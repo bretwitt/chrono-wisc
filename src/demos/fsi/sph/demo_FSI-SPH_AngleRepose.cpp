@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
     sysMBS.SetGravitationalAcceleration(ChVector3d(0, 0, -9.81));
     sysFSI.SetGravitationalAcceleration(ChVector3d(0, 0, -9.81));
     // Set soil properties
-    ChFsiFluidSystemSPH::ElasticMaterialProperties mat_props;
+    ChFsiFluidSystemSPH::SoilProperties mat_props;
     mat_props.density = bulk_density;
     mat_props.Young_modulus = youngs_modulus;
     mat_props.Poisson_ratio = 0.3;
@@ -124,7 +124,7 @@ int main(int argc, char* argv[]) {
     mat_props.mu_fric_s = mu_s;
     mat_props.mu_fric_2 = mu_s;
     mat_props.average_diam = granular_particle_diameter;
-    sysSPH.SetElasticSPH(mat_props);
+    sysSPH.SetCrmSPH(mat_props);
 
     ChFsiFluidSystemSPH::SPHParameters sph_params;
     sph_params.integration_scheme = IntegrationScheme::RK2;
@@ -135,7 +135,7 @@ int main(int argc, char* argv[]) {
     sph_params.shifting_xsph_eps = 0.25;
     sph_params.shifting_ppst_pull = 1.0;
     sph_params.shifting_ppst_push = 3.0;
-    sph_params.free_surface_threshold = 2.0;
+    sph_params.free_surface_threshold = 2.4;
     sph_params.num_proximity_search_steps = ps_freq;
     sph_params.use_variable_time_step = false;
     sph_params.kernel_type = KernelType::CUBIC_SPLINE;
@@ -193,7 +193,7 @@ int main(int argc, char* argv[]) {
 
     // Add BCE particles attached on the walls into FSI system
     auto box_bce = sysSPH.CreatePointsBoxContainer(ChVector3d(bxDim, byDim, bzDim), {0, 0, -1});
-    sysFSI.AddFsiBody(box, box_bce, ChFrame<>(ChVector3d(0, 0, 0), QUNIT), false);
+    sysFSI.AddRigidBody(box, box_bce, ChFrame<>(ChVector3d(0, 0, 0), QUNIT), false);
 
     sysFSI.Initialize();
 

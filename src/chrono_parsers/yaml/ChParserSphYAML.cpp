@@ -233,7 +233,7 @@ void ChParserSphYAML::LoadSolverData(const YAML::Node& yaml) {
             m_sim.sph.shifting_diffusion_A = a["shifting_diffusion_A"].as<double>();
         if (a["shifting_diffusion_AFSM"])
             m_sim.sph.shifting_diffusion_AFSM = a["shifting_diffusion_AFSM"].as<double>();
-        if (a["artificial_viscosity"])
+        if (a["shifting_diffusion_AFST"])
             m_sim.sph.shifting_diffusion_AFST = a["shifting_diffusion_AFST"].as<double>();
     }
 
@@ -281,13 +281,13 @@ void ChParserSphYAML::LoadModelData(const YAML::Node& yaml) {
         if (m_verbose)
             cout << "read fluid properties" << endl;
 
-        auto a = model["fluid properties"];
+        auto a = model["fluid_properties"];
         if (a["density"])
             m_material.fluid_props.density = a["density"].as<double>();
         if (a["viscosity"])
             m_material.fluid_props.viscosity = a["viscosity"].as<double>();
-        if (a["char_length"])
-            m_material.fluid_props.char_length = a["char_length"].as<double>();
+        if (a["characteristic_length"])
+            m_material.fluid_props.char_length = a["characteristic_length"].as<double>();
     }
 
     // Read soil material properties
@@ -295,7 +295,7 @@ void ChParserSphYAML::LoadModelData(const YAML::Node& yaml) {
         if (m_verbose)
             cout << "read soil properties" << endl;
 
-        auto a = model["soil properties"];
+        auto a = model["soil_properties"];
         if (a["density"])
             m_material.soil_props.density = a["density"].as<double>();
         if (a["Young_modulus"])
@@ -444,23 +444,23 @@ void ChParserSphYAML::LoadModelData(const YAML::Node& yaml) {
                     }
                     break;
                 case GeometryType::CYLINDRICAL:
-                    m_geometry.fluid_domain_cylindrical = chrono_types::make_unique<AnnulusDomain>();
+                    m_geometry.container_cylindrical = chrono_types::make_unique<AnnulusDomain>();
                     ChAssertAlways(a["inner_radius"]);
                     ChAssertAlways(a["outer_radius"]);
                     ChAssertAlways(a["height"]);
-                    m_geometry.fluid_domain_cylindrical->inner_radius = a["inner_radius"].as<double>();
-                    m_geometry.fluid_domain_cylindrical->outer_radius = a["outer_radius"].as<double>();
-                    m_geometry.fluid_domain_cylindrical->height = a["height"].as<double>();
+                    m_geometry.container_cylindrical->inner_radius = a["inner_radius"].as<double>();
+                    m_geometry.container_cylindrical->outer_radius = a["outer_radius"].as<double>();
+                    m_geometry.container_cylindrical->height = a["height"].as<double>();
                     if (a["cyl_origin"]) {
-                        m_geometry.fluid_domain_cylindrical->origin = ReadVector(a["cyl_origin"]);
+                        m_geometry.container_cylindrical->origin = ReadVector(a["cyl_origin"]);
                     } else {
-                        m_geometry.fluid_domain_cylindrical->origin = VNULL;
+                        m_geometry.container_cylindrical->origin = VNULL;
                     }
                     if (a["cyl_walls"]) {
-                        m_geometry.fluid_domain_cylindrical->wall_code = ReadWallFlagsCylindrical(a["cyl_walls"]);
-                        has_walls = (m_geometry.fluid_domain_cylindrical->wall_code != fsi::sph::CylSide::NONE);
+                        m_geometry.container_cylindrical->wall_code = ReadWallFlagsCylindrical(a["cyl_walls"]);
+                        has_walls = (m_geometry.container_cylindrical->wall_code != fsi::sph::CylSide::NONE);
                     } else {
-                        m_geometry.fluid_domain_cylindrical->wall_code = fsi::sph::CylSide::NONE;
+                        m_geometry.container_cylindrical->wall_code = fsi::sph::CylSide::NONE;
                     }
                     break;
             }
@@ -540,7 +540,7 @@ class WavemakerFunction : public ChFunction {
 };
 
 // Callback for setting initial SPH particle properties
-class SPHPropertiesCallback : public fsi::sph::ChFsiProblemSPH::ParticlePropertiesCallback {
+class SPHPropertiesCallback : public fsi::sph::ChFsiFluidSystemSPH::ParticlePropertiesCallback {
   public:
     SPHPropertiesCallback(bool set_pressure, double zero_height, bool set_velocity, const ChVector3d& init_velocity)
         : ParticlePropertiesCallback(), set_pressure(set_pressure), zero_height(zero_height), set_velocity(set_velocity), init_velocity(init_velocity) {}
@@ -552,11 +552,21 @@ class SPHPropertiesCallback : public fsi::sph::ChFsiProblemSPH::ParticleProperti
             p0 = sysSPH.GetDensity() * gz * (zero_height - pos.z());
             rho0 = sysSPH.GetDensity() + p0 / c2;
             mu0 = sysSPH.GetViscosity();
+
+            // CRM
+            if (sysSPH.GetPhysicsProblem() == fsi::sph::PhysicsProblem::CRM && sysSPH.GetParams().rheology_model_crm == fsi::sph::RheologyCRM::MCC) {
+                ChAssertAlways(gz > 0);
+                double p0_min = sysSPH.GetDensity() * gz * sysSPH.GetInitialSpacing() / 4;
+                p0 = std::max(p0, p0_min);
+                consolidation_pressure = 1.01 * p0;
+            }
+
+            tau_diag = ChVector3(-p0);
+            tau_offdiag = VNULL;
         }
 
-        if (set_velocity) {
+        if (set_velocity)
             v0 = init_velocity;
-        }
     }
 
     bool set_pressure;
@@ -618,7 +628,7 @@ std::shared_ptr<fsi::sph::ChFsiProblemSPH> ChParserSphYAML::CreateFsiProblemSPH(
             m_fsi_problem->SetCfdSPH(m_material.fluid_props);
             break;
         case fsi::sph::PhysicsProblem::CRM:
-            m_fsi_problem->SetElasticSPH(m_material.soil_props);
+            m_fsi_problem->SetCrmSPH(m_material.soil_props);
             break;
     }
 
@@ -893,7 +903,7 @@ fsi::sph::ShiftingMethod ChParserSphYAML::ReadShiftingMethod(const YAML::Node& a
         return fsi::sph::ShiftingMethod::PPST_XSPH;
     if (val == "DIFFUSION")
         return fsi::sph::ShiftingMethod::DIFFUSION;
-    if (val == "NONE")
+    if (val == "DIFFUSION_XSPH")
         return fsi::sph::ShiftingMethod::DIFFUSION_XSPH;
     return fsi::sph::ShiftingMethod::XSPH;
 }

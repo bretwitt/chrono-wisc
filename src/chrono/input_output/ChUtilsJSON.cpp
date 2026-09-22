@@ -37,11 +37,13 @@ void ReadFileJSON(const std::string& filename, Document& d) {
     std::ifstream ifs(filename);
     if (!ifs.good()) {
         std::cerr << "ERROR: Could not open JSON file: " << filename << std::endl;
+        throw std::runtime_error("Could not open JSON file '" + filename + "'.");
     } else {
         IStreamWrapper isw(ifs);
         d.ParseStream<ParseFlag::kParseCommentsFlag>(isw);
         if (d.IsNull()) {
             std::cerr << "ERROR: Invalid JSON file: " << filename << std::endl;
+            throw std::runtime_error("Invalid JSON file '" + filename + "'.");
         }
     }
 }
@@ -137,6 +139,10 @@ ChJoint::Type ReadJointTypeJSON(const Value& a) {
         return ChJoint::Type::REVOLUTE;
     } else if (type.compare("Spherical") == 0) {
         return ChJoint::Type::SPHERICAL;
+    } else if (type.compare("Prismatic") == 0) {
+        return ChJoint::Type::PRISMATIC;
+    } else if (type.compare("Cylindrical") == 0) {
+        return ChJoint::Type::CYLINDRICAL;
     } else if (type.compare("Universal") == 0) {
         return ChJoint::Type::UNIVERSAL;
     } else {

@@ -74,6 +74,9 @@ class ChApiParsers ChParserSphYAML : public ChParserCfdYAML {
     /// Access the underlying fluid system.
     virtual std::shared_ptr<fsi::ChFsiFluidSystem> GetFluidSystem() override { return m_fsi_problem->GetFluidSystemSPH(); }
 
+    /// Access the underlying fluid system.
+    std::shared_ptr<fsi::sph::ChFsiFluidSystemSPH> GetFluidSystemSPH() { return m_fsi_problem->GetFluidSystemSPH(); }
+
     // --------------
 
 #ifdef CHRONO_VSG
@@ -120,7 +123,7 @@ class ChApiParsers ChParserSphYAML : public ChParserCfdYAML {
 
         fsi::sph::PhysicsProblem physics_problem;
         fsi::sph::ChFsiFluidSystemSPH::FluidProperties fluid_props;
-        fsi::sph::ChFsiFluidSystemSPH::ElasticMaterialProperties soil_props;
+        fsi::sph::ChFsiFluidSystemSPH::SoilProperties soil_props;
     };
 
     /// Problem geometry (fluid domain, container, computational domain).

@@ -250,7 +250,7 @@ int main(int argc, char* argv[]) {
             ////double cohesion = 1000;
             ////double friction = 0.9;
 
-            ChFsiFluidSystemSPH::ElasticMaterialProperties mat_props;
+            ChFsiFluidSystemSPH::SoilProperties mat_props;
             mat_props.density = density;
             mat_props.Young_modulus = 1e6;
             mat_props.Poisson_ratio = 0.3;
@@ -259,7 +259,7 @@ int main(int argc, char* argv[]) {
             mat_props.mu_fric_2 = friction;
             mat_props.average_diam = 0.005;
             mat_props.cohesion_coeff = cohesion;
-            terrain_crm->SetElasticSPH(mat_props);
+            terrain_crm->SetCrmSPH(mat_props);
 
             // Set SPH solver parameters
             ChFsiFluidSystemSPH::SPHParameters sph_params;
@@ -267,7 +267,7 @@ int main(int argc, char* argv[]) {
             sph_params.initial_spacing = spacing;
             sph_params.shifting_method = ShiftingMethod::PPST_XSPH;
             sph_params.d0_multiplier = 1;
-            sph_params.free_surface_threshold = 2.0;
+            sph_params.free_surface_threshold = 2.4;
             sph_params.artificial_viscosity = 0.5;
             sph_params.use_consistent_gradient_discretization = false;
             sph_params.use_consistent_laplacian_discretization = false;

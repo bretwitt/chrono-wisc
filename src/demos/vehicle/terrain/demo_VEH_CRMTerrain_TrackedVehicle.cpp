@@ -65,21 +65,15 @@ std::shared_ptr<ChBezierCurve> CreatePath(const std::string& path_file);
 void CreateFSITracks(std::shared_ptr<TrackedVehicle> vehicle, CRMTerrain& terrain);
 
 // Callback for setting initial SPH particle properties
-class SPHPropertiesCallbackWithPressureScale : public ChFsiProblemSPH::ParticlePropertiesCallback {
+class SPHPropertiesCallbackWithPressureScale : public DepthPressurePropertiesCallback {
   public:
-    SPHPropertiesCallbackWithPressureScale(double zero_height, double pre_pressure_scale)
-        : ParticlePropertiesCallback(), zero_height(zero_height), pre_pressure_scale(pre_pressure_scale) {}
+    SPHPropertiesCallbackWithPressureScale(double zero_height, double pre_pressure_scale) : DepthPressurePropertiesCallback(zero_height), pre_pressure_scale(pre_pressure_scale) {}
 
     virtual void set(const ChFsiFluidSystemSPH& sysSPH, const ChVector3d& pos) override {
-        double gz = std::abs(sysSPH.GetGravitationalAcceleration().z());
-        p0 = sysSPH.GetDensity() * gz * (zero_height - pos.z());
-        rho0 = sysSPH.GetDensity();
-        mu0 = sysSPH.GetViscosity();
-        v0 = ChVector3d(0, 0, 0);
-        pre_pressure_scale0 = pre_pressure_scale;
+        DepthPressurePropertiesCallback::set(sysSPH, pos);
+        consolidation_pressure = pre_pressure_scale * p0;
     }
 
-    double zero_height;
     double pre_pressure_scale;
 };
 
@@ -160,7 +154,7 @@ int main(int argc, char* argv[]) {
     terrain.RegisterVehicle(vehicle.get());
 
     // Set SPH parameters and soil material properties
-    ChFsiFluidSystemSPH::ElasticMaterialProperties mat_props;
+    ChFsiFluidSystemSPH::SoilProperties mat_props;
     mat_props.density = density;
     mat_props.Young_modulus = youngs_modulus;
     mat_props.Poisson_ratio = poisson_ratio;
@@ -180,14 +174,14 @@ int main(int argc, char* argv[]) {
         mat_props.mcc_kappa = kappa;
         mat_props.mcc_lambda = lambda;
     }
-    terrain.SetElasticSPH(mat_props);
+    terrain.SetCrmSPH(mat_props);
 
     // Set SPH solver parameters
     ChFsiFluidSystemSPH::SPHParameters sph_params;
     sph_params.integration_scheme = IntegrationScheme::RK2;
     sph_params.initial_spacing = initial_spacing;
     sph_params.d0_multiplier = 1.3;
-    sph_params.free_surface_threshold = 2.0;
+    sph_params.free_surface_threshold = 2.4;
     sph_params.artificial_viscosity = 0.5;
     sph_params.viscosity_method = ViscosityMethod::ARTIFICIAL_BILATERAL;
     sph_params.boundary_method = BoundaryMethod::HOLMES;

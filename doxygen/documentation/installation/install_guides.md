@@ -19,8 +19,6 @@ Additional Chrono functionality is provided through optional modules, enabled du
 
 -   [IRRLICHT module](@ref module_irrlicht_installation)
 
--   [MATLAB module](@ref module_matlab_installation)
-
 -   [MODAL module](@ref module_modal_installation)
 
 -   [MULTICORE module](@ref module_multicore_installation)
@@ -32,6 +30,8 @@ Additional Chrono functionality is provided through optional modules, enabled du
 -   [PARSERS module](@ref module_parsers_installation)
 
 -   [POSTPROCESS module](@ref module_postprocess_installation)
+
+-   [PRECICE module](@ref module_precice_installation)
 
 -   [PYTHON module](@ref module_python_installation)
 
@@ -47,7 +47,7 @@ Additional Chrono functionality is provided through optional modules, enabled du
 
 #### Providing 3rd-party dependencies
 
-The core Chrono module (and hence all of Chrono) required the Eigen3 linear algebra (headers-only) library.
+The core Chrono module (and hence all of Chrono) requires the Eigen3 linear algebra (headers-only) library.
 
 Chrono optional modules often rely on third-party libraries that might require additional installation steps, as described in each module installation page.
 

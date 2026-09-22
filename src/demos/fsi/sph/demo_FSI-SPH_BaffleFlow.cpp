@@ -19,7 +19,6 @@
 
 #include "chrono/physics/ChSystemSMC.h"
 #include "chrono/assets/ChVisualSystem.h"
-#include "chrono/assets/ChVisualShapeBox.h"
 
 #include "chrono_fsi/sph/ChFsiProblemSPH.h"
 
@@ -62,20 +61,15 @@ bool show_particles_sph = true;
 // ----------------------------------------------------------------------------
 
 // Callback for setting initial SPH particle properties
-class SPHPropertiesCallback : public ChFsiProblemSPH::ParticlePropertiesCallback {
+class SPHPropertiesCallback : public DepthPressurePropertiesCallback {
   public:
-    SPHPropertiesCallback(double zero_height, const ChVector3d& init_velocity) : ParticlePropertiesCallback(), zero_height(zero_height), init_velocity(init_velocity) {}
+    SPHPropertiesCallback(double zero_height, const ChVector3d& init_velocity) : DepthPressurePropertiesCallback(zero_height), init_velocity(init_velocity) {}
 
     virtual void set(const ChFsiFluidSystemSPH& sysSPH, const ChVector3d& pos) override {
-        double gz = std::abs(sysSPH.GetGravitationalAcceleration().z());
-        double c2 = sysSPH.GetSoundSpeed() * sysSPH.GetSoundSpeed();
-        p0 = sysSPH.GetDensity() * gz * (zero_height - pos.z());
-        rho0 = sysSPH.GetDensity() + p0 / c2;
-        mu0 = sysSPH.GetViscosity();
+        DepthPressurePropertiesCallback::set(sysSPH, pos);
         v0 = init_velocity;
     }
 
-    double zero_height;
     ChVector3d init_velocity;
 };
 
@@ -217,7 +211,7 @@ int main(int argc, char* argv[]) {
     fsi.SetStepsizeMBD(step_size);
 
     // Set soil properties
-    ChFsiFluidSystemSPH::ElasticMaterialProperties mat_props;
+    ChFsiFluidSystemSPH::SoilProperties mat_props;
     mat_props.density = 1800;
     mat_props.Young_modulus = 2e6;
     mat_props.Poisson_ratio = 0.3;
@@ -227,7 +221,7 @@ int main(int argc, char* argv[]) {
     mat_props.average_diam = 0.0614;
     mat_props.cohesion_coeff = 0;  // default
 
-    fsi.SetElasticSPH(mat_props);
+    fsi.SetCrmSPH(mat_props);
 
     // Set SPH solution parameters
     ChFsiFluidSystemSPH::SPHParameters sph_params;
@@ -239,7 +233,7 @@ int main(int argc, char* argv[]) {
     sph_params.shifting_xsph_eps = 0.25;
     sph_params.shifting_ppst_pull = 1.0;
     sph_params.shifting_ppst_push = 3.0;
-    sph_params.free_surface_threshold = 2.0;
+    sph_params.free_surface_threshold = 2.4;
     sph_params.num_proximity_search_steps = ps_freq;
 
     // Set boundary type

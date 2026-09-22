@@ -105,7 +105,7 @@ int main(int argc, char* argv[]) {
     fsi.SetStepsizeMBD(step_size);
 
     // Set soil properties
-    ChFsiFluidSystemSPH::ElasticMaterialProperties mat_props;
+    ChFsiFluidSystemSPH::SoilProperties mat_props;
     mat_props.density = 1700;
     mat_props.Young_modulus = 1e6;
     mat_props.Poisson_ratio = 0.3;
@@ -115,7 +115,7 @@ int main(int argc, char* argv[]) {
     mat_props.average_diam = 0.005;
     mat_props.cohesion_coeff = 1e3;  // default
 
-    fsi.SetElasticSPH(mat_props);
+    fsi.SetCrmSPH(mat_props);
 
     // Set SPH solution parameters
     ChFsiFluidSystemSPH::SPHParameters sph_params;
@@ -126,7 +126,7 @@ int main(int argc, char* argv[]) {
     sph_params.shifting_ppst_pull = 1.0;
     sph_params.shifting_xsph_eps = 0.25;
     sph_params.d0_multiplier = 1;
-    sph_params.free_surface_threshold = 2.0;
+    sph_params.free_surface_threshold = 2.4;
     sph_params.artificial_viscosity = 0.5;
     sph_params.use_consistent_gradient_discretization = false;
     sph_params.use_consistent_laplacian_discretization = false;

@@ -171,7 +171,7 @@ int main(int argc, char* argv[]) {
     terrain.RegisterVehicle(vehicle.get());
 
     // Set SPH parameters and soil material properties
-    ChFsiFluidSystemSPH::ElasticMaterialProperties mat_props;
+    ChFsiFluidSystemSPH::SoilProperties mat_props;
     mat_props.density = density;
     mat_props.Young_modulus = youngs_modulus;
     mat_props.Poisson_ratio = poisson_ratio;
@@ -180,14 +180,15 @@ int main(int argc, char* argv[]) {
     mat_props.mu_fric_2 = friction;
     mat_props.average_diam = 0.005;
     mat_props.cohesion_coeff = cohesion;
-    terrain.SetElasticSPH(mat_props);
+    ////mat_props.rheology_model = RheologyCRM::MCC;
+    terrain.SetCrmSPH(mat_props);
 
     // Set SPH solver parameters
     ChFsiFluidSystemSPH::SPHParameters sph_params;
     sph_params.integration_scheme = integration_scheme;
     sph_params.initial_spacing = spacing;
     sph_params.d0_multiplier = 1.0;
-    sph_params.free_surface_threshold = 2.0;
+    sph_params.free_surface_threshold = 2.4;
     sph_params.artificial_viscosity = 0.5;
     sph_params.use_consistent_gradient_discretization = false;
     sph_params.use_consistent_laplacian_discretization = false;
@@ -202,7 +203,7 @@ int main(int argc, char* argv[]) {
     // Add vehicle wheels as FSI solids
     CreateFSIWheels(vehicle, terrain);
     terrain.SetActiveDomain(ChVector3d(active_box_dim));
-    terrain.SetActiveDomainDelay(settling_time);
+    terrain.SetFreeFlowDuration(settling_time);
 
     // Construct the terrain and associated path
     cout << "Create terrain..." << endl;
