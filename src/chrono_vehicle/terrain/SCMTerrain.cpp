@@ -224,6 +224,13 @@ void SCMTerrain::SetBoundary(const ChAABB& aabb) {
 
 // Add a user-provided active domains
 void SCMTerrain::AddActiveDomain(std::shared_ptr<ChBody> body, const ChVector3d& OOBB_center, const ChVector3d& OOBB_dims) {
+    // If Initialize already ran with no user domains, SetupInitial pushed a default domain carrying
+    // a NULL body, to be updated by UpdateDefaultActiveDomain. Registering a user domain now flips
+    // m_user_domains, after which every domain -- including that one -- is passed to
+    // UpdateActiveDomain, which dereferences the body. Drop it.
+    if (!m_loader->m_user_domains)
+        m_loader->m_active_domains.clear();
+
     SCMLoader::ActiveDomainInfo ad;
     ad.m_body = body;
     ad.m_center = OOBB_center;
@@ -258,6 +265,11 @@ void SCMTerrain::Initialize(const std::string& mesh_file, double delta) {
 // Initialize the terrain from a specified triangular mesh file.
 void SCMTerrain::Initialize(const ChTriangleMeshConnected& trimesh, double delta) {
     m_loader->Initialize(trimesh, delta);
+}
+
+// Initialize the terrain from a user-provided procedural height field.
+void SCMTerrain::Initialize(std::shared_ptr<HeightFunctor> functor, double delta) {
+    m_loader->Initialize(functor, delta);
 }
 
 // Get the heights of modified grid nodes.
@@ -608,6 +620,34 @@ void SCMLoader::Initialize(const ChTriangleMeshConnected& trimesh, double delta)
     SetupInitial();
 }
 
+// Initialize the terrain from a user-provided procedural height field.
+void SCMLoader::Initialize(std::shared_ptr<SCMTerrain::HeightFunctor> functor, double delta) {
+    if (!functor)
+        throw std::runtime_error("SCMTerrain::Initialize: null height functor.");
+    if (m_trimesh_shape)
+        throw std::runtime_error(
+            "SCMTerrain::Initialize: a procedural patch has no extent and so cannot generate a "
+            "visualization mesh; construct SCMTerrain with visualization_mesh = false.");
+
+    m_type = PatchType::CALLBACK;
+    m_height_fun = functor;
+
+    m_delta = delta;                // grid spacing (used verbatim; there is no extent to divide)
+    m_area = std::pow(m_delta, 2);  // area of a cell
+
+    // A procedural patch is unbounded: no m_heights array is allocated and the solver never clamps
+    // grid indices (ray casting works off the active domain ranges and m_delta alone). m_nx/m_ny
+    // bound only the visualization mesh, which does not exist here -- left at zero, CheckMeshBounds
+    // rejects every node and no mesh update is ever attempted.
+    m_nx = 0;
+    m_ny = 0;
+
+    // The other Initialize versions reach SetupInitial only when they build a visualization mesh,
+    // which leaves m_active_domains empty (and hence zero ray casts) for a non-visualized patch.
+    // Always run it here, so a default active domain exists if the caller specified none.
+    SetupInitial();
+}
+
 void SCMLoader::CreateVisualizationMesh(double sizeX, double sizeY) {
     // Create the colormap
     m_colormap = chrono_types::make_unique<ChColormap>(m_colormap_type);
@@ -802,6 +842,8 @@ double SCMLoader::GetInitHeight(const ChVector2i& loc) const {
             auto y = ChClamp(loc.y(), -m_ny, +m_ny);
             return m_heights(x + m_nx, y + m_ny);
         }
+        case PatchType::CALLBACK:
+            return m_height_fun->GetInitHeight(loc, m_delta);
         default:
             return 0;
     }
@@ -811,7 +853,8 @@ double SCMLoader::GetInitHeight(const ChVector2i& loc) const {
 ChVector3d SCMLoader::GetInitNormal(const ChVector2i& loc) const {
     switch (m_type) {
         case PatchType::HEIGHT_MAP:
-        case PatchType::TRI_MESH: {
+        case PatchType::TRI_MESH:
+        case PatchType::CALLBACK: {
             // Average normals of 4 triangular faces incident to given grid node
             auto hE = GetInitHeight(loc + ChVector2i(1, 0));  // east
             auto hW = GetInitHeight(loc - ChVector2i(1, 0));  // west
@@ -845,7 +888,8 @@ double SCMLoader::GetHeight(const ChVector2i& loc) const {
 ChVector3d SCMLoader::GetNormal(const ChVector2i& loc) const {
     switch (m_type) {
         case PatchType::HEIGHT_MAP:
-        case PatchType::TRI_MESH: {
+        case PatchType::TRI_MESH:
+        case PatchType::CALLBACK: {
             // Average normals of 4 triangular faces incident to given grid node
             auto hE = GetHeight(loc + ChVector2i(1, 0));  // east
             auto hW = GetHeight(loc - ChVector2i(1, 0));  // west

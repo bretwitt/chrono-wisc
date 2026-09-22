@@ -247,6 +247,23 @@ class CH_VEHICLE_API SCMTerrain : public ChTerrain {
     /// GetContactForceNode for rigid bodies and FEA nodes, respectively.
     void SetCosimulationMode(bool val);
 
+    /// Class to be used as a callback interface for a procedurally-defined undeformed height field.
+    /// This allows using SCM over terrain that is too large (or not known in advance) to be
+    /// materialized as a height-map image or a triangular mesh. The SCM grid is then conceptually
+    /// unbounded: no dense height array is allocated and memory grows only with the area actually
+    /// deformed.
+    /// ATTENTION: GetInitHeight is called from within an OpenMP parallel region (during ray casting)
+    /// and must therefore be reentrant.
+    class CH_VEHICLE_API HeightFunctor {
+      public:
+        virtual ~HeightFunctor() {}
+
+        /// Return the undeformed terrain height at the given grid node.
+        /// The node is at (loc.x() * delta, loc.y() * delta) in the SCM reference plane and the
+        /// returned height is measured along the Z axis of the SCM reference frame.
+        virtual double GetInitHeight(const ChVector2i& loc, double delta) = 0;
+    };
+
     /// Initialize the terrain system (flat).
     /// This version creates a flat array of points.
     void Initialize(double sizeX,  ///< [in] terrain dimension in the X direction
@@ -289,6 +306,16 @@ class CH_VEHICLE_API SCMTerrain : public ChTerrain {
     /// is set to the height of the closest point on the mesh).  A visualization mesh is created from the original mesh
     /// resampled at the grid node points.
     void Initialize(const ChTriangleMeshConnected& trimesh,  ///< [in] surface triangular mesh
+                    double delta                             ///< [in] grid spacing
+    );
+
+    /// Initialize the terrain system (procedural).
+    /// The initial undeformed terrain profile is provided through a user-supplied functor, queried
+    /// lazily at each grid node touched by the simulation. Unlike the other Initialize versions, the
+    /// terrain has no predefined extent. Use SetBoundary to bound it if needed.
+    /// Note: a visualization mesh cannot be generated for a procedural patch (it has no extent), so
+    /// the SCMTerrain must have been constructed with visualization_mesh = false.
+    void Initialize(std::shared_ptr<HeightFunctor> functor,  ///< [in] undeformed height field
                     double delta                             ///< [in] grid spacing
     );
 
@@ -404,12 +431,18 @@ class CH_VEHICLE_API SCMLoader : public ChLoadContainer {
                     double delta                             ///< [in] grid spacing
     );
 
+    /// Initialize the terrain system (procedural, unbounded).
+    void Initialize(std::shared_ptr<SCMTerrain::HeightFunctor> functor,  ///< [in] undeformed height field
+                    double delta                                         ///< [in] grid spacing
+    );
+
   private:
     // SCM patch type.
     enum class PatchType {
         FLAT,        // flat patch
         HEIGHT_MAP,  // triangular mesh (generated from a gray-scale image height-map)
-        TRI_MESH     // triangular mesh (provided through an OBJ file)
+        TRI_MESH,    // triangular mesh (provided through an OBJ file)
+        CALLBACK     // procedural height field (provided through a user functor); unbounded
     };
 
     // Active domain parameters.
@@ -578,6 +611,9 @@ class CH_VEHICLE_API SCMLoader : public ChLoadContainer {
 
     ChMatrixDynamic<> m_heights;  ///< (base) grid heights (when initializing from height-field map)
     double m_base_height;         ///< default height for vertices outside the projection of input mesh
+
+    /// User-provided undeformed height field (PatchType::CALLBACK only).
+    std::shared_ptr<SCMTerrain::HeightFunctor> m_height_fun;
 
     std::unordered_map<ChVector2i, NodeRecord, CoordHash> m_grid_map;  ///< modified grid nodes (persistent)
     std::vector<ChVector2i> m_modified_nodes;                          ///< modified grid nodes (current)
