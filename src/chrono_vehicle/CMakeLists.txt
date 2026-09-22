@@ -244,6 +244,14 @@ if(CH_ENABLE_MODULE_FSI_SPH)
         terrain/CRMTerrain.cpp    
     )
 endif()
+if(CH_ENABLE_MODULE_PLANET)
+    set(CV_TERRAIN_FILES ${CV_TERRAIN_FILES}
+        terrain/PlanetTerrain.h
+        terrain/PlanetTerrain.cpp
+        terrain/PlanetSCMTerrain.h
+        terrain/PlanetSCMTerrain.cpp
+    )
+endif()
 source_group("terrain" FILES ${CV_TERRAIN_FILES})
 
 set(CV_UTILS_FILES
@@ -825,6 +833,9 @@ if(CH_ENABLE_MODULE_FSI_SPH)
   list (APPEND DEPENDENCIES_VEHICLE "FSI")
   list (APPEND DEPENDENCIES_VEHICLE "FSI_SPH")
 endif()
+if(CH_ENABLE_MODULE_PLANET)
+  list (APPEND DEPENDENCIES_VEHICLE "PLANET")
+endif()
 
 set(DEPENDENCIES_VEHICLE ${DEPENDENCIES_VEHICLE} PARENT_SCOPE)
 
@@ -899,6 +910,11 @@ endif()
 if(CH_ENABLE_MODULE_FSI_SPH)
   target_link_libraries(Chrono_vehicle PRIVATE Chrono_fsi)
   target_link_libraries(Chrono_vehicle PRIVATE Chrono_fsisph)
+endif()
+
+# Public: the planet terrain headers include the module's surface and site frame.
+if(CH_ENABLE_MODULE_PLANET)
+  target_link_libraries(Chrono_vehicle PUBLIC Chrono_planet)
 endif()
 
 target_compile_definitions(Chrono_vehicle INTERFACE 

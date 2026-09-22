@@ -3,6 +3,10 @@ set(TESTS
     utest_VEH_tire_contact
 )
 
+if(CH_ENABLE_MODULE_PLANET)
+  set(TESTS ${TESTS} utest_VEH_PlanetTerrain)
+endif()
+
 set(UTILS
    ../ut_utils.h)
 
