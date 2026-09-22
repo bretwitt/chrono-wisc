@@ -59,6 +59,11 @@ a moving viewpoint. Chrono::Vehicle builds two terrain models on it:
 
 To use the vehicle terrains, also enable `CH_ENABLE_MODULE_VEHICLE`.
 
+To draw the quadtree terrain, also enable `CH_ENABLE_MODULE_VSG`: this adds
+the `Chrono_planet_vsg` library with `ChPlanetVisualizationVSG`, a plugin for
+`ChVisualSystemVSG` that streams the tiles around the camera, and the
+`demo_PLANET_TerrainVSG` demo.
+
 
 ## How to use it
 

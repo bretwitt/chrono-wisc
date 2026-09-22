@@ -183,3 +183,46 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
 
 # Dependencies on other Chrono components, for the exported ChronoConfig.
 set(DEPENDENCIES_PLANET "" PARENT_SCOPE)
+
+#-------------------------------------------------------------------------------
+# Add the Chrono_planet_vsg library: the quadtree terrain as a VSG plugin
+#-------------------------------------------------------------------------------
+
+if(CH_ENABLE_MODULE_VSG)
+  message(STATUS "Add Chrono_planet_vsg library")
+
+  set(Chrono_PLANET_VSG_FILES
+      visualization/ChPlanetVisualizationVSG.h
+      visualization/ChPlanetVisualizationVSG.cpp
+  )
+  source_group("visualization" FILES ${Chrono_PLANET_VSG_FILES})
+
+  add_library(Chrono_planet_vsg ${Chrono_PLANET_VSG_FILES})
+  add_library(Chrono::planet_vsg ALIAS Chrono_planet_vsg)
+
+  set_target_properties(Chrono_planet_vsg PROPERTIES DEBUG_POSTFIX ${CH_DEBUG_POSTFIX})
+
+  if(CH_WHOLE_PROG_OPT)
+    set_target_properties(Chrono_planet_vsg PROPERTIES COMPILE_FLAGS "/GL")
+    set_target_properties(Chrono_planet_vsg PROPERTIES LINK_FLAGS "/LTCG")
+  endif()
+
+  if(CH_STATIC)
+    set_target_properties(Chrono_planet_vsg PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  endif()
+
+  if(MSVC)
+    set_target_properties(Chrono_planet_vsg PROPERTIES MSVC_RUNTIME_LIBRARY ${CH_MSVC_RUNTIME_LIBRARY})
+  endif()
+
+  target_compile_definitions(Chrono_planet_vsg PRIVATE $<$<COMPILE_LANGUAGE:CXX>:CH_API_COMPILE_PLANET>)
+
+  target_link_libraries(Chrono_planet_vsg PUBLIC Chrono_planet Chrono_vsg)
+
+  install(TARGETS Chrono_planet_vsg
+          EXPORT ChronoTargets
+          RUNTIME DESTINATION bin
+          LIBRARY DESTINATION lib
+          ARCHIVE DESTINATION lib
+          INCLUDES DESTINATION include/chrono_planet)
+endif()
