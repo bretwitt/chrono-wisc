@@ -1,7 +1,11 @@
 #include "chrono_planet/lod/Quadtree.h"
 
 #include "chrono_planet/lod/SphericalCoordinates.h"
+#include "chrono_planet/lod/CartesianCoordinates.h"
 #include "chrono_planet/lod/TileMetadata.h"
+
+namespace chrono {
+namespace planet {
 
 template <typename T, typename CoordSystem>
 QuadTree<T, CoordSystem>::QuadTree(Boundary boundary, int level, QuadTree* parent)
@@ -54,3 +58,8 @@ void QuadTree<T, CoordSystem>::merge() {
 }
 
 template class QuadTree<TileMetadata, Spherical>;
+
+template class QuadTree<TileMetadata, Cartesian>;
+
+}  // namespace planet
+}  // namespace chrono

@@ -30,6 +30,7 @@
 
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/ChSiteFrame.h"
+#include "chrono_planet/planets/moon/ChMoon.h"
 
 #include "chrono_vehicle/terrain/PlanetSCMTerrain.h"
 #include "chrono_vehicle/terrain/PlanetTerrain.h"
@@ -45,13 +46,13 @@ const double site_lat = 20.19;
 const int zoom = 15;
 
 std::shared_ptr<ChPlanetSurface> MakeSurface() {
-    return std::make_shared<ChPlanetSurface>(std::vector<ChPlanetSurface::DemSource>{}, zoom);
+    return moon::CreateSurface(zoom);
 }
 
 }  // namespace
 
 TEST(ChSiteFrame, RoundTrip) {
-    ChSiteFrame site(site_lon, site_lat, 100.0);
+    ChSiteFrame site(moon::Body(), site_lon, site_lat, 100.0);
     for (double x : {-500.0, 0.0, 250.0}) {
         for (double y : {-300.0, 0.0, 700.0}) {
             double lon, lat;
@@ -81,7 +82,7 @@ TEST(ChPlanetSurface, GridMatchesPointSamples) {
 TEST(PlanetTerrain, HeightAndNormal) {
     ChSystemNSC sys;
     auto surface = MakeSurface();
-    ChSiteFrame site(site_lon, site_lat, surface->GetElevation(site_lon, site_lat));
+    ChSiteFrame site = surface->MakeSiteFrame(site_lon, site_lat);
     PlanetTerrain terrain(&sys, surface, site);
     terrain.Initialize();
 
@@ -103,7 +104,7 @@ TEST(PlanetTerrain, HeightAndNormal) {
 TEST(PlanetTerrain, PatchFollowsLocation) {
     ChSystemNSC sys;
     auto surface = MakeSurface();
-    ChSiteFrame site(site_lon, site_lat, surface->GetElevation(site_lon, site_lat));
+    ChSiteFrame site = surface->MakeSiteFrame(site_lon, site_lat);
     PlanetTerrain terrain(&sys, surface, site);
     terrain.SetPatchSize(20.0);
     terrain.SetPatchResolution(0.5);
@@ -125,10 +126,10 @@ TEST(PlanetTerrain, PatchFollowsLocation) {
 
 TEST(PlanetTerrain, BallRestsOnPatch) {
     ChSystemNSC sys;
-    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -1.62));
+    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -moon::kGravity));
     sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
     auto surface = MakeSurface();
-    ChSiteFrame site(site_lon, site_lat, surface->GetElevation(site_lon, site_lat));
+    ChSiteFrame site = surface->MakeSiteFrame(site_lon, site_lat);
     PlanetTerrain terrain(&sys, surface, site);
     terrain.SetPatchSize(10.0);
     terrain.Initialize();
@@ -147,7 +148,7 @@ TEST(PlanetTerrain, BallRestsOnPatch) {
 
 TEST(PlanetSCMTerrain, FunctorMatchesSurface) {
     auto surface = MakeSurface();
-    ChSiteFrame site(site_lon, site_lat, surface->GetElevation(site_lon, site_lat));
+    ChSiteFrame site = surface->MakeSiteFrame(site_lon, site_lat);
     PlanetSCMHeightFunctor functor(surface, site);
     const double delta = 0.05;
 
@@ -171,10 +172,10 @@ TEST(PlanetSCMTerrain, FunctorMatchesSurface) {
 
 TEST(PlanetSCMTerrain, WheelSinks) {
     ChSystemNSC sys;
-    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -1.62));
+    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -moon::kGravity));
     sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
     auto surface = MakeSurface();
-    ChSiteFrame site(site_lon, site_lat, surface->GetElevation(site_lon, site_lat));
+    ChSiteFrame site = surface->MakeSiteFrame(site_lon, site_lat);
 
     const double radius = 0.25;
     const double width = 0.2;
@@ -188,7 +189,6 @@ TEST(PlanetSCMTerrain, WheelSinks) {
     EXPECT_THROW(terrain.Initialize(PlanetSCMTerrain::Params{}, {}), std::invalid_argument);
 
     PlanetSCMTerrain::Params params;
-    params.prefetch = false;
     terrain.Initialize(params, {{wheel, radius, width}});
     while (sys.GetChTime() < 1.0)
         sys.DoStepDynamics(1e-3);

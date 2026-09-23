@@ -1,16 +1,18 @@
-#ifndef QTPLANET_SPHEREMATH_H
-#define QTPLANET_SPHEREMATH_H
+#ifndef CH_PLANET_SPHEREMATH_H
+#define CH_PLANET_SPHEREMATH_H
 
 #include "chrono_planet/ChApiPlanet.h"
 
 #include <cmath>
 
 #include "chrono_planet/core/MathUtil.h"
-#include "chrono_planet/core/Planet.h"
 
-// Geometry of the body. Lon/lat to and from cartesian, the local horizon frame, and ground distances.
+namespace chrono {
+namespace planet {
 
-namespace qtplanet {
+// Sphere geometry. Lon/lat to and from cartesian, the local horizon frame, and ground distances.
+
+namespace util {
 
 // Longitude folded into [-180, 180).
 double wrapLongitude(double lonDeg);
@@ -26,8 +28,8 @@ double metresPerDegLon(double radiusM, double latDeg);
 
 // Distance from the body's center.
 inline double radiusOf(double x, double y, double z) { return std::sqrt(x * x + y * y + z * z); }
-// Height above the reference sphere.
-inline double elevationOf(double x, double y, double z) { return radiusOf(x, y, z) - kRadiusM; }
+// Height above a reference sphere of the given radius.
+inline double elevationOf(double x, double y, double z, double sphereRadiusM) { return radiusOf(x, y, z) - sphereRadiusM; }
 
 // Geographic position in degrees.
 struct CH_PLANET_API LonLat {
@@ -51,6 +53,9 @@ EnuFrame enuAlong(const Vec3& upDir);
 // Outward radial at a lon/lat, the Up column of enuAt.
 Vec3 dirFromLonLat(double lonDeg, double latDeg);
 
-}   // namespace qtplanet
+}  // namespace util
 
-#endif   // QTPLANET_SPHEREMATH_H
+}  // namespace planet
+}  // namespace chrono
+
+#endif   // CH_PLANET_SPHEREMATH_H

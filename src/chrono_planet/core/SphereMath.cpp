@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cmath>
 
-namespace qtplanet {
+namespace chrono {
+namespace planet {
+
+namespace util {
 
 double wrapLongitude(double lonDeg) {
     double shifted = std::fmod(lonDeg + 180.0, 360.0);
@@ -45,4 +48,7 @@ EnuFrame enuAlong(const Vec3& upDir) {
 
 Vec3 dirFromLonLat(double lonDeg, double latDeg) { return enuAt(lonDeg, latDeg).up; }
 
-}   // namespace qtplanet
+}  // namespace util
+
+}  // namespace planet
+}  // namespace chrono

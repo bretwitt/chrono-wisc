@@ -23,13 +23,16 @@
 #include <memory>
 #include <unordered_map>
 
+#include "chrono/assets/ChColormap.h"
 #include "chrono/assets/ChVisualMaterial.h"
 
+#include "chrono_vsg/ChGuiComponentVSG.h"
 #include "chrono_vsg/ChVisualSystemVSG.h"
 
 #include "chrono_planet/ChApiPlanet.h"
 #include "chrono_planet/ChSiteFrame.h"
-#include "chrono_planet/lod/QuadtreeWorld.h"
+#include "chrono_planet/filters/ChDeformationFilter.h"
+#include "chrono_planet/lod/ChPlanetQuadtree.h"
 
 namespace chrono {
 namespace planet {
@@ -40,19 +43,39 @@ namespace planet {
 /// VSG plugin that mirrors the quadtree's resident tiles into the scene.
 /// Each frame the level of detail is stepped at the camera position on simulation time, and every
 /// tile mesh the world holds is re-projected through the site frame, so the drawn ground is the
-/// surface PlanetTerrain and PlanetSCMTerrain put under the wheels. Tiles use the visual system's
-/// PBR pipeline with one material; this is the geometry path, ahead of the Hapke shading port.
+/// surface that vehicle::PlanetTerrain and vehicle::PlanetSCMTerrain put under the wheels. The site frame
+/// must be on the same body as the quadtree's surface. Tiles use the visual system's
+/// PBR pipeline with one material.
 class CH_PLANET_API ChPlanetVisualizationVSG : public vsg3d::ChVisualSystemVSGPlugin {
   public:
-    /// Construct the plugin over a quadtree world, drawn in the given site frame.
-    ChPlanetVisualizationVSG(std::shared_ptr<QuadtreeWorld> world, const ChSiteFrame& site);
+    /// Construct the plugin over a quadtree, drawn in the given site frame.
+    ChPlanetVisualizationVSG(std::shared_ptr<ChPlanetQuadtree> world, const ChSiteFrame& site);
     ~ChPlanetVisualizationVSG();
 
-    /// Set the material every tile is drawn with (default: a matte regolith grey).
+    /// Set the material every tile is drawn with (default: a matte neutral grey).
     void SetMaterial(std::shared_ptr<ChVisualMaterial> material) { m_material = material; }
 
-    /// Draw tiles as wireframe (default: false). Applies to tiles built after the call.
-    void SetWireframe(bool val) { m_wireframe = val; }
+    /// Draw tiles as wireframe (default: false). Can be toggled at any time; the tiles in the scene are
+    /// rebuilt on the next frame.
+    void SetWireframe(bool val) { m_wireframe_requested = val; }
+    bool GetWireframe() const { return m_wireframe_requested; }
+
+    /// Color the terrain by the depth of a deformation filter's changes, like SCM's sinkage plot: ground
+    /// lowered by `range` (m) or more gets the top color of the colormap, undisturbed ground keeps the
+    /// material color. Ruts a few centimeters deep are hard to see by shading alone; this makes them
+    /// obvious. Tiles are drawn with vertex colors while it is on. Pass null to turn it off.
+    void SetDeformationColoring(std::shared_ptr<ChDeformationFilter> filter,
+                                double range = 0.05,
+                                ChColormap::Type colormap = ChColormap::Type::JET);
+
+    /// Turn deformation coloring on or off, keeping the filter (applied on the next frame).
+    void EnableDeformationColoring(bool val) { m_coloring_requested = val; }
+    bool IsDeformationColoringEnabled() const { return m_coloring_requested; }
+    bool HasDeformationColoring() const { return m_deformation != nullptr; }
+
+    /// Show a small "Planet terrain" panel with a wireframe checkbox and tile counts (default: true).
+    /// Call before attaching the plugin to have it take effect from the first frame.
+    void SetShowGui(bool val);
 
     /// Show or hide the terrain.
     void SetVisible(bool val);
@@ -60,35 +83,38 @@ class CH_PLANET_API ChPlanetVisualizationVSG : public vsg3d::ChVisualSystemVSGPl
     /// Number of tiles currently in the scene.
     size_t GetNumTiles() const { return m_tiles.size(); }
 
-    /// The quadtree world this plugin drives.
-    std::shared_ptr<QuadtreeWorld> GetWorld() const { return m_world; }
+    /// The quadtree this plugin drives.
+    std::shared_ptr<ChPlanetQuadtree> GetWorld() const { return m_world; }
 
     virtual void OnAttach() override;
     virtual void OnBindAssets() override;
     virtual void OnRender() override;
 
   private:
-    using NodeKey = const QuadTree<TileMetadata, Spherical>*;
-
-    struct Tile {
-        std::uint64_t mesh_id;
-        vsg::ref_ptr<vsg::Node> node;
-    };
+    class GuiVSG;
 
     /// Build a VSG subgraph for one tile mesh, in site coordinates.
-    vsg::ref_ptr<vsg::Node> BuildTile(const Mesh& mesh) const;
+    vsg::ref_ptr<vsg::Node> BuildTile(const ChTileMesh& mesh) const;
 
     /// Add and drop tiles so the scene matches the world's resident meshes.
     void SyncTiles();
 
-    std::shared_ptr<QuadtreeWorld> m_world;
+    std::shared_ptr<ChPlanetQuadtree> m_world;
     ChSiteFrame m_site;
     std::shared_ptr<ChVisualMaterial> m_material;
-    bool m_wireframe;
+    bool m_wireframe;            ///< wireframe state of the tiles in the scene
+    bool m_wireframe_requested;  ///< wireframe state asked for, applied on the next frame
     bool m_visible;
+    bool m_show_gui;
+    std::shared_ptr<ChDeformationFilter> m_deformation;  ///< coloring source, if any
+    double m_color_range;                               ///< depth (m) that gets the top color
+    std::unique_ptr<ChColormap> m_colormap;
+    bool m_coloring;             ///< coloring state of the tiles in the scene
+    bool m_coloring_requested;   ///< coloring state asked for, applied on the next frame
+    std::shared_ptr<vsg3d::ChGuiComponentVSG> m_gui;
 
     vsg::ref_ptr<vsg::Switch> m_terrain_scene;  ///< VSG scene holding the tiles
-    std::unordered_map<NodeKey, Tile> m_tiles;  ///< tiles in the scene, by quadtree node
+    std::unordered_map<std::uint64_t, vsg::ref_ptr<vsg::Node>> m_tiles;  ///< tiles in the scene, by mesh id
     unsigned long long m_mesh_version;          ///< world mesh set version last mirrored
 };
 

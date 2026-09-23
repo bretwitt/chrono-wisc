@@ -6,19 +6,23 @@
 #include <cstdlib>
 
 #include "chrono_planet/core/BenchProfiler.h"
-#include "chrono_planet/core/FilterChain.h"
 #include "chrono_planet/core/MathUtil.h"
 #include "chrono_planet/core/Parallel.h"
-#include "chrono_planet/core/Planet.h"
+#include "chrono_planet/ChLevelOfDetail.h"
+#include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/core/SphereMath.h"
 #include "chrono_planet/lod/SphericalCoordinates.h"
+#include "chrono_planet/lod/CartesianCoordinates.h"
 
-using namespace qtplanet;
+namespace chrono {
+namespace planet {
 
-int MeshTopology::divisions(int level) { return std::min(1 << (level + 1), kMaxDivisions); }
+using namespace util;
+
+int MeshTopology::divisions(int level) { return ChLevelOfDetail::GetDivisions(level); }
 
 double MeshTopology::vertexSpacingDeg(int level, double rootDeg) {
-    return std::ldexp(rootDeg, -std::max(0, level)) / divisions(std::max(0, level));
+    return ChLevelOfDetail::GetVertexSpacing(level, rootDeg);
 }
 
 size_t MeshTopology::vertexCount(int level) {
@@ -27,9 +31,6 @@ size_t MeshTopology::vertexCount(int level) {
 }
 
 namespace {
-
-// Bake sampling stays this far from the poles, where the lon/lat lattice degenerates.
-constexpr double kBakeLatLimitDeg = 89.99;
 
 // Grid triangles followed by one skirt strip per border, for a grid of n vertices per side.
 std::vector<unsigned int> buildIndices(int n) {
@@ -73,59 +74,29 @@ const std::vector<unsigned int>& MeshTopology::indices(int level) {
     return tables[std::clamp(level, 0, kMaxDistinctLevel)];
 }
 
+const std::vector<unsigned int>& ChTileMesh::GetIndices(int level) {
+    return MeshTopology::indices(level);
+}
+
 template <typename C>
-Mesh TileMeshBuilder<C>::build(const Boundary& bounds, int level) const {
+Mesh TileMeshBuilder<C>::build(const Boundary& bounds, int level, TileHeightCache* cache) const {
     BENCH_SCOPE("generate");
-    return filterChain(BuildRequest{bounds, level, loader_.get()})
-        .then(sampleTerrain)
-        .then(measureGeometry)
-        .then(packMesh)
-        .then(bakeSurface)
-        .take();
-}
-
-template <typename C>
-typename TileMeshBuilder<C>::SampledTile TileMeshBuilder<C>::sampleTerrain(BuildRequest request) {
-    const int divisions = MeshTopology::divisions(request.level);
-    auto fine = sampleFineGrid(request.bounds, request.level, divisions, request.loader);
-    auto parent = sampleParentLattice(request.bounds, request.level, divisions, request.loader);
-    return {request, std::move(fine), std::move(parent)};
-}
-
-template <typename C>
-typename TileMeshBuilder<C>::PreparedTile TileMeshBuilder<C>::measureGeometry(SampledTile sampled) {
-    const GeometrySummary geometry = summarizeGeometry(sampled.fine.positionsM);
-    const double skirtDepthM = skirtDepthForLevel(sampled.request.level);
-    return {std::move(sampled), geometry, skirtDepthM};
-}
-
-template <typename C>
-typename TileMeshBuilder<C>::PackedTile TileMeshBuilder<C>::packMesh(PreparedTile prepared) {
-    const auto& request = prepared.sampled.request;
-    const auto& bounds = request.bounds;
-    const auto& fine = prepared.sampled.fine;
-    const auto& geometry = prepared.geometry;
+    const int divisions = MeshTopology::divisions(level);
+    const auto fine = sampleFineGrid(bounds, level, divisions, *surface_, cache ? &cache->fine : nullptr);
+    const auto parent = sampleParentLattice(bounds, level, divisions, *surface_, cache ? &cache->parent : nullptr);
+    const auto geometry = summarizeGeometry(fine.positionsM, surface_->GetBody().GetRadius());
+    const double skirtDepthM = skirtDepthForLevel(level);
     Mesh mesh;
-    mesh.level = request.level;
+    mesh.level = level;
     mesh.centerX = geometry.centerM.x;
     mesh.centerY = geometry.centerM.y;
     mesh.centerZ = geometry.centerM.z;
     mesh.minElevation = geometry.minElevationM;
     mesh.maxElevation = geometry.maxElevationM;
-    mesh.radius = boundingRadiusM(fine.positionsM, geometry.centerM, prepared.skirtDepthM);
-    mesh.uvMin[0] = (bounds.centerLonDeg - bounds.halfWidthDeg + 180.0) / 360.0;
-    mesh.uvMin[1] = (bounds.centerLatDeg - bounds.halfHeightDeg + 90.0) / 180.0;
-    mesh.uvSize[0] = 2.0 * bounds.halfWidthDeg / 360.0;
-    mesh.uvSize[1] = 2.0 * bounds.halfHeightDeg / 180.0;
-    mesh.vertexData = packVertices(fine, prepared.sampled.parent, geometry.centerM, prepared.skirtDepthM);
-    return {request, std::move(mesh)};
-}
-
-template <typename C>
-Mesh TileMeshBuilder<C>::bakeSurface(PackedTile packed) {
-    const auto& request = packed.request;
-    packed.mesh.bake = bakeShading(request.bounds, request.level, request.loader);
-    return std::move(packed.mesh);
+    mesh.radius = boundingRadiusM(fine.positionsM, geometry.centerM, skirtDepthM);
+    CoordinateTraits<C>::textureBounds(bounds, mesh.uvMin, mesh.uvSize);
+    mesh.vertexData = packVertices(fine, parent, geometry.centerM, skirtDepthM);
+    return mesh;
 }
 
 template <typename C>
@@ -133,7 +104,7 @@ double TileMeshBuilder<C>::skirtDepthForLevel(int level) {
     // Walls stay deeper than the sag a coarser neighbor's T-junctions open.
     static constexpr double depthByLevel[] = {2000.0, 1000.0, 500.0, 250.0, 150.0, 80.0, 70.0, 50.0, 30.0, 20.0};
     constexpr int count = sizeof(depthByLevel) / sizeof(depthByLevel[0]);
-    static const bool noSkirt = std::getenv("QT_NOSKIRT") != nullptr;
+    static const bool noSkirt = std::getenv("CH_PLANET_NOSKIRT") != nullptr;
     if (noSkirt) {
         return 0.0;
     }
@@ -142,12 +113,12 @@ double TileMeshBuilder<C>::skirtDepthForLevel(int level) {
 
 template <typename C>
 typename TileMeshBuilder<C>::FineGrid TileMeshBuilder<C>::sampleFineGrid(
-    const Boundary& bounds, int level, int divisions, const MultiGeoTIFFManager* loader) {
+    const Boundary& bounds, int level, int divisions, const ChPlanetSurface& surface, std::vector<double>* cache) {
     FineGrid grid;
     grid.side = divisions + 1;
     {
         BENCH_SCOPE("grid");
-        grid.positionsM = CoordinateTraits<C>::cartesianGrid(bounds, divisions, loader, level);
+        grid.positionsM = CoordinateTraits<C>::cartesianGrid(bounds, divisions, surface, level, 0.0, cache);
         grid.uv.resize(static_cast<size_t>(grid.side) * grid.side * 2);
         for (int row = 0; row < grid.side; ++row) {
             for (int column = 0; column < grid.side; ++column) {
@@ -167,7 +138,7 @@ typename TileMeshBuilder<C>::FineGrid TileMeshBuilder<C>::sampleFineGrid(
 // The parent's lattice, one ring of cells wider than this tile, so every fine vertex has a parent cell.
 template <typename C>
 std::optional<typename TileMeshBuilder<C>::ParentLattice> TileMeshBuilder<C>::sampleParentLattice(
-    const Boundary& bounds, int level, int divisions, const MultiGeoTIFFManager* loader) {
+    const Boundary& bounds, int level, int divisions, const ChPlanetSurface& surface, std::vector<double>* cache) {
     BENCH_SCOPE("lattice");
     const int parentDivisions = level > 0 ? MeshTopology::divisions(level - 1) / 2 : 0;   // parent cells across this tile
     if (parentDivisions < 1) {
@@ -176,25 +147,22 @@ std::optional<typename TileMeshBuilder<C>::ParentLattice> TileMeshBuilder<C>::sa
     ParentLattice parent;
     parent.divisions = parentDivisions;
     parent.fineCellsPerCell = divisions / parentDivisions;   // fine cells per parent cell
-    const double parentStepLonDeg = 2.0 * bounds.halfWidthDeg / parent.divisions;
-    Boundary ring = bounds;
-    ring.halfWidthDeg += parentStepLonDeg;
-    ring.halfHeightDeg += 2.0 * bounds.halfHeightDeg / parent.divisions;
+    const Boundary ring = CoordinateTraits<C>::expanded(bounds, 1.0 + 2.0 / parent.divisions);
     parent.side = parent.divisions + 3;   // coarse grid side incl. ring
-    parent.positionsM = CoordinateTraits<C>::cartesianGrid(ring, parent.divisions + 2, loader, level - 1);
+    parent.positionsM = CoordinateTraits<C>::cartesianGrid(ring, parent.divisions + 2, surface, level - 1, 0.0, cache);
     parent.slopes = slopesFor(parent.positionsM, parent.side);
     return parent;
 }
 
 template <typename C>
-typename TileMeshBuilder<C>::GeometrySummary TileMeshBuilder<C>::summarizeGeometry(const std::vector<double>& positionsM) {
+typename TileMeshBuilder<C>::GeometrySummary TileMeshBuilder<C>::summarizeGeometry(const std::vector<double>& positionsM, double sphereRadiusM) {
     const size_t gridCount = positionsM.size() / 3;
     double cx = 0, cy = 0, cz = 0, maxElev = -1e30, minElev = 1e30;
     for (size_t v = 0; v < gridCount; ++v) {
         cx += positionsM[v * 3];
         cy += positionsM[v * 3 + 1];
         cz += positionsM[v * 3 + 2];
-        const double e = CoordinateTraits<C>::elevationOf(positionsM[v * 3], positionsM[v * 3 + 1], positionsM[v * 3 + 2]);
+        const double e = CoordinateTraits<C>::elevationOf(positionsM[v * 3], positionsM[v * 3 + 1], positionsM[v * 3 + 2], sphereRadiusM);
         maxElev = std::max(maxElev, e);
         minElev = std::min(minElev, e);
     }
@@ -248,127 +216,6 @@ double TileMeshBuilder<C>::boundingRadiusM(const std::vector<double>& positionsM
     return std::sqrt(radiusSquaredM2) + skirtDepthM;
 }
 
-// Height above the sphere of the packed cartesian points, as floats. Rows go to the team on the bake-sized grids.
-template <typename C>
-std::vector<float> TileMeshBuilder<C>::elevationsM(const std::vector<double>& positionsM) {
-    const size_t count = positionsM.size() / 3;
-    std::vector<float> heightsM(count);
-#pragma omp parallel for num_threads(qtplanet::parallelThreads()) schedule(static) if (qtplanet::parallelGrid(count))
-    for (size_t v = 0; v < count; ++v) {
-        heightsM[v] = static_cast<float>(CoordinateTraits<C>::elevationOf(positionsM[v * 3], positionsM[v * 3 + 1], positionsM[v * 3 + 2]));
-    }
-    return heightsM;
-}
-
-// Unnormalized normal map over tile+margin at kBakeZoom and height map over tile+kHeightMargin.
-template <typename C>
-std::shared_ptr<const ShadingBake> TileMeshBuilder<C>::bakeShading(
-    const Boundary& bounds, int level, const MultiGeoTIFFManager* loader) {
-    BENCH_SCOPE("bake");
-    if (level < Mesh::kBakeMinLevel) {
-        return nullptr;
-    }
-    Boundary normalBakeBounds = bounds;
-    normalBakeBounds.halfWidthDeg *= (1.0 + 2.0 * Mesh::kBakeMargin);
-    normalBakeBounds.halfHeightDeg *= (1.0 + 2.0 * Mesh::kBakeMargin);
-    const double bMinLat = normalBakeBounds.centerLatDeg - normalBakeBounds.halfHeightDeg, bMaxLat = normalBakeBounds.centerLatDeg + normalBakeBounds.halfHeightDeg;
-    if (bMinLat <= -90.0 || bMaxLat >= 90.0) {
-        return nullptr;
-    }
-
-    const int res = Mesh::bakeRes(level), samplesPerTexelAxis = Mesh::bakeSupersample(level);
-    const int normalSampleSide = res * samplesPerTexelAxis;   // supersampled samples per side
-    auto bake = std::make_shared<ShadingBake>();
-    bake->res = res;
-    bake->minLon = normalBakeBounds.centerLonDeg - normalBakeBounds.halfWidthDeg;
-    bake->maxLon = normalBakeBounds.centerLonDeg + normalBakeBounds.halfWidthDeg;
-    bake->minLat = bMinLat;
-    bake->maxLat = bMaxLat;
-    // Sample at (sub)texel centers. Texel i = mean of its ss x ss samples.
-    const double normalStepLonDeg = 2.0 * normalBakeBounds.halfWidthDeg / normalSampleSide, normalStepLatDeg = 2.0 * normalBakeBounds.halfHeightDeg / normalSampleSide;
-    Boundary normalSampleBounds = normalBakeBounds;
-    normalSampleBounds.halfWidthDeg -= 0.5 * normalStepLonDeg;
-    normalSampleBounds.halfHeightDeg -= 0.5 * normalStepLatDeg;
-    std::vector<float> normalSampleHeightsM;
-    {
-        BENCH_SCOPE("bake_dem");
-        const std::vector<double> normalSamplePositionsM = CoordinateTraits<C>::cartesianGrid(normalSampleBounds, normalSampleSide - 1, loader, Mesh::kBakeZoom);
-        BENCH_SCOPE("dem_elev");
-        normalSampleHeightsM = elevationsM(normalSamplePositionsM);
-    }
-    BENCH_SCOPE("bake_normals");
-    const double dyM = metresPerDegLat(kRadiusM) * normalStepLatDeg;
-    const size_t count = static_cast<size_t>(res) * res;
-    bake->normals.resize(count * 3);
-    // A sample row of unit normals at a time, then the ss x ss mean per texel.
-#pragma omp parallel num_threads(qtplanet::parallelThreads()) if (qtplanet::parallelGrid(count))
-    {
-        std::vector<double> nx(normalSampleSide), ny(normalSampleSide), nz(normalSampleSide);
-        std::vector<Vec3> acc(res);
-#pragma omp for schedule(static)
-        for (int ty = 0; ty < res; ++ty) {
-            std::fill(acc.begin(), acc.end(), Vec3{});
-            for (int sy = 0; sy < samplesPerTexelAxis; ++sy) {
-                const int y = ty * samplesPerTexelAxis + sy;
-                const double lat = bMinLat + (y + 0.5) * normalStepLatDeg;
-                const double dxM = std::max(1.0, metresPerDegLon(kRadiusM, lat) * normalStepLonDeg);
-                const float* rowM = &normalSampleHeightsM[static_cast<size_t>(std::max(y - 1, 0)) * normalSampleSide];
-                const float* rowP = &normalSampleHeightsM[static_cast<size_t>(std::min(y + 1, normalSampleSide - 1)) * normalSampleSide];
-                const float* row = &normalSampleHeightsM[static_cast<size_t>(y) * normalSampleSide];
-                auto at = [&](int x, int xm, int xp) {
-                    const float dhx = row[xp] - row[xm], dhy = rowP[x] - rowM[x];
-                    const double gx = dhx / (2.0 * dxM), gy = dhy / (2.0 * dyM);
-                    const double len = std::sqrt(gx * gx + gy * gy + 1.0);
-                    nx[x] = -gx / len;
-                    ny[x] = -gy / len;
-                    nz[x] = 1.0 / len;
-                };
-                at(0, 0, 1);
-                for (int x = 1; x < normalSampleSide - 1; ++x) {
-                    at(x, x - 1, x + 1);
-                }
-                at(normalSampleSide - 1, normalSampleSide - 2, normalSampleSide - 1);
-                for (int tx = 0; tx < res; ++tx) {
-                    for (int sx = 0; sx < samplesPerTexelAxis; ++sx) {
-                        const int x = tx * samplesPerTexelAxis + sx;
-                        acc[tx] += Vec3{nx[x], ny[x], nz[x]};
-                    }
-                }
-            }
-            for (int tx = 0; tx < res; ++tx) {
-                Vec3 nsum = acc[tx];
-                nsum /= double(samplesPerTexelAxis * samplesPerTexelAxis);
-                const std::array<unsigned short, 3> packed = packSnorm16(nsum);
-                std::copy(packed.begin(), packed.end(), &bake->normals[(static_cast<size_t>(ty) * res + tx) * 3]);
-            }
-        }
-    }
-
-    {
-        BENCH_SCOPE("bake_height");
-        Boundary heightBakeBounds = bounds;
-        heightBakeBounds.halfWidthDeg *= (1.0 + 2.0 * Mesh::kHeightMargin);
-        const double hMinLat = std::max(bounds.centerLatDeg - bounds.halfHeightDeg * (1.0 + 2.0 * Mesh::kHeightMargin), -kBakeLatLimitDeg);
-        const double hMaxLat = std::min(bounds.centerLatDeg + bounds.halfHeightDeg * (1.0 + 2.0 * Mesh::kHeightMargin), kBakeLatLimitDeg);
-        heightBakeBounds.centerLatDeg = 0.5 * (hMinLat + hMaxLat);
-        heightBakeBounds.halfHeightDeg = 0.5 * (hMaxLat - hMinLat);
-        const int heightSide = Mesh::heightRes(level);
-        const double heightStepLonDeg = 2.0 * heightBakeBounds.halfWidthDeg / heightSide, heightStepLatDeg = 2.0 * heightBakeBounds.halfHeightDeg / heightSide;
-        Boundary heightSampleBounds = heightBakeBounds;   // texel centers
-        heightSampleBounds.halfWidthDeg -= 0.5 * heightStepLonDeg;
-        heightSampleBounds.halfHeightDeg -= 0.5 * heightStepLatDeg;
-        const std::vector<double> heightSamplePositionsM = CoordinateTraits<C>::cartesianGrid(heightSampleBounds, heightSide - 1, loader, Mesh::kBakeZoom, normalStepLonDeg);
-        bake->hRes = heightSide;
-        bake->hMinLon = heightBakeBounds.centerLonDeg - heightBakeBounds.halfWidthDeg;
-        bake->hMaxLon = heightBakeBounds.centerLonDeg + heightBakeBounds.halfWidthDeg;
-        bake->hMinLat = hMinLat;
-        bake->hMaxLat = hMaxLat;
-        BENCH_SCOPE("height_elev");
-        bake->heights = elevationsM(heightSamplePositionsM);
-    }
-    return bake;
-}
-
 // Area-weighted face normals accumulated on a (side x side) grid.
 template <typename C>
 std::vector<double> TileMeshBuilder<C>::smoothNormals(const std::vector<double>& positionsM, int side) {
@@ -397,7 +244,7 @@ std::vector<double> TileMeshBuilder<C>::smoothNormals(const std::vector<double>&
 // A normal expressed as east/north rise over its own up component.
 template <typename C>
 typename TileMeshBuilder<C>::Slope2 TileMeshBuilder<C>::slopeAt(const Vec3& positionM, const Vec3& normal) {
-    const EnuFrame frame = enuAlong(positionM);
+    const EnuFrame frame = CoordinateTraits<C>::frameAt(positionM);
     const double upComponent = std::max(dot(normal, frame.up), 0.05);
     return {dot(normal, frame.east) / upComponent, dot(normal, frame.north) / upComponent};
 }
@@ -476,3 +323,8 @@ void TileMeshBuilder<C>::writeVertex(std::vector<float>& vertices, size_t vertex
 }
 
 template class TileMeshBuilder<Spherical>;
+
+template class TileMeshBuilder<Cartesian>;
+
+}  // namespace planet
+}  // namespace chrono

@@ -14,12 +14,14 @@
 //
 // Headless demonstration of the planetary terrain models: a rigid body settles
 // on a PlanetTerrain patch that follows it, then a wheel sinks into a
-// PlanetSCMTerrain. With no DEM paths given the surface is the procedural
-// fallback plus craters, so the demo needs no data files; pass GeoTIFF paths
-// on the command line to run over a real elevation model.
+// PlanetSCMTerrain, on the Moon preset of the Planet module. With no DEM paths
+// given the surface is the Moon's procedural relief alone, so the demo needs no
+// data files; pass GeoTIFF paths on the command line to run over a real
+// elevation model.
 //
 // =============================================================================
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -27,11 +29,13 @@
 #include <optional>
 #include <thread>
 
+#include "chrono/utils/ChOpenMP.h"
 #include "chrono/physics/ChBodyEasy.h"
 #include "chrono/physics/ChSystemNSC.h"
 
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/ChSiteFrame.h"
+#include "chrono_planet/planets/moon/ChMoon.h"
 
 #include "chrono_vehicle/terrain/PlanetSCMTerrain.h"
 #include "chrono_vehicle/terrain/PlanetTerrain.h"
@@ -45,19 +49,25 @@ const double site_lon = 30.75;
 const double site_lat = 20.19;
 const int zoom = 15;
 
-const double gravity = 1.62;
+const double gravity = moon::kGravity;
 const double step_size = 1e-3;
 
 int main(int argc, char* argv[]) {
     std::cout << "Copyright (c) 2026 projectchrono.org\nChrono version: " << CHRONO_VERSION << std::endl;
 
     // DEM stack from the command line: each argument is a GeoTIFF serving all zooms.
-    std::vector<ChPlanetSurface::DemSource> dems;
+    std::vector<ChGeoTiffSource> dems;
     for (int i = 1; i < argc; ++i)
         dems.push_back({argv[i], 0, 30});
 
-    auto surface = std::make_shared<ChPlanetSurface>(dems, zoom);
-    ChSiteFrame site(site_lon, site_lat, surface->GetElevation(site_lon, site_lat));
+    std::shared_ptr<ChPlanetSurface> surface;
+    try {
+        surface = moon::CreateSurface(dems, zoom);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << std::endl;
+        return 1;
+    }
+    const ChSiteFrame site = surface->MakeSiteFrame(site_lon, site_lat);
     std::cout << "Site origin elevation: " << site.GetOriginElevation() << " m" << std::endl;
 
     // ---------------------------------------------------------------
@@ -102,7 +112,9 @@ int main(int argc, char* argv[]) {
         ChSystemNSC sys;
         sys.SetGravitationalAcceleration(ChVector3d(0, 0, -gravity));
         sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
-        sys.SetNumThreads(1, 1, 4);
+        // SCM ray-casts every wheel's grid nodes in parallel on Chrono's threads, and it dominates the step.
+        // Gains flatten past about 8 threads.
+        sys.SetNumThreads(std::min(8, ChOMP::GetNumProcs()), 1, 4);
 
         const double radius = 0.25;
         const double width = 0.2;
@@ -115,7 +127,6 @@ int main(int argc, char* argv[]) {
         PlanetSCMTerrain terrain(&sys, surface, site);
         PlanetSCMTerrain::Params params;
         params.delta = 0.05;
-        params.prefetch = false;
         terrain.Initialize(params, {{wheel, radius, width}});
 
         while (sys.GetChTime() < 2.0)

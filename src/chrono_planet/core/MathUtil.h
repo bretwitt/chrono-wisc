@@ -1,15 +1,20 @@
-#ifndef QTPLANET_MATHUTIL_H
-#define QTPLANET_MATHUTIL_H
+#ifndef CH_PLANET_MATHUTIL_H
+#define CH_PLANET_MATHUTIL_H
 
 #include "chrono_planet/ChApiPlanet.h"
 
 #include <array>
 
-#include "chrono_planet/core/Planet.h"
 
-// Scalar and small-vector helpers with no glm dependency, so headless consumers can link qtplanet.
+namespace chrono {
+namespace planet {
 
-namespace qtplanet {
+// Scalar and small-vector helpers shared by the terrain core.
+
+namespace util {
+
+inline constexpr double kPi = 3.14159265358979323846;
+inline constexpr double kTwoPi = 2.0 * kPi;
 
 // Minimal double 3-vector.
 struct CH_PLANET_API Vec3 {
@@ -69,6 +74,9 @@ constexpr unsigned char packUnorm8(double v) { return static_cast<unsigned char>
 [[nodiscard]] std::array<unsigned char, 3> packSnorm8(const Vec3& v);
 [[nodiscard]] std::array<unsigned short, 3> packSnorm16(const Vec3& v);
 
-}   // namespace qtplanet
+}  // namespace util
 
-#endif   // QTPLANET_MATHUTIL_H
+}  // namespace planet
+}  // namespace chrono
+
+#endif   // CH_PLANET_MATHUTIL_H

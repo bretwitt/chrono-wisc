@@ -31,25 +31,26 @@
 
 /**
     @defgroup planet_module PLANET module
-    @brief Planetary terrain from GeoTIFF elevation models
+    @brief Planetary terrain for any body, from GeoTIFF elevation models and procedural relief
 
-    This module provides a headless planetary terrain core: a stack of GeoTIFF digital
-    elevation models sampled at any longitude, latitude and level of detail, procedural
-    crater, rock and roughness fields layered on top of it, and a quadtree of tiles that
-    streams around a moving viewpoint. Chrono::Vehicle builds rigid and SCM terrains on
-    it (see PlanetTerrain and PlanetSCMTerrain).
+    This module provides a headless planetary terrain core that is independent of any particular
+    body. A ChPlanetBody describes the body (radius, gravity, geographic coordinate system); a
+    ChPlanetSurface on it samples heights (usually from a ChGeoTiffStack of GDAL rasters, each serving
+    a range of levels of detail, or any chain of samplers), falls back where the data has holes, and
+    passes the result through a chain of filters: procedural relief layers (base swell, craters,
+    boulder beds, micro-roughness) and filters that scale, clamp or reshape, globally or by region.
+    Everything is a pure function of longitude, latitude and level of detail. ChPlanetQuadtree streams terrain tiles from the same
+    surface around a moving viewpoint. Chrono::Vehicle builds rigid and SCM terrains on the surface
+    (see vehicle::PlanetTerrain and vehicle::PlanetSCMTerrain).
+
+    Presets for particular bodies (chrono::planet::moon, chrono::planet::mars) live under
+    chrono_planet/planets and use only the public API; they provide filter chains and, for the Moon,
+    DEM resources selected with moon::Dem, and double as templates for new bodies.
 
     For additional information, see:
+    - the [reference manual](@ref manual_planet)
     - the [installation guide](@ref module_planet_installation)
     - the [tutorials](@ref tutorial_root)
-
-    @{
-        @defgroup planet_core Body constants, sphere math and profiling
-        @defgroup planet_dem GeoTIFF loading and the multi-DEM elevation stack
-        @defgroup planet_procedural Craters, rocks and surface roughness
-        @defgroup planet_lod Quadtree, tiles and tile mesh construction
-        @defgroup planet_shading Hapke reflectance parameters
-    @}
 */
 
 namespace chrono {

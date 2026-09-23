@@ -1,5 +1,8 @@
 #include "chrono_planet/core/BenchProfiler.h"
 
+namespace chrono {
+namespace planet {
+
 namespace bench {
 
 std::atomic<bool>& profiling() {
@@ -157,7 +160,7 @@ Scope::~Scope() {
 
 void Counters::resetFrame() {
     for (std::atomic<long long>* c :
-         {&drawCalls, &triangles, &texBinds, &uniformCalls, &meshUploadBytes, &bakeUploadBytes, &bakeUploads,
+         {&drawCalls, &triangles, &texBinds, &uniformCalls, &meshUploadBytes,
           &splitsDone, &splitsDeferred, &merges, &syncBuildNs, &culledFrustum, &culledHorizon, &jobsStarted,
           &jobsFinished, &jobNsTotal, &jobNsMax}) {
         c->store(0, std::memory_order_relaxed);
@@ -176,3 +179,6 @@ void bumpMax(std::atomic<long long>& c, long long v) {
 }
 
 }   // namespace bench
+
+}  // namespace planet
+}  // namespace chrono

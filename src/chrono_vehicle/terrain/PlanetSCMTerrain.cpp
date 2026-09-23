@@ -75,23 +75,50 @@ std::size_t PlanetSCMHeightFunctor::GetNumCachedNodes() const {
 PlanetSCMTerrain::PlanetSCMTerrain(ChSystem* system,
                                    std::shared_ptr<const planet::ChPlanetSurface> surface,
                                    const planet::ChSiteFrame& site)
-    : SCMTerrain(system, false), m_functor(std::make_shared<PlanetSCMHeightFunctor>(std::move(surface), site)) {}
+    : SCMTerrain(system, false),
+      m_site(site),
+      m_functor(std::make_shared<PlanetSCMHeightFunctor>(std::move(surface), site)) {}
 
 PlanetSCMTerrain::~PlanetSCMTerrain() {
     m_stop.store(true, std::memory_order_release);
-    // Notify under each mutex so a worker between its predicate test and wait cannot miss the wake.
+    // Notify under the mutex so the worker between its predicate test and wait cannot miss the wake.
     {
         std::lock_guard<std::mutex> lock(m_stats_mutex);
         m_stats_cv.notify_all();
     }
-    {
-        std::lock_guard<std::mutex> lock(m_prefetch_mutex);
-        m_prefetch_cv.notify_all();
-    }
     if (m_stats_thread.joinable())
         m_stats_thread.join();
-    if (m_prefetch_thread.joinable())
-        m_prefetch_thread.join();
+}
+
+void PlanetSCMTerrain::SetDeformationFilter(std::shared_ptr<planet::ChDeformationFilter> filter) {
+    if (filter) {
+        const planet::ChSiteFrame& fs = filter->GetSiteFrame();
+        const bool same_site = fs.GetRadius() == m_site.GetRadius() &&
+                               fs.GetOriginLongitude() == m_site.GetOriginLongitude() &&
+                               fs.GetOriginLatitude() == m_site.GetOriginLatitude() &&
+                               fs.GetOriginElevation() == m_site.GetOriginElevation();
+        if (!same_site || std::abs(filter->GetSpacing() - m_params.delta) > 1e-12)
+            throw std::invalid_argument(
+                "PlanetSCMTerrain::SetDeformationFilter: the filter must use this terrain's site frame and grid spacing");
+    }
+    m_deformation = std::move(filter);
+}
+
+std::shared_ptr<planet::ChDeformationFilter> PlanetSCMTerrain::MakeDeformationFilter() {
+    auto filter = std::make_shared<planet::ChDeformationFilter>(m_site, m_params.delta);
+    SetDeformationFilter(filter);
+    return filter;
+}
+
+std::size_t PlanetSCMTerrain::PublishDeformation() {
+    if (!m_deformation)
+        return 0;
+    const auto nodes = GetModifiedNodes(true);
+    std::vector<std::pair<ChVector2i, double>> deltas;
+    deltas.reserve(nodes.size());
+    for (const auto& [loc, level] : nodes)
+        deltas.emplace_back(loc, level - m_functor->GetInitHeight(loc, m_params.delta));
+    return m_deformation->SetDeltas(deltas);
 }
 
 void PlanetSCMTerrain::Initialize(const Params& params, const std::vector<Wheel>& wheels) {
@@ -119,25 +146,17 @@ void PlanetSCMTerrain::Initialize(const Params& params, const std::vector<Wheel>
 
     SCMTerrain::Initialize(m_functor, m_params.delta);
 
-    // Workers start only once the grid exists.
+    // The statistics worker starts only once the grid exists.
     m_stats_thread = std::thread([this] { StatsLoop(); });
-    if (m_params.prefetch)
-        m_prefetch_thread = std::thread([this] { PrefetchLoop(); });
 }
 
 void PlanetSCMTerrain::SetSoil(const Params& params) {
-    // Grid geometry and the prefetch worker are fixed at Initialize; keep ours.
+    // Grid geometry is fixed at Initialize; keep ours.
     const double delta = m_params.delta;
     const double domain_pad = m_params.domain_pad;
-    const bool prefetch = m_params.prefetch;
-    const double lookahead = m_params.prefetch_lookahead;
-    const double half_width = m_params.prefetch_half_width;
     m_params = params;
     m_params.delta = delta;
     m_params.domain_pad = domain_pad;
-    m_params.prefetch = prefetch;
-    m_params.prefetch_lookahead = lookahead;
-    m_params.prefetch_half_width = half_width;
 
     SetSoilParameters(m_params.bekker_kphi, m_params.bekker_kc, m_params.bekker_n, m_params.mohr_cohesion,
                       m_params.mohr_friction, m_params.janosi_shear, m_params.elastic_k, m_params.damping_r);
@@ -233,133 +252,6 @@ void PlanetSCMTerrain::StatsLoop() {
         m_stats_ready = true;
         m_stats_in_flight = false;
     }
-}
-
-// -----------------------------------------------------------------------------
-// Undeformed-height prefetch
-// -----------------------------------------------------------------------------
-
-namespace {
-// Floor division, so a corridor crossing the site origin does not fold negative blocks onto positive ones.
-int FloorDiv(int a, int b) {
-    const int q = a / b;
-    return (a % b != 0 && ((a < 0) != (b < 0))) ? q - 1 : q;
-}
-}  // namespace
-
-void PlanetSCMTerrain::SetPrefetchPose(double x, double y, double hx, double hy) {
-    if (!m_params.prefetch)
-        return;
-
-    const double n = std::hypot(hx, hy);
-    if (n < 1e-9) {
-        hx = 1.0;
-        hy = 0.0;
-    } else {
-        hx /= n;
-        hy /= n;
-    }
-
-    std::lock_guard<std::mutex> lock(m_prefetch_mutex);
-    // Only wake the worker once the corridor has actually moved (a quarter meter or about 8 degrees).
-    const bool moved = std::hypot(x - m_pre_x, y - m_pre_y) > 0.25 || (hx * m_pre_hx + hy * m_pre_hy) < 0.99;
-    if (m_pre_notified && !moved)
-        return;
-    m_pre_x = x;
-    m_pre_y = y;
-    m_pre_hx = hx;
-    m_pre_hy = hy;
-    m_pre_dirty = true;
-    m_pre_notified = true;
-    m_prefetch_cv.notify_one();
-}
-
-void PlanetSCMTerrain::PrefetchLoop() {
-    while (true) {
-        double x, y, hx, hy;
-        {
-            std::unique_lock<std::mutex> lock(m_prefetch_mutex);
-            m_prefetch_cv.wait(lock, [this] { return m_pre_dirty || m_stop.load(std::memory_order_acquire); });
-            if (m_stop.load(std::memory_order_acquire))
-                return;
-            m_pre_dirty = false;
-            x = m_pre_x;
-            y = m_pre_y;
-            hx = m_pre_hx;
-            hy = m_pre_hy;
-        }
-
-        if (!WarmCorridor(x, y, hx, hy)) {
-            // Stopped on the per-pass cap with blocks left: re-arm rather than wait for the next pose.
-            std::lock_guard<std::mutex> lock(m_prefetch_mutex);
-            m_pre_dirty = true;
-        }
-    }
-}
-
-bool PlanetSCMTerrain::WarmCorridor(double x, double y, double hx, double hy) {
-    const double delta = m_params.delta;
-    const double lookahead = m_params.prefetch_lookahead;
-    const double half_width = m_params.prefetch_half_width;
-
-    // A block is a square meter of ground, so the warmed set stays small over a long drive.
-    const int nb = std::max(1, static_cast<int>(std::lround(1.0 / delta)));
-    const double block_m = nb * delta;
-    const double pad = block_m * 0.70710678;  // block half-diagonal
-
-    // Half a width behind as well as ahead, so turning on the spot still lands on warm ground.
-    const double back = half_width;
-    double min_x = x, max_x = x, min_y = y, max_y = y;
-    for (const double a : {-back, lookahead}) {
-        for (const double l : {-half_width, half_width}) {
-            const double px = x + a * hx - l * hy;
-            const double py = y + a * hy + l * hx;
-            min_x = std::min(min_x, px);
-            max_x = std::max(max_x, px);
-            min_y = std::min(min_y, py);
-            max_y = std::max(max_y, py);
-        }
-    }
-
-    const int bi0 = FloorDiv(static_cast<int>(std::floor((min_x - pad) / delta)), nb);
-    const int bi1 = FloorDiv(static_cast<int>(std::ceil((max_x + pad) / delta)), nb);
-    const int bj0 = FloorDiv(static_cast<int>(std::floor((min_y - pad) / delta)), nb);
-    const int bj1 = FloorDiv(static_cast<int>(std::ceil((max_y + pad) / delta)), nb);
-
-    // Bound the pass so a pose jump cannot hold shutdown on the join.
-    constexpr int kMaxBlocksPerPass = 512;
-    int warmed = 0;
-
-    for (int bj = bj0; bj <= bj1; ++bj) {
-        for (int bi = bi0; bi <= bi1; ++bi) {
-            if (m_stop.load(std::memory_order_acquire))
-                return true;
-            if (warmed >= kMaxBlocksPerPass)
-                return false;
-
-            const std::int64_t k = (static_cast<std::int64_t>(bi) << 32) | static_cast<std::uint32_t>(bj);
-            if (m_warmed_blocks.count(k))
-                continue;
-
-            // Test the block center against the corridor grown by the block half-diagonal.
-            const double cx = (bi * nb + nb * 0.5) * delta;
-            const double cy = (bj * nb + nb * 0.5) * delta;
-            const double dx = cx - x, dy = cy - y;
-            const double along = dx * hx + dy * hy;
-            const double lat = -dx * hy + dy * hx;
-            if (along < -back - pad || along > lookahead + pad)
-                continue;
-            if (std::fabs(lat) > half_width + pad)
-                continue;
-
-            for (int j = bj * nb; j < (bj + 1) * nb; ++j)
-                for (int i = bi * nb; i < (bi + 1) * nb; ++i)
-                    m_functor->Warm(ChVector2i(i, j), delta);
-            m_warmed_blocks.insert(k);
-            ++warmed;
-        }
-    }
-    return true;
 }
 
 }  // end namespace vehicle

@@ -29,7 +29,6 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "chrono/physics/ChBody.h"
@@ -40,6 +39,7 @@
 
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/ChSiteFrame.h"
+#include "chrono_planet/filters/ChDeformationFilter.h"
 
 namespace chrono {
 namespace vehicle {
@@ -59,9 +59,6 @@ class CH_VEHICLE_API PlanetSCMHeightFunctor : public SCMTerrain::HeightFunctor {
 
     /// Undeformed heights for many nodes at once, in the order given.
     void GetInitHeights(const std::vector<ChVector2i>& locs, double delta, std::vector<double>& out) const;
-
-    /// Evaluate and memoize a node ahead of SCM asking for it.
-    void Warm(const ChVector2i& loc, double delta) const { HeightOf(loc, delta); }
 
     /// Number of nodes currently memoized.
     std::size_t GetNumCachedNodes() const;
@@ -94,7 +91,7 @@ class CH_VEHICLE_API PlanetSCMHeightFunctor : public SCMTerrain::HeightFunctor {
 /// interact with the soil, so there is no collision mesh for anything else to rest on.
 class CH_VEHICLE_API PlanetSCMTerrain : public SCMTerrain {
   public:
-    /// Grid, soil and prefetch settings.
+    /// Grid and soil settings.
     struct Params {
         double delta = 0.05;  ///< SCM grid spacing (m)
 
@@ -113,9 +110,6 @@ class CH_VEHICLE_API PlanetSCMTerrain : public SCMTerrain {
         double domain_pad = 0.10;   ///< margin added to each wheel's active domain box (m)
         double test_height = 0.10;  ///< SCM ray test height above the undeformed surface (m)
 
-        bool prefetch = true;            ///< warm the height memo ahead of the rover on a worker thread
-        double prefetch_lookahead = 8.0;   ///< corridor length ahead of the rover (m)
-        double prefetch_half_width = 2.0;  ///< corridor half width either side of the heading (m)
     };
 
     /// A wheel body whose footprint SCM samples.
@@ -144,7 +138,7 @@ class CH_VEHICLE_API PlanetSCMTerrain : public SCMTerrain {
     /// Throws std::invalid_argument if no wheels are given.
     void Initialize(const Params& params, const std::vector<Wheel>& wheels);
 
-    /// Re-apply the soil parameters to the live terrain (grid and prefetch settings are fixed).
+    /// Re-apply the soil parameters to the live terrain (grid settings are fixed).
     void SetSoil(const Params& params);
 
     /// Current settings.
@@ -160,22 +154,34 @@ class CH_VEHICLE_API PlanetSCMTerrain : public SCMTerrain {
     /// Take the last completed summary, if any.
     std::optional<RutStats> TakeRutStats();
 
-    /// Tell the prefetch worker where the rover is and which way it is heading.
-    void SetPrefetchPose(double x, double y, double heading_x, double heading_y);
 
     /// Number of undeformed heights memoized so far.
     std::size_t GetNumCachedNodes() const { return m_functor->GetNumCachedNodes(); }
+
+    /// Publish the soil deformation into a filter, so a renderer drawing a view of the surface with it
+    /// (see planet::ChPlanetSurface::CreateView) shows the ruts. The filter must be on this terrain's site
+    /// frame with the SCM grid spacing; MakeDeformationFilter returns one. Throws std::invalid_argument
+    /// otherwise. Call after Initialize.
+    void SetDeformationFilter(std::shared_ptr<planet::ChDeformationFilter> filter);
+
+    /// A deformation filter matching this terrain's site frame and grid, already set on it.
+    std::shared_ptr<planet::ChDeformationFilter> MakeDeformationFilter();
+
+    /// Copy the current sinkage of every node SCM has touched into the deformation filter, if one is set.
+    /// Call it as often as the drawn terrain should refresh, for example once per rendered frame.
+    /// Returns the number of nodes whose height changed by more than a millimeter.
+    std::size_t PublishDeformation();
 
     /// The height functor, for consumers that sample the undeformed surface directly.
     std::shared_ptr<PlanetSCMHeightFunctor> GetHeightFunctor() const { return m_functor; }
 
   private:
     void StatsLoop();
-    void PrefetchLoop();
-    bool WarmCorridor(double x, double y, double hx, double hy);
 
     Params m_params;
+    planet::ChSiteFrame m_site;
     std::shared_ptr<PlanetSCMHeightFunctor> m_functor;
+    std::shared_ptr<planet::ChDeformationFilter> m_deformation;
 
     std::atomic<bool> m_stop{false};
 
@@ -187,16 +193,7 @@ class CH_VEHICLE_API PlanetSCMTerrain : public SCMTerrain {
     RutStats m_stats_result;
     bool m_stats_ready = false;
 
-    std::thread m_prefetch_thread;
-    std::mutex m_prefetch_mutex;
-    std::condition_variable m_prefetch_cv;
-    double m_pre_x = 0.0;
-    double m_pre_y = 0.0;
-    double m_pre_hx = 1.0;
-    double m_pre_hy = 0.0;
-    bool m_pre_dirty = false;
-    bool m_pre_notified = false;
-    std::unordered_set<std::int64_t> m_warmed_blocks;
+
 };
 
 /// @} vehicle_terrain

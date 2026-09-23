@@ -22,7 +22,7 @@
 
 #include "chrono_vehicle/terrain/PlanetTerrain.h"
 
-#include "chrono_planet/core/Planet.h"
+#include "chrono/utils/ChConstants.h"
 
 namespace chrono {
 namespace vehicle {
@@ -82,8 +82,8 @@ void PlanetTerrain::RebuildPatch(const ChVector2d& center) {
     const int n = static_cast<int>(std::round(m_size / m_resolution)) + 1;
     double center_lon, center_lat;
     m_site.ToLonLat(center.x(), center.y(), center_lon, center_lat);
-    const double deg_per_m_lat = 180.0 / (qtplanet::kPi * planet::ChSiteFrame::kRadius);
-    const double deg_per_m_lon = deg_per_m_lat / std::cos(center_lat * qtplanet::kPi / 180.0);
+    const double deg_per_m_lat = 180.0 / (CH_PI * m_site.GetRadius());
+    const double deg_per_m_lon = deg_per_m_lat / std::cos(center_lat * CH_PI / 180.0);
     const double step_lat = m_resolution * deg_per_m_lat;
     const double step_lon = m_resolution * deg_per_m_lon;
     const double lon0 = center_lon - (n - 1) / 2.0 * step_lon;

@@ -1,5 +1,5 @@
-#ifndef QTPLANET_BENCH_PROFILER_H
-#define QTPLANET_BENCH_PROFILER_H
+#ifndef CH_PLANET_BENCH_PROFILER_H
+#define CH_PLANET_BENCH_PROFILER_H
 
 #include "chrono_planet/ChApiPlanet.h"
 
@@ -16,6 +16,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace chrono {
+namespace planet {
 
 namespace bench {
 
@@ -106,15 +109,15 @@ struct CH_PLANET_API Scope {
 #define BENCH_CAT2(a, b) a##b
 #define BENCH_CAT(a, b) BENCH_CAT2(a, b)
 // Times the rest of the enclosing block under name.
-#define BENCH_SCOPE(name) ::bench::Scope BENCH_CAT(bench_scope_, __LINE__)(name)
+#define BENCH_SCOPE(name) ::chrono::planet::bench::Scope BENCH_CAT(bench_scope_, __LINE__)(name)
 
 // Per-frame tallies and live gauges.
 struct CH_PLANET_API Counters {
     // Reset every frame by resetFrame().
     std::atomic<long long> drawCalls{0}, triangles{0}, texBinds{0}, uniformCalls{0};
-    std::atomic<long long> meshUploadBytes{0}, bakeUploadBytes{0}, bakeUploads{0};
+    std::atomic<long long> meshUploadBytes{0};
     std::atomic<long long> splitsDone{0}, splitsDeferred{0}, merges{0};
-    std::atomic<long long> syncBuildNs{0};   // render-thread time building meshes no worker result covered
+    std::atomic<long long> syncBuildNs{0};   // time spent building meshes synchronously
     std::atomic<long long> culledFrustum{0}, culledHorizon{0};
     std::atomic<long long> jobsStarted{0}, jobsFinished{0};
     std::atomic<long long> jobNsTotal{0}, jobNsMax{0};
@@ -139,4 +142,7 @@ void bumpMax(std::atomic<long long>& c, long long v);
 
 }   // namespace bench
 
-#endif   // QTPLANET_BENCH_PROFILER_H
+}  // namespace planet
+}  // namespace chrono
+
+#endif   // CH_PLANET_BENCH_PROFILER_H

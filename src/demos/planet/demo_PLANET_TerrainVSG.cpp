@@ -14,9 +14,9 @@
 //
 // Quadtree planetary terrain in a VSG window: a ball drops onto a rigid
 // PlanetTerrain patch while the ChPlanetVisualizationVSG plugin streams the
-// quadtree tiles around the camera. GeoTIFF paths on the command line form the
-// DEM stack; with none, the module's default stack is used, which needs the
-// build to have been configured with CH_PLANET_ASSET_ROOT.
+// quadtree tiles around the camera, on the Moon preset. GeoTIFF paths on the
+// command line form the DEM stack; with none, the Moon DEM resources shipped
+// with Chrono (global low resolution plus the Apollo 17 landing site) are used.
 //
 // =============================================================================
 
@@ -28,7 +28,10 @@
 
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/ChSiteFrame.h"
-#include "chrono_planet/lod/QuadtreeWorld.h"
+#include "chrono_planet/lod/ChPlanetQuadtree.h"
+#include "chrono_planet/planets/moon/ChMoon.h"
+
+#include "PlanetDemoSetup.h"
 #include "chrono_planet/visualization/ChPlanetVisualizationVSG.h"
 
 #include "chrono_vehicle/terrain/PlanetTerrain.h"
@@ -48,32 +51,25 @@ const int zoom = 15;
 const double root_tile_deg = 16.0;
 const int view_range_tiles = 10;
 
-const double gravity = 1.62;
 const double step_size = 1e-3;
 
 int main(int argc, char* argv[]) {
     std::cout << "Copyright (c) 2026 projectchrono.org\nChrono version: " << CHRONO_VERSION << std::endl;
 
-    std::vector<ChPlanetSurface::DemSource> physics_dems;
-    std::vector<QuadtreeWorld::DemSource> world_dems;
-    for (int i = 1; i < argc; ++i) {
-        physics_dems.push_back({argv[i], 0, 30});
-        world_dems.push_back({argv[i], 0, 30});
-    }
+    // GeoTIFF paths from the command line.
+    std::vector<ChGeoTiffSource> dems;
+    for (int i = 1; i < argc; ++i)
+        dems.push_back({argv[i], 0, 30});
 
-    auto surface = std::make_shared<ChPlanetSurface>(physics_dems, zoom);
-    ChSiteFrame site(site_lon, site_lat, surface->GetElevation(site_lon, site_lat));
-
-    std::shared_ptr<QuadtreeWorld> world;
-    try {
-        world = std::make_shared<QuadtreeWorld>(root_tile_deg, view_range_tiles, world_dems);
-    } catch (const std::exception& e) {
-        std::cerr << e.what() << "\nPass GeoTIFF paths on the command line." << std::endl;
+    // One surface for physics and rendering, so the wheels ride the drawn ground.
+    auto surface = CreateDemoSurface(dems, zoom, root_tile_deg);
+    if (!surface)
         return 1;
-    }
+    const ChSiteFrame site = surface->MakeSiteFrame(site_lon, site_lat);
+    auto world = chrono_types::make_shared<ChPlanetQuadtree>(surface, view_range_tiles);
 
     ChSystemNSC sys;
-    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -gravity));
+    sys.SetGravitationalAcceleration(ChVector3d(0, 0, -surface->GetBody().GetSurfaceGravity()));
     sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
 
     PlanetTerrain terrain(&sys, surface, site);

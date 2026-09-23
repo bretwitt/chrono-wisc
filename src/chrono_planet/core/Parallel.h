@@ -1,5 +1,5 @@
-#ifndef QTPLANET_PARALLEL_H
-#define QTPLANET_PARALLEL_H
+#ifndef CH_PLANET_PARALLEL_H
+#define CH_PLANET_PARALLEL_H
 
 #include "chrono_planet/ChApiPlanet.h"
 
@@ -17,7 +17,10 @@
 #include <omp.h>
 #endif
 
-namespace qtplanet {
+namespace chrono {
+namespace planet {
+
+namespace util {
 
 // Grids below this run on the calling thread.
 constexpr size_t kParallelMinSamples = 128 * 128;
@@ -65,6 +68,9 @@ inline int parallelThreads() {
 #endif
 }
 
-}   // namespace qtplanet
+}  // namespace util
 
-#endif   // QTPLANET_PARALLEL_H
+}  // namespace planet
+}  // namespace chrono
+
+#endif   // CH_PLANET_PARALLEL_H

@@ -23,9 +23,10 @@
 #include <cmath>
 
 #include "chrono/core/ChVector3.h"
+#include "chrono/utils/ChConstants.h"
 
 #include "chrono_planet/ChApiPlanet.h"
-#include "chrono_planet/core/Planet.h"
+#include "chrono_planet/ChPlanetBody.h"
 
 namespace chrono {
 namespace planet {
@@ -33,38 +34,41 @@ namespace planet {
 /// @addtogroup planet_module
 /// @{
 
-/// Local east-north-up frame tangent to the planet sphere at a site origin.
+/// Local east-north-up frame tangent to a planet's reference sphere at a site origin.
 /// Positions are equirectangular meters about the origin, so the frame is only meant for the
 /// few kilometers a surface simulation covers; z is elevation above the origin's elevation.
 class CH_PLANET_API ChSiteFrame {
   public:
-    /// Planet radius in meters, shared with the terrain core.
-    static constexpr double kRadius = qtplanet::kRadiusM;
+    /// Construct a site frame on a sphere of the given radius (m), at the given origin (degrees, meters).
+    ChSiteFrame(double radius, double origin_lon_deg, double origin_lat_deg, double origin_elev_m)
+        : m_radius(radius), m_lon0(origin_lon_deg), m_lat0(origin_lat_deg), m_elev0(origin_elev_m) {}
 
-    /// Construct a site frame at the given origin (degrees, meters).
-    ChSiteFrame(double origin_lon_deg, double origin_lat_deg, double origin_elev_m)
-        : m_lon0(origin_lon_deg), m_lat0(origin_lat_deg), m_elev0(origin_elev_m) {}
+    /// Construct a site frame on the body's reference sphere, at the given origin (degrees, meters).
+    /// ChPlanetSurface::MakeSiteFrame builds one with the origin on the surface.
+    ChSiteFrame(const ChPlanetBody& body, double origin_lon_deg, double origin_lat_deg, double origin_elev_m)
+        : ChSiteFrame(body.GetRadius(), origin_lon_deg, origin_lat_deg, origin_elev_m) {}
 
     /// Convert a planet position (degrees, meters) to site coordinates.
     ChVector3d ToLocal(double lon_deg, double lat_deg, double elev_m) const {
-        const double y = Deg2Rad(lat_deg - m_lat0) * kRadius;
-        const double x = Deg2Rad(WrapDelta(lon_deg - m_lon0)) * kRadius * std::cos(Deg2Rad(lat_deg));
+        const double y = Deg2Rad(lat_deg - m_lat0) * m_radius;
+        const double x = Deg2Rad(WrapDelta(lon_deg - m_lon0)) * m_radius * std::cos(Deg2Rad(lat_deg));
         return ChVector3d(x, y, elev_m - m_elev0);
     }
 
     /// Convert site x/y meters to longitude and latitude in degrees.
     void ToLonLat(double x, double y, double& lon_deg, double& lat_deg) const {
-        lat_deg = m_lat0 + Rad2Deg(y / kRadius);
-        lon_deg = m_lon0 + Rad2Deg(x / (kRadius * std::cos(Deg2Rad(lat_deg))));
+        lat_deg = m_lat0 + Rad2Deg(y / m_radius);
+        lon_deg = m_lon0 + Rad2Deg(x / (m_radius * std::cos(Deg2Rad(lat_deg))));
     }
 
+    double GetRadius() const { return m_radius; }           ///< reference sphere radius (m)
     double GetOriginLongitude() const { return m_lon0; }  ///< origin longitude (degrees)
     double GetOriginLatitude() const { return m_lat0; }   ///< origin latitude (degrees)
     double GetOriginElevation() const { return m_elev0; } ///< origin elevation (meters)
 
   private:
-    static double Deg2Rad(double d) { return d * (qtplanet::kPi / 180.0); }
-    static double Rad2Deg(double r) { return r * (180.0 / qtplanet::kPi); }
+    static double Deg2Rad(double d) { return d * (CH_PI / 180.0); }
+    static double Rad2Deg(double r) { return r * (180.0 / CH_PI); }
     static double WrapDelta(double d) {
         while (d > 180.0)
             d -= 360.0;
@@ -73,6 +77,7 @@ class CH_PLANET_API ChSiteFrame {
         return d;
     }
 
+    double m_radius;
     double m_lon0;
     double m_lat0;
     double m_elev0;

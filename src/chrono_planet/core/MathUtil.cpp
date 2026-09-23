@@ -2,7 +2,10 @@
 
 #include <cmath>
 
-namespace qtplanet {
+namespace chrono {
+namespace planet {
+
+namespace util {
 
 double length(const Vec3& v) { return std::sqrt(dot(v, v)); }
 
@@ -32,4 +35,7 @@ std::array<unsigned short, 3> packSnorm16(const Vec3& v) {
     return {packSnorm16(v.x), packSnorm16(v.y), packSnorm16(v.z)};
 }
 
-}   // namespace qtplanet
+}  // namespace util
+
+}  // namespace planet
+}  // namespace chrono

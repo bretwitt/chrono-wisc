@@ -1,5 +1,5 @@
-#ifndef QTPLANET_QUADTREE_H
-#define QTPLANET_QUADTREE_H
+#ifndef CH_PLANET_QUADTREE_H
+#define CH_PLANET_QUADTREE_H
 
 #include "chrono_planet/ChApiPlanet.h"
 
@@ -8,8 +8,11 @@
 #include <memory>
 #include "chrono_planet/lod/CoordinateSystems.h"
 
+namespace chrono {
+namespace planet {
+
 // A node of the LOD tree that owns its four children. Callbacks let the owner attach and release per-node data.
-// Instantiated for <TileMetadata, Spherical> only.
+// Instantiated for TileMetadata with Spherical and Cartesian coordinates.
 template <typename T, typename CoordSystem>
 class QuadTree {
 public:
@@ -38,7 +41,7 @@ public:
     const T* getType() const { return &data_; }
     T* getType() { return &data_; }
 
-    // Borrowed child nodes in Traits::getChildBounds order, NE, NW, SE, SW. All null unless divided.
+    // Borrowed child nodes in Traits::getChildBounds order, NE, NW, SW, SE. All null unless divided.
     std::array<QuadTree*, 4> children() {
         return {children_[0].get(), children_[1].get(), children_[2].get(), children_[3].get()};
     }
@@ -60,4 +63,7 @@ private:
     std::array<std::unique_ptr<QuadTree>, 4> children_;
 };
 
-#endif   // QTPLANET_QUADTREE_H
+}  // namespace planet
+}  // namespace chrono
+
+#endif   // CH_PLANET_QUADTREE_H

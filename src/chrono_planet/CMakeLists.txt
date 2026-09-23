@@ -35,47 +35,64 @@ else()
   set(CH_PLANET_SIMD_FLAGS "$<$<CXX_COMPILER_ID:GNU,Clang>:-ffp-contract=off>")
 endif()
 
-# Optional directory holding the renderer's shaders/ and resources/, baked in so
-# relative DEM paths resolve without depending on the working directory.
-set(CH_PLANET_ASSET_ROOT "" CACHE PATH "Directory containing the terrain shaders/ and resources/ trees (optional)")
-
 #-----------------------------------------------------------------------------
 
+set(Chrono_PLANET_FILES
+    ChApiPlanet.h
+    ChGeoGrid.h
+    ChLevelOfDetail.h
+    ChLevelOfDetail.cpp
+    ChPlanetBody.h
+    ChPlanetBody.cpp
+    ChPlanetSurface.h
+    ChPlanetSurface.cpp
+    ChSiteFrame.h
+)
+source_group("" FILES ${Chrono_PLANET_FILES})
+
 set(Chrono_PLANET_CORE_FILES
-    core/AssetPaths.h
-    core/AssetPaths.cpp
     core/BenchProfiler.h
     core/BenchProfiler.cpp
-    core/FilterChain.h
+    core/FieldHash.h
     core/MathUtil.h
     core/MathUtil.cpp
     core/Parallel.h
-    core/Planet.h
+    core/Perlin.h
+    core/Perlin.cpp
     core/SphereMath.h
     core/SphereMath.cpp
 )
 source_group("core" FILES ${Chrono_PLANET_CORE_FILES})
 
+set(Chrono_PLANET_SAMPLERS_FILES
+    samplers/ChElevationSampler.h
+    samplers/ChElevationSampler.cpp
+)
+source_group("samplers" FILES ${Chrono_PLANET_SAMPLERS_FILES})
+
 set(Chrono_PLANET_DEM_FILES
+    samplers/ChElevationSampler.h
+    samplers/ChElevationSampler.cpp
+    dem/ChGeoTiffStack.h
+    dem/ChGeoTiffStack.cpp
     dem/GeoTIFFLoader.h
     dem/GeoTIFFLoader.cpp
-    dem/MultiGeoTIFFManager.h
-    dem/MultiGeoTIFFManager.cpp
 )
 source_group("dem" FILES ${Chrono_PLANET_DEM_FILES})
 
 set(Chrono_PLANET_LOD_FILES
+    lod/ChPlanetQuadtree.h
+    lod/ChPlanetQuadtree.cpp
+    lod/ChTileMesh.h
     lod/CoordinateSystems.h
     lod/Quadtree.h
     lod/Quadtree.cpp
     lod/QuadtreeTile.h
     lod/QuadtreeTile.cpp
-    lod/QuadtreeWorld.h
-    lod/QuadtreeWorld.cpp
     lod/SphericalCoordinates.h
+    lod/CartesianCoordinates.h
+    lod/CartesianCoordinates.cpp
     lod/SphericalCoordinates.cpp
-    lod/TileBuildWorker.h
-    lod/TileBuildWorker.cpp
     lod/TileMeshBuilder.h
     lod/TileMeshBuilder.cpp
     lod/TileMetadata.h
@@ -83,46 +100,58 @@ set(Chrono_PLANET_LOD_FILES
 )
 source_group("lod" FILES ${Chrono_PLANET_LOD_FILES})
 
+set(Chrono_PLANET_FILTERS_FILES
+    filters/ChSurfaceFilter.h
+    filters/ChSurfaceFilter.cpp
+    filters/ChDeformationFilter.h
+    filters/ChDeformationFilter.cpp
+)
+source_group("filters" FILES ${Chrono_PLANET_FILTERS_FILES})
+
 set(Chrono_PLANET_PROCEDURAL_FILES
-    procedural/CraterField.h
-    procedural/CraterField.cpp
+    procedural/ChReliefLayer.h
+    procedural/ChReliefLayer.cpp
+    procedural/ChBaseReliefLayer.h
+    procedural/ChBaseReliefLayer.cpp
+    procedural/ChCraterLayer.h
+    procedural/ChCraterLayer.cpp
+    procedural/ChRockLayer.h
+    procedural/ChRockLayer.cpp
+    procedural/ChRoughnessLayer.h
+    procedural/ChRoughnessLayer.cpp
     procedural/FieldGrid.h
-    procedural/FieldHash.h
-    procedural/Perlin.h
-    procedural/Perlin.cpp
-    procedural/RockField.h
-    procedural/RockField.cpp
-    procedural/RockMeshes.h
-    procedural/RockMeshes.cpp
-    procedural/RockSdf.h
-    procedural/RockSdf.cpp
-    procedural/SurfaceRoughness.h
-    procedural/SurfaceRoughness.cpp
+    core/FieldHash.h
+    core/Perlin.h
+    core/Perlin.cpp
+    geometry/RockMeshes.h
+    geometry/RockMeshes.cpp
+    geometry/RockSdf.h
+    geometry/RockSdf.cpp
 )
 source_group("procedural" FILES ${Chrono_PLANET_PROCEDURAL_FILES})
 
-set(Chrono_PLANET_SHADING_FILES
-    shading/Hapke.h
-    shading/Hapke.cpp
-)
-source_group("shading" FILES ${Chrono_PLANET_SHADING_FILES})
 
-set(Chrono_PLANET_FILES
-    ChApiPlanet.h
-    ChSiteFrame.h
-    ChPlanetSurface.h
-    ChPlanetSurface.cpp
+# Presets for particular bodies. They use only the public API above; nothing in the
+# core includes them.
+set(Chrono_PLANET_PLANETS_FILES
+    planets/moon/ChMoon.h
+    planets/moon/ChMoon.cpp
+    planets/moon/ChMoonDem.h
+    planets/moon/ChMoonDem.cpp
+    planets/mars/ChMars.h
+    planets/mars/ChMars.cpp
 )
-source_group("" FILES ${Chrono_PLANET_FILES})
+source_group("planets" FILES ${Chrono_PLANET_PLANETS_FILES})
 
 # The grid loops in these files only vectorise if the compiler may hoist
 # floating-point work out of a conditional and skip the errno check on sqrt.
 # Neither changes a result and nothing here reads errno.
 set_source_files_properties(
-    procedural/CraterField.cpp
-    procedural/RockField.cpp
-    procedural/SurfaceRoughness.cpp
-    dem/MultiGeoTIFFManager.cpp
+    procedural/ChBaseReliefLayer.cpp
+    procedural/ChCraterLayer.cpp
+    procedural/ChRockLayer.cpp
+    procedural/ChRoughnessLayer.cpp
+    dem/ChGeoTiffStack.cpp
     lod/SphericalCoordinates.cpp
     lod/TileMeshBuilder.cpp
     PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-fno-math-errno;-fno-trapping-math>"
@@ -134,10 +163,13 @@ set_source_files_properties(
 add_library(Chrono_planet
     ${Chrono_PLANET_FILES}
     ${Chrono_PLANET_CORE_FILES}
+    ${Chrono_PLANET_SAMPLERS_FILES}
     ${Chrono_PLANET_DEM_FILES}
     ${Chrono_PLANET_LOD_FILES}
+    ${Chrono_PLANET_FILTERS_FILES}
     ${Chrono_PLANET_PROCEDURAL_FILES}
-    ${Chrono_PLANET_SHADING_FILES}
+    ${Chrono_PLANET_GEOMETRY_FILES}
+    ${Chrono_PLANET_PLANETS_FILES}
 )
 add_library(Chrono::planet ALIAS Chrono_planet)
 
@@ -157,14 +189,12 @@ if(MSVC)
 endif()
 
 target_compile_definitions(Chrono_planet PRIVATE $<$<COMPILE_LANGUAGE:CXX>:CH_API_COMPILE_PLANET>)
-if(CH_PLANET_ASSET_ROOT)
-  target_compile_definitions(Chrono_planet PRIVATE QTPLANET_SOURCE_ROOT="${CH_PLANET_ASSET_ROOT}")
-endif()
 
 target_compile_options(Chrono_planet PRIVATE ${CH_PLANET_SIMD_FLAGS})
 
-# GDAL is public: the DEM headers expose OGRSpatialReference members.
-target_link_libraries(Chrono_planet PUBLIC Chrono_core GDAL::GDAL)
+# GDAL stays inside the DEM implementation; installed headers do not include it.
+# Users link GDAL but need not have its headers.
+target_link_libraries(Chrono_planet PUBLIC Chrono_core PRIVATE GDAL::GDAL)
 
 install(TARGETS Chrono_planet
         EXPORT ChronoTargets
@@ -179,7 +209,8 @@ install(TARGETS Chrono_planet
 
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
         DESTINATION include/chrono_planet
-        FILES_MATCHING PATTERN "*.h")
+        FILES_MATCHING PATTERN "*.h"
+        PATTERN "GeoTIFFLoader.h" EXCLUDE)
 
 # Dependencies on other Chrono components, for the exported ChronoConfig.
 set(DEPENDENCIES_PLANET "" PARENT_SCOPE)
