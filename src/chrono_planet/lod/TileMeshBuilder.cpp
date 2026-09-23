@@ -39,24 +39,29 @@ std::vector<unsigned int> buildIndices(int n) {
     out.reserve(static_cast<size_t>(divisions) * divisions * 6 + 4 * (n - 1) * 6);
     for (int j = 0; j < divisions; ++j) {
         for (int i = 0; i < divisions; ++i) {
+            // j grows north and i east; counter-clockwise seen from above, so the front face is up.
             const unsigned int tl = j * n + i, tr = tl + 1, bl = (j + 1) * n + i, br = bl + 1;
-            out.insert(out.end(), {tl, bl, tr, tr, bl, br});
+            out.insert(out.end(), {tl, tr, bl, tr, br, bl});
         }
     }
     // Skirts, one strip per border, hanging off the skirt rows after the grid.
     unsigned int base = static_cast<unsigned int>(n) * n;
-    auto strip = [&](auto&& topIndex) {
+    // Walls face outward: south and east strips as listed, north and west ones reversed.
+    auto strip = [&](bool reversed, auto&& topIndex) {
         for (int k = 0; k + 1 < n; ++k) {
             const unsigned int t0 = topIndex(k), t1 = topIndex(k + 1);
             const unsigned int b0 = base + k, b1 = base + k + 1;
-            out.insert(out.end(), {t0, b0, t1, t1, b0, b1});
+            if (reversed)
+                out.insert(out.end(), {t0, t1, b0, t1, b1, b0});
+            else
+                out.insert(out.end(), {t0, b0, t1, t1, b0, b1});
         }
         base += n;
     };
-    strip([n](int k) { return static_cast<unsigned int>(k); });                 // south row
-    strip([n](int k) { return static_cast<unsigned int>((n - 1) * n + k); });   // north row
-    strip([n](int k) { return static_cast<unsigned int>(k * n); });             // west column
-    strip([n](int k) { return static_cast<unsigned int>(k * n + (n - 1)); });   // east column
+    strip(false, [n](int k) { return static_cast<unsigned int>(k); });                 // south row
+    strip(true, [n](int k) { return static_cast<unsigned int>((n - 1) * n + k); });    // north row
+    strip(true, [n](int k) { return static_cast<unsigned int>(k * n); });              // west column
+    strip(false, [n](int k) { return static_cast<unsigned int>(k * n + (n - 1)); });   // east column
     return out;
 }
 

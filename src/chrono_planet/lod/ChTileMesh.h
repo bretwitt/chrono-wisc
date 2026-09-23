@@ -32,7 +32,8 @@ namespace planet {
 /// @{
 
 /// One tile's renderable geometry: a vertex grid plus skirts, relative to the tile center.
-/// Centers use planet-centered meters for Spherical, site meters for Cartesian. Triangles come from GetIndices(level).
+/// Centers use planet-centered meters for Spherical, site meters for Cartesian. Triangles come from GetIndices(level),
+/// counter-clockwise seen from outside (up for the grid, outward for the skirts).
 struct CH_PLANET_API ChTileMesh {
     /// Vertex layout: position(3) slope(2) uv(2) parent position(3) parent slope(2). Positions are
     /// relative to (centerX, centerY, centerZ); slopes are the normal's east and north components over
