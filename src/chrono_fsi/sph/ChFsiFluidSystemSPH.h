@@ -377,6 +377,10 @@ class CH_FSI_API ChFsiFluidSystemSPH : public ChFsiFluidSystem {
     /// For each SPH particle, the 3-dimensional vector contains density, pressure, and viscosity.
     std::vector<ChVector3d> GetParticleFluidProperties() const;
 
+    /// Return the stress tensor of the SPH particles (CRM only): diagonal (xx, yy, zz) and off-diagonal (xy, xz, yz)
+    /// components.
+    void GetParticleStresses(std::vector<ChVector3d>& diag, std::vector<ChVector3d>& offdiag) const;
+
     /// Return the boundary treatment type.
     BoundaryMethod GetBoundaryType() const { return m_paramsH->boundary_method; }
 

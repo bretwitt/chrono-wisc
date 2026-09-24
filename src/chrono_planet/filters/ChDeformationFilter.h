@@ -20,6 +20,7 @@
 #ifndef CH_DEFORMATION_FILTER_H
 #define CH_DEFORMATION_FILTER_H
 
+#include <algorithm>
 #include <cstdint>
 #include <deque>
 #include <shared_mutex>
@@ -83,6 +84,11 @@ class CH_PLANET_API ChDeformationFilter : public ChSurfaceFilter {
     void SetFlattenDepth(double depth) { m_flatten_depth = depth; }
     double GetFlattenDepth() const { return m_flatten_depth; }
 
+    /// How much of the incoming terrain's finer relief compacted ground loses, from 0 (none) to 1 (all, the default):
+    /// a wheel smooths the regolith it presses without polishing it.
+    void SetFlattenStrength(double strength) { m_flatten_strength = std::clamp(strength, 0.0, 1.0); }
+    double GetFlattenStrength() const { return m_flatten_strength; }
+
     /// Remove every change, recording one covering them all.
     void Clear();
 
@@ -125,6 +131,7 @@ class CH_PLANET_API ChDeformationFilter : public ChSurfaceFilter {
     };
     std::unordered_map<std::int64_t, Value> m_deltas;
     double m_flatten_depth = 0.01;
+    double m_flatten_strength = 1.0;
     int m_i0, m_j0, m_i1, m_j1;  // bounding box of the nodes ever set, in node indices
 
     struct Change {

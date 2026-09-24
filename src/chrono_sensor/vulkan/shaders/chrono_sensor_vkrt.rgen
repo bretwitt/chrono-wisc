@@ -715,6 +715,26 @@ float volume_light_transmittance(vec3 hit_pos, vec3 light_dir, int type, float m
 // Light scattered toward the viewer per unit extinction at p: w * color * sum over lights of irradiance * phase / 4 pi.
 // The traced light gets the grid's transmittance and visibility, and every light that still reaches p is checked
 // against the scene's geometry, so the medium in the shadow of a vehicle is dark.
+//
+// Inside a thick cloud most light arrives scattered more than once, which single scattering leaves out, and the
+// cloud looks dark as smoke. For the traced light, two more orders of scattering are added as octaves (Wrenninge,
+// "Oz: The Great and Volumetric", SIGGRAPH 2013 talk): order i weighted by albedo^i, seeing the transmittance toward
+// the light as T^(1/2^i) and a phase function half as peaked, and faded in with the cloud's optical depth toward the
+// light (1 - T), so thin dust is lit as before.
+float volume_sun_phase(VolumeInfo v, float T, float cos_g) {
+    float phase = T * hapke_phase(v.phase_b, v.phase_c, cos_g);
+    float weight = 1.0 - T;
+    float b = v.phase_b;
+    float Ti = T;
+    for (int i = 1; i <= 2; ++i) {
+        weight *= v.albedo;
+        b *= 0.5;
+        Ti = sqrt(Ti);
+        phase += weight * Ti * hapke_phase(b, v.phase_c, cos_g);
+    }
+    return phase;
+}
+
 vec3 volume_source(VolumeInfo v, vec3 p, vec3 view_dir, vec2 sun_tv) {
     vec3 sum = vec3(0.0);
     for (uint i = 0u; i < scene_data.counts.x; ++i) {
@@ -727,11 +747,15 @@ vec3 volume_source(VolumeInfo v, vec3 p, vec3 view_dir, vec2 sun_tv) {
         float attenuation = sample_local_light(light, type, p, light_dir, max_t);
         if (attenuation <= 0.0)
             continue;
-        if (type == LIGHT_DIRECTIONAL && dot(light_dir, v.sun_dir) > 0.99999)
-            attenuation *= sun_tv.x * sun_tv.y;
-        if (attenuation <= 1e-4 || visibility_occluded_optix(p, light_dir, max_t))
+        float cos_g = dot(light_dir, view_dir);
+        float phase = hapke_phase(v.phase_b, v.phase_c, cos_g);
+        if (type == LIGHT_DIRECTIONAL && dot(light_dir, v.sun_dir) > 0.99999) {
+            attenuation *= sun_tv.y;
+            phase = volume_sun_phase(v, sun_tv.x, cos_g);
+        }
+        if (attenuation * phase <= 1e-6 || visibility_occluded_optix(p, light_dir, max_t))
             continue;
-        sum += attenuation * light.color_atten.rgb * hapke_phase(v.phase_b, v.phase_c, dot(light_dir, view_dir));
+        sum += attenuation * light.color_atten.rgb * phase;
     }
     return v.albedo * v.color * sum / (4.0 * PI);
 }
@@ -1003,6 +1027,27 @@ vec3 trace_lit_once(vec3 origin, vec3 dir, bool include_ambient, uint sample_see
     return shade_direct(h, origin, dir, include_ambient, sample_seed);
 }
 
+uint camera_sample_factor();
+
+// Direction of the GI bounce ray of a pixel's camera sample: over the cap 0.35 < cos < 1 about n, uniform in solid
+// angle. The pixel's samples are stratified over the cap (a k x k grid of azimuth and cos, k the supersampling factor),
+// in an order shuffled per pixel, so they cover it evenly instead of clumping as independent random directions do.
+vec3 gi_direction(vec3 n, uint seed, uint sample_index, out float z) {
+    uint k = camera_sample_factor();
+    uint count = k * k;
+    uint shuffle = ((gl_LaunchIDEXT.x + 1u) * 2246822519u ^ (gl_LaunchIDEXT.y + 1u) * 3266489917u ^ (pc.frame_index + 1u) * 668265263u) % count;
+    uint stratum = (sample_index + shuffle) % count;
+    float u = (float(stratum % k) + hash_unit(seed ^ 0x9e3779b9u)) / float(k);
+    float v = (float(stratum / k) + hash_unit(seed ^ 0x85ebca6bu)) / float(k);
+    float a = 2.0 * PI * u;
+    z = v * 0.65 + 0.35;
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    vec3 helper = abs(n.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    vec3 t = normalize(cross(helper, n));
+    vec3 b = normalize(cross(n, t));
+    return normalize(t * (r * cos(a)) + b * (r * sin(a)) + n * z);
+}
+
 vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index) {
     vec3 accum = vec3(0.0);
     uint path_seed = (gl_LaunchIDEXT.x + 1u) * 73856093u ^
@@ -1042,8 +1087,21 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index) {
         uint bounce_seed = hash_u32(path_seed ^ uint(depth + 1) * 83492791u);
         vec3 direct = shade_direct(h, ro, rd, depth == 0, bounce_seed);
 
-        // As in OptiX, a Hapke surface is opaque and adds no mirror or GI bounce.
+        // A Hapke surface is opaque and adds no mirror bounce. With GI it takes one diffuse bounce, as regolith in
+        // shadow is lit by the sunlit regolith around it: the light from one direction over the hemisphere (0.35 < cos
+        // < 1, uniform in solid angle), reflected with the surface's diffusive reflectance r0 = (1 - g) / (1 + g),
+        // g = sqrt(1 - w) (Hapke 2012, eq. 8.25), tinted by its albedo color.
         if (materials[h.mat_id].ids.z == BSDF_HAPKE) {
+            if ((pc.flags & FLAG_USE_GI) != 0u && depth == 0) {
+                uint gi_seed = bounce_seed ^ 0x7f4a7c15u;
+                float z;
+                vec3 gi_dir = gi_direction(n, gi_seed, camera_sample_index, z);
+                vec3 gi = trace_lit_once(hit_pos + gi_dir * TRACE_EPS, gi_dir, false, gi_seed ^ 0xc2b2ae35u);
+                float g = sqrt(max(0.0, 1.0 - materials[h.mat_id].hapke0.x));
+                float r0 = (1.0 - g) / (1.0 + g);
+                // Monte Carlo estimate of (r0 / pi) * integral of L cos over the sampled cap: r0 * L * cos * 2 * 0.65
+                direct += r0 * 1.3 * z * mat.diffuse * gi;
+            }
             accum += throughput * direct;
             break;
         }
@@ -1076,13 +1134,8 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index) {
 
         if ((pc.flags & FLAG_USE_GI) != 0u && depth == 0) {
             uint gi_seed = bounce_seed ^ 0x7f4a7c15u;
-            float a = 2.0 * PI * hash_unit(gi_seed ^ 0x9e3779b9u);
-            float z = hash_unit(gi_seed ^ 0x85ebca6bu) * 0.65 + 0.35;
-            float r = sqrt(max(0.0, 1.0 - z * z));
-            vec3 helper = abs(n.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
-            vec3 t = normalize(cross(helper, n));
-            vec3 b = normalize(cross(n, t));
-            vec3 gi_dir = normalize(t * (r * cos(a)) + b * (r * sin(a)) + n * z);
+            float z;
+            vec3 gi_dir = gi_direction(n, gi_seed, camera_sample_index, z);
             float gi_ndl = max(dot(n, gi_dir), 0.0);
             vec3 gi = trace_lit_once(hit_pos + gi_dir * TRACE_EPS, gi_dir, false,
                                      gi_seed ^ 0xc2b2ae35u);

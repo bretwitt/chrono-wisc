@@ -1004,11 +1004,14 @@ void SphForceWCSPH::CrmApplyBC(std::shared_ptr<SphMarkerDataD> sortedSphMarkersD
                                                 mR3CAST(sortedSphMarkersD->tauXxYyZzD), mR3CAST(sortedSphMarkersD->tauXyXzYzD), m_errflagD);
     } else {
         thrust::device_vector<Real2> sortedKernelSupport(numActive);
+        // The Holmes kernels use too many registers for blocks of 1024 threads
+        const uint holmesThreads = 256;
+        const uint holmesBlocks = (numActive + holmesThreads - 1) / holmesThreads;
         // Calculate the kernel support of each particle
-        calcKernelSupport_D<<<numBlocks, numThreads>>>(mR4CAST(sortedSphMarkersD->posRadD), mR4CAST(sortedSphMarkersD->rhoPresMuD), mR2CAST(sortedKernelSupport),
+        calcKernelSupport_D<<<holmesBlocks, holmesThreads>>>(mR4CAST(sortedSphMarkersD->posRadD), mR4CAST(sortedSphMarkersD->rhoPresMuD), mR2CAST(sortedKernelSupport),
                                                        U1CAST(m_data_mgr.numNeighborsPerPart), U1CAST(m_data_mgr.neighborList), numActive);
         // https://onlinelibrary-wiley-com.ezproxy.library.wisc.edu/doi/pdfdirect/10.1002/nag.898
-        CrmHolmesBC_D<<<numBlocks, numThreads>>>(U1CAST(m_data_mgr.numNeighborsPerPart), U1CAST(m_data_mgr.neighborList), mR4CAST(sortedSphMarkersD->posRadD),
+        CrmHolmesBC_D<<<holmesBlocks, holmesThreads>>>(U1CAST(m_data_mgr.numNeighborsPerPart), U1CAST(m_data_mgr.neighborList), mR4CAST(sortedSphMarkersD->posRadD),
                                                  mR2CAST(sortedKernelSupport), numActive, mR3CAST(m_data_mgr.bceAcc), mR4CAST(sortedSphMarkersD->rhoPresMuD),
                                                  mR3CAST(sortedSphMarkersD->velMasD), mR3CAST(sortedSphMarkersD->tauXxYyZzD), mR3CAST(sortedSphMarkersD->tauXyXzYzD), m_errflagD);
     }
@@ -1042,128 +1045,22 @@ void SphForceWCSPH::CfdApplyBC(std::shared_ptr<SphMarkerDataD> sortedSphMarkersD
 // CrmCalcRHS
 // -----------------------------------------------------------------------------
 
-__device__ inline Real4 CrmCalcDvDt_D(const Real W_ini_inv,
-                                      const Real W_AB,
-                                      const Real3 gradW,
-                                      const Real3 dist3,
-                                      const Real d,
-                                      const Real invd,
-                                      const Real4 posRadA,
-                                      const Real4 posRadB,
-                                      const Real3 velMasA,
-                                      const Real3 velMasB,
-                                      const Real4 rhoPresMuA,
-                                      const Real4 rhoPresMuB,
-                                      const Real3 tauXxYyZz_A,
-                                      const Real3 tauXyXzYz_A,
-                                      const Real3 tauXxYyZz_B,
-                                      const Real3 tauXyXzYz_B,
-                                      Real* max_vel_diff) {
-    if (IsBceMarker(rhoPresMuA.w) && IsBceMarker(rhoPresMuB.w))
-        return mR4(0);
+// Threads that share one particle's neighbor loop in CrmCalcRHS_D and Calc_Shifting_D. They run over the active particles only,
+// often a few thousand near the solids of an active domain, too few for one thread per particle to keep the GPU's
+// memory pipeline full: each thread would walk its neighbors one load at a time. A group of threads takes every
+// SPH_NEIGHBOR_GROUP-th neighbor each and their partial sums are combined with warp shuffles.
+#define SPH_NEIGHBOR_GROUP 8
 
-    // Density Update
-    Real derivRho = paramsD.markerMass * dot(velMasA - velMasB, gradW);
+__device__ inline Real GroupSum(Real v) {
+    for (int offset = SPH_NEIGHBOR_GROUP / 2; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset, SPH_NEIGHBOR_GROUP);
+    return v;
+}
 
-    if (paramsD.use_delta_sph) {
-        // diffusion term in continuity equation, this helps smoothing out the large oscillation in pressure
-        // field see S. Marrone et al., "delta-SPH model for simulating violent impact flows", Computer Methods in
-        // Applied Mechanics and Engineering, 200(2011), pp 1526 --1542.
-        Real Psi = paramsD.density_delta * paramsD.h * paramsD.Cs * paramsD.markerMass / rhoPresMuB.x * 2. * (rhoPresMuA.x - rhoPresMuB.x) /
-                   (d * d + paramsD.epsMinMarkersDis * paramsD.h * paramsD.h);
-        derivRho += Psi * dot(dist3, gradW);
-    }
-
-    Real Mass = paramsD.markerMass;
-
-    Real invRhoASq = 1 / (rhoPresMuA.x * rhoPresMuA.x);
-    Real invRhoBSq = 1 / (rhoPresMuB.x * rhoPresMuB.x);
-    Real3 MA_gradW = gradW * Mass;
-    Real derivVx = (tauXxYyZz_A.x * invRhoASq + tauXxYyZz_B.x * invRhoBSq) * MA_gradW.x + (tauXyXzYz_A.x * invRhoASq + tauXyXzYz_B.x * invRhoBSq) * MA_gradW.y +
-                   (tauXyXzYz_A.y * invRhoASq + tauXyXzYz_B.y * invRhoBSq) * MA_gradW.z;
-    Real derivVy = (tauXyXzYz_A.x * invRhoASq + tauXyXzYz_B.x * invRhoBSq) * MA_gradW.x + (tauXxYyZz_A.y * invRhoASq + tauXxYyZz_B.y * invRhoBSq) * MA_gradW.y +
-                   (tauXyXzYz_A.z * invRhoASq + tauXyXzYz_B.z * invRhoBSq) * MA_gradW.z;
-    Real derivVz = (tauXyXzYz_A.y * invRhoASq + tauXyXzYz_B.y * invRhoBSq) * MA_gradW.x + (tauXyXzYz_A.z * invRhoASq + tauXyXzYz_B.z * invRhoBSq) * MA_gradW.y +
-                   (tauXxYyZz_A.z * invRhoASq + tauXxYyZz_B.z * invRhoBSq) * MA_gradW.z;
-    // TODO: Viscoplastic model
-    // Real vel = length(velMasA);
-    // if(vel > 0.3){
-    //     Real rAB_Dot_GradWh = dot(dist3, gradW);
-    //     Real rAB_Dot_GradWh_OverDist = rAB_Dot_GradWh / (d * d + paramsD.epsMinMarkersDis * paramsD.h *
-    //     paramsD.h); Real3 derivV = - paramsD.markerMass *(rhoPresMuA.y / (rhoPresMuA.x * rhoPresMuA.x) +
-    //     rhoPresMuB.y / (rhoPresMuB.x * rhoPresMuB.x)) * gradW
-    //                    + paramsD.markerMass * (8.0f * multViscosity) * paramsD.mu_fric_s
-    //                    * pow(rhoPresMuA.x + rhoPresMuB.x, Real(-2)) * rAB_Dot_GradWh_OverDist * (velMasA - velMasB);
-    //     derivVx = derivV.x;
-    //     derivVy = derivV.y;
-    //     derivVz = derivV.z;
-    // }
-    Real derivM1 = 0;
-    Real vAB_rAB = dot(velMasA - velMasB, dist3);
-    Real intermediate = vAB_rAB / (d * d + paramsD.epsMinMarkersDis * paramsD.h * paramsD.h);
-    if (IsFluidParticle(rhoPresMuB.w)) {
-        *max_vel_diff = fmax(*max_vel_diff, fabs(paramsD.h * intermediate));
-    }
-    switch (paramsD.viscosity_method) {
-        case ViscosityMethod::ARTIFICIAL_UNILATERAL: {
-            // Artificial Viscosity from Monaghan 1997
-            // This has no viscous forces in the separation phase - used in SPH codes simulating fluids
-            if (vAB_rAB < 0) {
-                Real nu = -paramsD.artificial_viscosity * paramsD.h * paramsD.Cs * 2. / (rhoPresMuA.x + rhoPresMuB.x);
-                // Real nu = -paramsD.artificial_viscosity * paramsD.h * paramsD.Cs * paramsD.invrho0;
-                derivM1 = -Mass * (nu * intermediate);
-            }
-
-            break;
-        }
-        case ViscosityMethod::ARTIFICIAL_BILATERAL: {
-            // Artificial viscosity treatment from J J Monaghan (2005) "Smoothed particle hydrodynamics"
-            // Here there is viscous force added even during the separation phase - makes the simulation more stable
-            Real nu = -paramsD.artificial_viscosity * paramsD.h * paramsD.Cs * 2. / (rhoPresMuA.x + rhoPresMuB.x);
-            // Real nu = -paramsD.artificial_viscosity * paramsD.h * paramsD.Cs * paramsD.invrho0;
-            derivM1 = -Mass * (nu * intermediate);
-            break;
-        }
-    }
-
-    derivVx += derivM1 * gradW.x;
-    derivVy += derivM1 * gradW.y;
-    derivVz += derivM1 * gradW.z;
-    // }
-
-    // Artificial pressure to handle tensile instability issue.
-    // A complete artificial stress should be implemented in the future.
-    // if (paramsD.Coh_coeff > 1e-5) {
-    Real Pa = -0.333333333f * (tauXxYyZz_A.x + tauXxYyZz_A.y + tauXxYyZz_A.z);
-    if (Pa < 0) {
-        Real Pb = -0.333333333f * (tauXxYyZz_B.x + tauXxYyZz_B.y + tauXxYyZz_B.z);
-        Real epsi = 0.9;
-        // Real Ra = Pa * epsi * paramsD.invrho0 * paramsD.invrho0;
-        // Real Rb = Pb * epsi * paramsD.invrho0 * paramsD.invrho0;
-        Real Ra = Pa * epsi * invRhoASq;
-        Real Rb = Pb * epsi * invRhoBSq;
-        Real fAB = W_AB * W_ini_inv;
-        Real small_F = Mass * pow(fAB, 2.55) * (Ra + Rb);
-        derivVx += small_F * gradW.x;
-        derivVy += small_F * gradW.y;
-        derivVz += small_F * gradW.z;
-    }
-    // }
-
-    // TODO: Damping force
-    // if (1 == 0) {
-    //     Real xi0 = paramsD.Vis_Dam;
-    //     Real E0 = paramsD.E_young;
-    //     Real h0 = paramsD.h;
-    //     Real Cd = xi0 * sqrt(E0 / (rhoA * h0 * h0));
-    //     derivVx -= Cd * velMasA.x;
-    //     derivVy -= Cd * velMasA.y;
-    //     derivVz -= Cd * velMasA.z;
-    // }
-
-    // Real derivRho = Mass * dot(vel_XSPH_A - vel_XSPH_B, gradW);
-    // return mR4(derivVx, derivVy, derivVz, 0);
-    return mR4(derivVx, derivVy, derivVz, derivRho);
+__device__ inline Real GroupMax(Real v) {
+    for (int offset = SPH_NEIGHBOR_GROUP / 2; offset > 0; offset >>= 1)
+        v = fmax(v, __shfl_down_sync(0xffffffff, v, offset, SPH_NEIGHBOR_GROUP));
+    return v;
 }
 
 __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
@@ -1183,35 +1080,37 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
                              Real* __restrict__ courantViscousTimeStepD,
                              Real* __restrict__ accelerationTimeStepD,
                              volatile bool* error_flag) {
-    uint id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id >= numActive)
-        return;
+    // Every lane reaches the shuffles below, so a lane with no particle, or a wall marker, works on nothing
+    // instead of returning
+    const uint tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint index = tid / SPH_NEIGHBOR_GROUP;
+    const uint lane = threadIdx.x % SPH_NEIGHBOR_GROUP;
+    bool active = index < numActive;
+    const uint safe = active ? index : 0;
 
-    uint index = id;
+    const Real4 rhoPresMuA = sortedRhoPreMu[safe];
+    if (IsBceWallMarker(rhoPresMuA.w))
+        active = false;
 
-    if (IsBceWallMarker(sortedRhoPreMu[index].w))
-        return;
-
-    Real3 posRadA = mR3(sortedPosRad[index]);
-    Real3 velMasA = sortedVelMas[index];
-    Real4 rhoPresMuA = sortedRhoPreMu[index];
-    Real3 TauXxYyZzA = sortedTauXxYyZz[index];
-    Real3 TauXyXzYzA = sortedTauXyXzYz[index];
+    Real3 posRadA = mR3(sortedPosRad[safe]);
+    Real3 velMasA = sortedVelMas[safe];
+    Real3 TauXxYyZzA = sortedTauXxYyZz[safe];
+    Real3 TauXyXzYzA = sortedTauXyXzYz[safe];
     Real4 derivVelRho = mR4(0);
 
-    Real tauxx = sortedTauXxYyZz[index].x;
-    Real tauyy = sortedTauXxYyZz[index].y;
-    Real tauzz = sortedTauXxYyZz[index].z;
-    Real tauxy = sortedTauXyXzYz[index].x;
-    Real tauxz = sortedTauXyXzYz[index].y;
-    Real tauyz = sortedTauXyXzYz[index].z;
+    Real tauxx = TauXxYyZzA.x;
+    Real tauyy = TauXxYyZzA.y;
+    Real tauzz = TauXxYyZzA.z;
+    Real tauxy = TauXyXzYzA.x;
+    Real tauxz = TauXyXzYzA.y;
+    Real tauyz = TauXyXzYzA.z;
 
     Real Lxx = 0, Lxy = 0, Lxz = 0;  // velocity-gradient entries L = grad v
     Real Lyx = 0, Lyy = 0, Lyz = 0;
     Real Lzx = 0, Lzy = 0, Lzz = 0;
 
-    uint NLStart = numNeighborsPerPart[index];
-    uint NLEnd = numNeighborsPerPart[index + 1];
+    const uint NLStart = active ? numNeighborsPerPart[index] : 0;
+    const uint NLEnd = active ? numNeighborsPerPart[index + 1] : 0;
 
     const bool is_sph_particle = IsSphParticle(rhoPresMuA.w);
     const bool is_fluid_particle = IsFluidParticle(rhoPresMuA.w);
@@ -1225,26 +1124,35 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
     Real w_ini_inv = 1 / W3h(kernelType, d0, ooh);
     Real max_vel_diff = 0;
 
-    // Get the interaction from neighbor particles
+    // Terms of the momentum equation that depend on this particle only, taken out of the neighbor loop
+    const Real Mass = paramsD.markerMass;
+    const bool bceA = IsBceMarker(rhoPresMuA.w);
+    const Real invRhoASq = 1 / (rhoPresMuA.x * rhoPresMuA.x);
+    const Real3 sigmaA_d = TauXxYyZzA * invRhoASq;  // stress over density squared, diagonal
+    const Real3 sigmaA_o = TauXyXzYzA * invRhoASq;  // and off-diagonal
+    const Real PaA = -0.333333333f * (TauXxYyZzA.x + TauXxYyZzA.y + TauXxYyZzA.z);
+    const Real tension_eps = 0.9;
+    const Real RaA = PaA * tension_eps * invRhoASq;  // artificial pressure against tensile instability, if PaA < 0
+    const Real eps_hh = paramsD.epsMinMarkersDis * paramsD.h * paramsD.h;
+    const Real visc = paramsD.artificial_viscosity * paramsD.h * paramsD.Cs * 2;
+
+    // Get the interaction from neighbor particles, this lane taking every SPH_NEIGHBOR_GROUP-th of them
     // NLStart + 1 because the first element in neighbor list is the particle itself
-    for (int n = NLStart + 1; n < NLEnd; n++) {
+    for (uint n = NLStart + 1 + lane; n < NLEnd; n += SPH_NEIGHBOR_GROUP) {
         uint j = neighborList[n];
         Real4 rhoPresMuB = sortedRhoPreMu[j];
-        // Real volumej = paramsD.volume0;
-        Real volumej = paramsD.markerMass / rhoPresMuB.x;
-        if (IsBceMarker(rhoPresMuA.w) && IsBceMarker(rhoPresMuB.w))
+        if (bceA && IsBceMarker(rhoPresMuB.w))
             continue;  // No BCE-BCE interaction
+        const Real invRhoB = 1 / rhoPresMuB.x;
+        const Real volumej = Mass * invRhoB;
 
         Real3 posRadB = mR3(sortedPosRad[j]);
         Real3 dist3 = Distance(posRadA, posRadB);
         Real d = length(dist3);
-        Real invd = 1 / d;
         Real3 velMasB = sortedVelMas[j];
         Real3 TauXxYyZzB = sortedTauXxYyZz[j];
         Real3 TauXyXzYzB = sortedTauXyXzYz[j];
 
-        // Correct the kernel function gradient
-        Real w_AB = W3h(kernelType, d, ooh);
         Real3 gradW = GradW3h(kernelType, dist3, ooh);
 
         // Accumulate divergence of the position field to compute free surface particles
@@ -1252,10 +1160,53 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
         if (d > paramsD.h * 1.0e-9f)
             nabla_r += volumej * dot(-dist3, gradW);
 
-        // Calculate dv/dt
-        // Note: The SPH discretization chosen for gradW does not support the use of consistent discretization
-        derivVelRho += CrmCalcDvDt_D(w_ini_inv, w_AB, gradW, dist3, d, invd, sortedPosRad[index], sortedPosRad[j], velMasA, velMasB, rhoPresMuA, rhoPresMuB, TauXxYyZzA, TauXyXzYzA,
-                                     TauXxYyZzB, TauXyXzYzB, &max_vel_diff);
+        // Continuity equation, with delta-SPH diffusion if enabled (Marrone et al. 2011)
+        const Real3 vAB = velMasA - velMasB;
+        Real derivRho = Mass * dot(vAB, gradW);
+        if (paramsD.use_delta_sph) {
+            Real Psi = paramsD.density_delta * paramsD.h * paramsD.Cs * volumej * 2. * (rhoPresMuA.x - rhoPresMuB.x) / (d * d + eps_hh);
+            derivRho += Psi * dot(dist3, gradW);
+        }
+
+        // Momentum equation: stress divergence (A's share taken out of the loop)
+        const Real invRhoBSq = invRhoB * invRhoB;
+        const Real3 MA_gradW = gradW * Mass;
+        const Real sxx = sigmaA_d.x + TauXxYyZzB.x * invRhoBSq, syy = sigmaA_d.y + TauXxYyZzB.y * invRhoBSq, szz = sigmaA_d.z + TauXxYyZzB.z * invRhoBSq;
+        const Real sxy = sigmaA_o.x + TauXyXzYzB.x * invRhoBSq, sxz = sigmaA_o.y + TauXyXzYzB.y * invRhoBSq, syz = sigmaA_o.z + TauXyXzYzB.z * invRhoBSq;
+        Real derivVx = sxx * MA_gradW.x + sxy * MA_gradW.y + sxz * MA_gradW.z;
+        Real derivVy = sxy * MA_gradW.x + syy * MA_gradW.y + syz * MA_gradW.z;
+        Real derivVz = sxz * MA_gradW.x + syz * MA_gradW.y + szz * MA_gradW.z;
+
+        // Artificial viscosity (Monaghan 1997, 2005)
+        const Real vAB_rAB = dot(vAB, dist3);
+        const Real intermediate = vAB_rAB / (d * d + eps_hh);
+        if (IsFluidParticle(rhoPresMuB.w))
+            max_vel_diff = fmax(max_vel_diff, fabs(paramsD.h * intermediate));
+        Real derivM1 = 0;
+        switch (paramsD.viscosity_method) {
+            case ViscosityMethod::ARTIFICIAL_UNILATERAL:
+                if (vAB_rAB < 0)
+                    derivM1 = Mass * visc / (rhoPresMuA.x + rhoPresMuB.x) * intermediate;
+                break;
+            case ViscosityMethod::ARTIFICIAL_BILATERAL:
+                derivM1 = Mass * visc / (rhoPresMuA.x + rhoPresMuB.x) * intermediate;
+                break;
+        }
+        derivVx += derivM1 * gradW.x;
+        derivVy += derivM1 * gradW.y;
+        derivVz += derivM1 * gradW.z;
+
+        // Artificial pressure against the tensile instability, where A is in tension
+        if (PaA < 0) {
+            Real Pb = -0.333333333f * (TauXxYyZzB.x + TauXxYyZzB.y + TauXxYyZzB.z);
+            Real Rb = Pb * tension_eps * invRhoBSq;
+            Real fAB = W3h(kernelType, d, ooh) * w_ini_inv;
+            Real small_F = Mass * pow(fAB, 2.55) * (RaA + Rb);
+            derivVx += small_F * gradW.x;
+            derivVy += small_F * gradW.y;
+            derivVz += small_F * gradW.z;
+        }
+        derivVelRho += mR4(derivVx, derivVy, derivVz, derivRho);
 
         if (is_fluid_particle) {
             Real3 vBA = velMasB - velMasA;
@@ -1272,6 +1223,19 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
             Lzz += volumej * vBA.z * gradW.z;
         }
     }
+
+    // The group's sums, in its first lane
+    derivVelRho.x = GroupSum(derivVelRho.x);
+    derivVelRho.y = GroupSum(derivVelRho.y);
+    derivVelRho.z = GroupSum(derivVelRho.z);
+    derivVelRho.w = GroupSum(derivVelRho.w);
+    Lxx = GroupSum(Lxx), Lxy = GroupSum(Lxy), Lxz = GroupSum(Lxz);
+    Lyx = GroupSum(Lyx), Lyy = GroupSum(Lyy), Lyz = GroupSum(Lyz);
+    Lzx = GroupSum(Lzx), Lzy = GroupSum(Lzy), Lzz = GroupSum(Lzz);
+    nabla_r = GroupSum(nabla_r);
+    max_vel_diff = GroupMax(max_vel_diff);
+    if (!active || lane != 0)
+        return;
 
     // Split into D and W
     Real Dxx = Lxx;
@@ -1355,7 +1319,11 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
 void SphForceWCSPH::CrmCalcRHS(std::shared_ptr<SphMarkerDataD> sortedSphMarkersD) {
     gpuResetErrorFlag(m_errflagD);
 
-    computeGridSize(numActive, 256, numBlocks, numThreads);
+    // Whole blocks of whole warps: every lane takes part in the group shuffles
+    numThreads = 256;
+    numBlocks = (numActive * SPH_NEIGHBOR_GROUP + numThreads - 1) / numThreads;
+    if (numBlocks == 0)
+        return;
     CrmCalcRHS_D<<<numBlocks, numThreads>>>(mR4CAST(sortedSphMarkersD->posRadD), mR3CAST(sortedSphMarkersD->velMasD), mR4CAST(sortedSphMarkersD->rhoPresMuD),
                                             mR3CAST(sortedSphMarkersD->tauXxYyZzD), mR3CAST(sortedSphMarkersD->tauXyXzYzD), U1CAST(m_data_mgr.numNeighborsPerPart),
                                             U1CAST(m_data_mgr.neighborList), numActive, mR4CAST(m_data_mgr.derivVelRhoD), mR3CAST(m_data_mgr.derivTauXxYyZzD),
@@ -1624,12 +1592,13 @@ __device__ void ShiftingAccumulateNeighborContrib(uint index,
                                                   uint NLEnd,
                                                   bool consider_bce,
                                                   Real3& deltaV,
-                                                  Real3& inner_sum) {
+                                                  Real3& inner_sum,
+                                                  uint stride = 1) {
     Real SuppRadii = paramsD.h_multiplier * paramsD.h;
     Real SqRadii = SuppRadii * SuppRadii;
 
-    // Loop over neighbors
-    for (uint n = NLStart + 1; n < NLEnd; n++) {
+    // Loop over neighbors, every stride-th of them from NLStart + 1 when a group of threads shares the particle
+    for (uint n = NLStart + 1; n < NLEnd; n += stride) {
         uint j = neighborList[n];
 
         // Only proceed if neighbor is fluid (this check is inlined for brevity)
@@ -1684,22 +1653,24 @@ __global__ void Calc_Shifting_D(Real3* vel_XSPH_Sorted_D,
                                 const uint numActive,
                                 const Real* __restrict__ sortedPosDivergence,
                                 volatile bool* error_flag) {
-    uint index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= numActive)
-        return;
-
-    // If not fluid, do nothing
-    if (!IsFluidParticle(sortedRhoPreMu[index].w))
-        return;
+    // A group of SPH_NEIGHBOR_GROUP threads per particle, as in CrmCalcRHS_D: every lane reaches the shuffles, so a lane
+    // with no fluid particle works on nothing instead of returning
+    const uint tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint index = tid / SPH_NEIGHBOR_GROUP;
+    const uint lane = threadIdx.x % SPH_NEIGHBOR_GROUP;
+    bool active = index < numActive;
+    const uint safe = active ? index : 0;
+    if (!IsFluidParticle(sortedRhoPreMu[safe].w))
+        active = false;
 
     // Gather data
-    Real4 rhoPreMuA = sortedRhoPreMu[index];
-    Real3 velMasA = sortedVelMas[index];
-    Real3 posA = mR3(sortedPosRad[index]);
+    Real4 rhoPreMuA = sortedRhoPreMu[safe];
+    Real3 velMasA = sortedVelMas[safe];
+    Real3 posA = mR3(sortedPosRad[safe]);
 
-    // Range for neighbors
-    uint NLStart = numNeighborsPerPart[index];
-    uint NLEnd = numNeighborsPerPart[index + 1];
+    // Range for neighbors, this lane's share starting lane places in
+    uint NLStart = active ? numNeighborsPerPart[index] + lane : 0;
+    uint NLEnd = active ? numNeighborsPerPart[index + 1] : 0;
 
     // Accumulators for different methods
     Real3 deltaV = mR3(0);
@@ -1711,8 +1682,12 @@ __global__ void Calc_Shifting_D(Real3* vel_XSPH_Sorted_D,
     }
 
     // Accumulate neighbor contribution
-    ShiftingAccumulateNeighborContrib<SHIFT>(index, posA, rhoPreMuA, velMasA, sortedPosRad, sortedVelMas, sortedRhoPreMu, neighborList, NLStart, NLEnd, consider_bce, deltaV,
-                                             inner_sum);
+    ShiftingAccumulateNeighborContrib<SHIFT>(safe, posA, rhoPreMuA, velMasA, sortedPosRad, sortedVelMas, sortedRhoPreMu, neighborList, NLStart, NLEnd, consider_bce, deltaV,
+                                             inner_sum, SPH_NEIGHBOR_GROUP);
+    deltaV.x = GroupSum(deltaV.x), deltaV.y = GroupSum(deltaV.y), deltaV.z = GroupSum(deltaV.z);
+    inner_sum.x = GroupSum(inner_sum.x), inner_sum.y = GroupSum(inner_sum.y), inner_sum.z = GroupSum(inner_sum.z);
+    if (!active || lane != 0)
+        return;
 
     // Post-process depending on SHIFT
     Real3 result = mR3(0);
@@ -1793,14 +1768,13 @@ __global__ void Calc_Shifting_D(Real3* vel_XSPH_Sorted_D,
 void SphForceWCSPH::CalculateShifting(std::shared_ptr<SphMarkerDataD> sortedSphMarkersD) {
     gpuResetErrorFlag(m_errflagD);
 
-#ifdef CHRONO_SPH_USE_DOUBLE
-    uint blockSize = 256;
-#else
-    uint blockSize = 1024;
-#endif
-    computeGridSize(numActive, blockSize, numBlocks, numThreads);
+    // Whole blocks of whole warps, a group of threads per particle (see Calc_Shifting_D)
+    numThreads = 256;
+    numBlocks = (numActive * SPH_NEIGHBOR_GROUP + numThreads - 1) / numThreads;
 
     thrust::fill(m_data_mgr.vel_XSPH_D.begin(), m_data_mgr.vel_XSPH_D.begin() + numActive, mR3(0));
+    if (numBlocks == 0)
+        return;
 
     switch (m_data_mgr.paramsH->shifting_method) {
         case ShiftingMethod::XSPH:

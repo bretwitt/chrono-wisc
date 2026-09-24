@@ -9,6 +9,7 @@ set(DEMOS
     demo_PLANET_Flyover
     demo_PLANET_Viper_Rigid
     demo_PLANET_Viper_SCM
+    demo_PLANET_Excavation
 )
 
 if(CH_ENABLE_MODULE_VEHICLE_MODELS)
@@ -17,7 +18,7 @@ if(CH_ENABLE_MODULE_VEHICLE_MODELS)
     )
 endif()
 
-set(UTILS "PlanetBoulderField.h" "PlanetDemoSetup.h" "PlanetDust.h" "PlanetHazardAvoidance.h")
+set(UTILS "PlanetBoulderField.h" "PlanetDemoSetup.h" "PlanetDigCycle.h" "PlanetDust.h" "PlanetHazardAvoidance.h")
 
 #--------------------------------------------------------------
 
@@ -53,6 +54,27 @@ foreach(PROGRAM ${DEMOS})
     install(TARGETS ${PROGRAM} CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
 endforeach()
 
+# Excavation and rover mobility in CRM soil (Chrono::FSI SPH)
+if(CH_ENABLE_MODULE_FSI_SPH)
+    add_executable(demo_PLANET_Excavation_CRM demo_PLANET_Excavation_CRM.cpp ${UTILS})
+    source_group("" FILES demo_PLANET_Excavation_CRM.cpp ${UTILS})
+    if(MSVC)
+      set_target_properties(demo_PLANET_Excavation_CRM PROPERTIES MSVC_RUNTIME_LIBRARY ${CH_MSVC_RUNTIME_LIBRARY})
+    endif()
+    set_property(TARGET demo_PLANET_Excavation_CRM PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:demo_PLANET_Excavation_CRM>")
+    target_link_libraries(demo_PLANET_Excavation_CRM ${LIBS} Chrono_fsisph)
+    install(TARGETS demo_PLANET_Excavation_CRM CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
+
+    add_executable(demo_PLANET_Viper_CRM demo_PLANET_Viper_CRM.cpp ${UTILS})
+    source_group("" FILES demo_PLANET_Viper_CRM.cpp ${UTILS})
+    if(MSVC)
+      set_target_properties(demo_PLANET_Viper_CRM PROPERTIES MSVC_RUNTIME_LIBRARY ${CH_MSVC_RUNTIME_LIBRARY})
+    endif()
+    set_property(TARGET demo_PLANET_Viper_CRM PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:demo_PLANET_Viper_CRM>")
+    target_link_libraries(demo_PLANET_Viper_CRM ${LIBS} Chrono_fsisph)
+    install(TARGETS demo_PLANET_Viper_CRM CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
+endif()
+
 # Chrono::Sensor demos over the planet terrain, shaded with the Hapke BRDF.
 if(CH_ENABLE_MODULE_SENSOR)
     foreach(PROGRAM demo_PLANET_SensorHapke demo_PLANET_Viper_SCM_Sensor demo_PLANET_MoonDescent demo_PLANET_DustRoosterTail)
@@ -65,4 +87,16 @@ if(CH_ENABLE_MODULE_SENSOR)
         target_link_libraries(${PROGRAM} Chrono_core Chrono_planet Chrono_vehicle ChronoModels_robot Chrono_sensor)
         install(TARGETS ${PROGRAM} CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
     endforeach()
+endif()
+
+# Chrono::Sensor over CRM soil
+if(CH_ENABLE_MODULE_SENSOR AND CH_ENABLE_MODULE_FSI_SPH)
+    add_executable(demo_PLANET_Viper_CRM_Sensor demo_PLANET_Viper_CRM_Sensor.cpp ${UTILS})
+    source_group("" FILES demo_PLANET_Viper_CRM_Sensor.cpp ${UTILS})
+    if(MSVC)
+      set_target_properties(demo_PLANET_Viper_CRM_Sensor PROPERTIES MSVC_RUNTIME_LIBRARY ${CH_MSVC_RUNTIME_LIBRARY})
+    endif()
+    set_property(TARGET demo_PLANET_Viper_CRM_Sensor PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:demo_PLANET_Viper_CRM_Sensor>")
+    target_link_libraries(demo_PLANET_Viper_CRM_Sensor Chrono_core Chrono_planet Chrono_vehicle ChronoModels_robot Chrono_sensor Chrono_fsisph)
+    install(TARGETS demo_PLANET_Viper_CRM_Sensor CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
 endif()

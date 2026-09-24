@@ -79,16 +79,33 @@ class CH_PLANET_API ChDustField {
     struct WheelEmission {
         double bulk_density = 1500.0;  ///< density of the loose surface soil (kg/m^3)
         /// Depth of loose soil the tread carries away per unit of rim travel (m). The lofted mass rate is
-        /// bulk_density * width * loose_depth * (rim speed + slip_gain * slip speed).
+        /// bulk_density * width * loose_depth * (rim speed + slip_gain * slip speed), the slip speed counting only
+        /// while the wheel drives (its contact sliding backward); a braking wheel's slide loosens no extra soil.
         double loose_depth = 2e-4;
         double slip_gain = 4.0;  ///< extra loosening per unit of slip speed, relative to rim speed
         /// The rim releases soil from where it leaves the ground up to this angle from the bottom of the wheel
         /// (rad); 90 deg is level with the hub behind it. A fender lowers it.
         double max_release_angle = 1.5708;
+        /// How soil leaves the rim over those angles: 0 (the default) releases it evenly; a positive value (rad) sheds
+        /// it progressively, most right where the rim leaves the ground and less the farther it rides, the share still
+        /// on the rim falling by e every this many radians, so the soil streams off the wheel and some of it wraps
+        /// around it.
+        double release_decay = 0;
         double min_speed_fraction = 0.3;  ///< released grains move at a random fraction of the rim velocity,
         double max_speed_fraction = 1.0;  ///< between these
         double spread = 0.1;              ///< random velocity added, relative to the rim speed (1 sigma per axis)
         double contact_tolerance = 0.02;  ///< the wheel emits while its bottom is within this of the ground (m)
+        /// Soil carried in the tread (release by force balance) when positive: the soil's cohesion (Pa). The tread's
+        /// grooves, grouser_height deep, fill with soil as deep as the wheel sinks (up to grouser_height), carried at
+        /// rim speed. A clod stays in its groove while its cohesive hold, per unit mass, exceeds the acceleration
+        /// pulling it out, omega^2 r + g cos(phi) at angle phi from the bottom of the wheel: weak clods drop right
+        /// behind the contact, stronger ones ride over the top and fall off the front as the rim tips down, the
+        /// strongest are pressed back into the ground. Holds vary log-normally about cohesion / (bulk_density *
+        /// grouser_height), by hold_spread (sigma of the log). Clods leave at the rim's velocity. Replaces loose_depth,
+        /// slip_gain, the release angles and the speed fractions.
+        double cohesion = 0;
+        double grouser_height = 0.01;  ///< depth of the tread's grooves (m)
+        double hold_spread = 0.8;      ///< spread of clods' holds (sigma of their log)
         /// Super-particles per wheel and second, over all size bins. Each bin gets a share in proportion to the light
         /// its grains block, so each super-particle weighs about the same in the rendered dust.
         double particles_per_second = 20000.0;
@@ -120,6 +137,10 @@ class CH_PLANET_API ChDustField {
         int ny = 160;         ///< voxels along y
         int nz = 40;          ///< voxels along z
         double below = 0.5;   ///< the grid starts this far below the center given to UpdateGrid (m)
+        int blur = 0;         ///< passes of a [1 2 1] / 4 smoothing of the extinction along each axis
+        double exposure = 0;       ///< each particle is binned along its path over this long before the grid's time (s),
+                                   ///< as a camera exposure streaks it (0: at the grid's time only)
+        int exposure_samples = 4;  ///< points along that path
         /// Beyond the grid, the Sun's visibility past the terrain is traced this far (m), so ground outside the
         /// grid still shades the dust.
         double shadow_distance = 40.0;
@@ -166,6 +187,12 @@ class CH_PLANET_API ChDustField {
     /// Release one super-particle.
     void Emit(const ChVector3d& pos, const ChVector3d& vel, double mass, int bin, double time);
 
+    /// Emit `mass` (kg) from around a point, over the interval [time, time + dt): split among the size bins and among
+    /// super-particles as EmitFromWheels does, placed within `pos_spread` (m, 1 sigma per axis) of `pos`, with
+    /// velocities about `vel` spread by `vel_spread` (m/s, 1 sigma per axis). For a source measured elsewhere, such as
+    /// soil a granular model throws up.
+    void EmitSource(const ChVector3d& pos, double pos_spread, const ChVector3d& vel, double vel_spread, double mass, double time, double dt);
+
     /// Drop the grains that have landed or flown for too long by the given time.
     void Update(double time);
 
@@ -201,6 +228,7 @@ class CH_PLANET_API ChDustField {
     bool WriteOpticalDepthImage(const std::string& filename) const;
 
   private:
+    void EmitFromTread(size_t w, const WheelState& wheel, const ChVector3d& up, double ground, double time, double dt);
     // Ground height from a cache on a lattice of the grid's voxel size.
     double Ground(double x, double y);
     double LatticeHeight(int i, int j);
@@ -213,7 +241,8 @@ class CH_PLANET_API ChDustField {
     std::vector<Particle> m_particles;
     std::vector<double> m_mass_extinction;
     std::vector<double> m_bin_share;  // share of the super-particles each bin gets: its share of the cross section
-    std::vector<double> m_carry;      // fractional super-particles per wheel and bin, carried to the next call
+    std::vector<double> m_carry;         // fractional super-particles per wheel and bin, carried to the next call
+    std::vector<double> m_source_carry;  // fractional super-particles owed per bin (EmitSource)
     std::mt19937_64 m_rng;
     Grid m_grid;
     Stats m_stats;

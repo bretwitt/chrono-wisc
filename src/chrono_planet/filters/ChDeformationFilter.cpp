@@ -75,7 +75,7 @@ double ChDeformationFilter::HeightAt(double x, double y, double w, double height
     const double moved = height + delta;
     if (!(m_flatten_depth > 0) || delta >= 0)
         return moved;
-    const double c = w * util::smoothstep01(std::min(1.0, -delta / m_flatten_depth));
+    const double c = w * m_flatten_strength * util::smoothstep01(std::min(1.0, -delta / m_flatten_depth));
     if (c <= 0)
         return moved;
     // The nodes' own heights, bilinear; a node without one stands in with the moved incoming height, so the

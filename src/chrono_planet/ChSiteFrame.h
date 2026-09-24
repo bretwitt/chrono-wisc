@@ -83,6 +83,19 @@ class CH_PLANET_API ChSiteFrame {
     double m_elev0;
 };
 
+/// A rectangle of site x/y coordinates (m), for example ground a ChSiteVolume takes over from the terrain.
+struct CH_PLANET_API ChSiteRegion {
+    double min_x = 0, min_y = 0, max_x = 0, max_y = 0;
+
+    ChSiteRegion() = default;
+    ChSiteRegion(double min_x_, double min_y_, double max_x_, double max_y_) : min_x(min_x_), min_y(min_y_), max_x(max_x_), max_y(max_y_) {}
+
+    bool IsEmpty() const { return !(min_x < max_x && min_y < max_y); }
+    bool Contains(double x, double y) const { return x >= min_x && x <= max_x && y >= min_y && y <= max_y; }
+    /// The rectangle moved in by `d` (m) on every side (out for negative d).
+    ChSiteRegion Inset(double d) const { return ChSiteRegion(min_x + d, min_y + d, max_x - d, max_y - d); }
+};
+
 /// @} planet_module
 
 }  // namespace planet

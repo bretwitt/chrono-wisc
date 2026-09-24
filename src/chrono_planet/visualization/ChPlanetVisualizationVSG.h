@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 #include <unordered_map>
 
 #include "chrono/assets/ChColormap.h"
@@ -73,6 +74,13 @@ class CH_PLANET_API ChPlanetVisualizationVSG : public vsg3d::ChVisualSystemVSGPl
     bool IsDeformationColoringEnabled() const { return m_coloring_requested; }
     bool HasDeformationColoring() const { return m_deformation != nullptr; }
 
+    /// Leave the terrain out of a rectangle of site x/y, cutting the faces that cross its edges, where other ground
+    /// takes over, such as a ChSiteVolume's (see ChSiteVolume::GetHole). The tiles are rebuilt on the next frame.
+    void AddHole(const ChSiteRegion& hole) {
+        m_holes.push_back(hole);
+        m_holes_changed = true;
+    }
+
     /// Show a small "Planet terrain" panel with a wireframe checkbox and tile counts (default: true).
     /// Call before attaching the plugin to have it take effect from the first frame.
     void SetShowGui(bool val);
@@ -111,6 +119,8 @@ class CH_PLANET_API ChPlanetVisualizationVSG : public vsg3d::ChVisualSystemVSGPl
     std::unique_ptr<ChColormap> m_colormap;
     bool m_coloring;             ///< coloring state of the tiles in the scene
     bool m_coloring_requested;   ///< coloring state asked for, applied on the next frame
+    std::vector<ChSiteRegion> m_holes;  ///< rectangles of site x/y left out
+    bool m_holes_changed = false;       ///< holes added since the tiles in the scene were built
     std::shared_ptr<vsg3d::ChGuiComponentVSG> m_gui;
 
     vsg::ref_ptr<vsg::Switch> m_terrain_scene;  ///< VSG scene holding the tiles

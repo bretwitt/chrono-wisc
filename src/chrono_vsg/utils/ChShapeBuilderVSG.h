@@ -128,6 +128,13 @@ class CH_VSG_API ShapeBuilder : public vsg::Inherit<vsg::Object, ShapeBuilder> {
 
     void assignCompileTraversal(vsg::ref_ptr<vsg::CompileTraversal> ct);
 
+    /// Compile a node built after the visual system was initialized, such as geometry a plugin adds under state it
+    /// built earlier, so it can be drawn. The Create* functions compile what they build themselves.
+    void CompileNode(vsg::ref_ptr<vsg::Object> node) {
+        if (m_compileTraversal)
+            m_compileTraversal->compile(node);
+    }
+
   private:
     struct ShapeData {
         vsg::ref_ptr<vsg::vec3Array> vertices;

@@ -1512,9 +1512,23 @@ ChVector3f Shade(const ChVulkanRTRenderCache* cache,
                                 depth + 1, max_trace_depth, use_gi);
     }
 
-    // As in OptiX, a Hapke surface is opaque and adds no ambient, emissive, mirror or GI term.
-    if (hit.material.bsdf_type == BSDFType::HAPKE)
-        return ShadeHapke(cache, scene, hit, hit_pos, normal, view_dir, mat.diffuse);
+    // A Hapke surface is opaque and adds no ambient, emissive or mirror term. With GI it takes one diffuse bounce
+    // with its diffusive reflectance, as trace_camera in chrono_sensor_vkrt.rgen does.
+    if (hit.material.bsdf_type == BSDFType::HAPKE) {
+        ChVector3f color = ShadeHapke(cache, scene, hit, hit_pos, normal, view_dir, mat.diffuse);
+        if (use_gi && depth == 0) {
+            const ChVector3d gi_dir = NormalizeSafe(normal + ChVector3d(0.31, -0.21, 0.92), normal);
+            const float gi_ndl = static_cast<float>(std::max(0.0, normal.Dot(gi_dir)));
+            if (gi_ndl > 0.f) {
+                const ChVector3f gi = TraceCameraColor(cache, scene, hit_pos + gi_dir * CH_VKRT_SHADOW_EPS, gi_dir, depth + 1,
+                                                       max_trace_depth, false);
+                const float g = std::sqrt(std::max(0.f, 1.f - hit.material.hapke_w));
+                const float r0 = (1.f - g) / (1.f + g);
+                color += r0 * 1.3f * gi_ndl * Mul(mat.diffuse, gi);
+            }
+        }
+        return color;
+    }
 
     const float ndv = static_cast<float>(std::max(0.0, normal.Dot(view_dir)));
     const ChVector3f ambient_light = scene ? scene->GetAmbientLight() : ChVector3f(0.08f, 0.08f, 0.08f);

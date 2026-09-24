@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <vector>
 
 #include "chrono/assets/ChVisualMaterial.h"
 #include "chrono/assets/ChVisualShapeTriangleMesh.h"
@@ -74,6 +75,23 @@ class CH_PLANET_API ChPlanetVisualMesh {
     /// faces are split along the `min_depth` contour, so the boundary follows the rut outline, not the tile grid.
     /// Applies to tiles built after the call, so set it before the first update. Pass a null filter to turn it off.
     void SetCompaction(std::shared_ptr<ChDeformationFilter> filter, std::shared_ptr<ChVisualMaterial> material, double min_depth = 0.01);
+
+    /// Ground lowered past a depth (m), and the material it is drawn with there.
+    struct CompactionLevel {
+        double min_depth;
+        std::shared_ptr<ChVisualMaterial> material;
+    };
+
+    /// As SetCompaction, with several levels: ground lowered past each level's depth takes its material, so ruts can
+    /// darken by steps with depth rather than all at once. Faces are split along every level's contour.
+    void SetCompaction(std::shared_ptr<ChDeformationFilter> filter, std::vector<CompactionLevel> levels);
+
+    /// Leave the terrain out of a rectangle of site x/y, cutting the faces that cross its edges, where other ground
+    /// takes over, such as a ChSiteVolume's (see ChSiteVolume::GetHole). The tiles are rebuilt on the next update.
+    void AddHole(const ChSiteRegion& hole);
+    /// Remove every hole. The tiles are rebuilt on the next update.
+    void ClearHoles();
+    const std::vector<ChSiteRegion>& GetHoles() const { return m_holes; }
 
     /// Set how the tiles are placed (default: SITE). Applies to tiles built after the call, so set it before
     /// the first update.
@@ -130,8 +148,8 @@ class CH_PLANET_API ChPlanetVisualMesh {
     ChVector3d m_origin;                        ///< site origin, planet-centered (m)
     ChVector3d m_east, m_north, m_up;           ///< east-north-up axes at the site origin
     std::shared_ptr<ChDeformationFilter> m_compaction;              ///< source of the ground lowering, if any
-    std::shared_ptr<ChVisualMaterial> m_compacted_material;         ///< material of lowered ground
-    double m_compaction_depth = 0.01;                               ///< lowering that counts as compacted (m)
+    std::vector<CompactionLevel> m_compaction_levels;              ///< materials of lowered ground, by depth
+    std::vector<ChSiteRegion> m_holes;                              ///< rectangles of site x/y left out
     std::unordered_map<std::uint64_t, std::shared_ptr<ChVisualShapeTriangleMesh>> m_tiles;  ///< by ChTileMesh::id
     double m_max_distance;
     double m_morph_time = 0.5;

@@ -20,6 +20,7 @@
 #include "chrono_vsg/utils/ChShapeBuilderVSG.h"
 
 #include "chrono_planet/ChPlanetVisualMesh.h"
+#include "chrono_planet/ChSiteHoles.h"
 #include "chrono_planet/core/SphereMath.h"
 #include "chrono_planet/visualization/ChPlanetVisualizationVSG.h"
 
@@ -126,7 +127,8 @@ void ChPlanetVisualizationVSG::SetVisible(bool val) {
 void ChPlanetVisualizationVSG::SyncTiles() {
     // A wireframe or coloring toggle rebuilds every tile in the scene with the new setting.
     const bool coloring = m_coloring_requested && m_deformation;
-    if (m_wireframe_requested != m_wireframe || coloring != m_coloring) {
+    if (m_wireframe_requested != m_wireframe || coloring != m_coloring || m_holes_changed) {
+        m_holes_changed = false;
         m_wireframe = m_wireframe_requested;
         m_coloring = coloring;
         m_terrain_scene->children.clear();
@@ -176,8 +178,12 @@ vsg::ref_ptr<vsg::Node> ChPlanetVisualizationVSG::BuildTile(const ChTileMesh& me
     ChPlanetVisualMesh::AppendTile(mesh, m_site, *trimesh);
 
     auto transform = vsg::MatrixTransform::create();
-    if (!m_coloring)
+    if (!m_coloring) {
+        CutSiteHoles(*trimesh, m_holes);
+        if (trimesh->GetIndicesVertices().empty())
+            return vsg::Group::create();  // a tile wholly in a hole
         return m_vsys->GetVSGShapeBuilder()->CreateTrimeshPbrMatShape(trimesh, transform, {m_material}, true, m_wireframe);
+    }
 
     // Vertex colors by deformation depth, at this tile's relief spacing so coarse tiles stay plain.
     const double spacing = m_world->GetSurface()->GetSampleSpacingAtZoom(mesh.level);
@@ -190,6 +196,9 @@ vsg::ref_ptr<vsg::Node> ChPlanetVisualizationVSG::BuildTile(const ChTileMesh& me
         const double depth = -m_deformation->Apply(ll.lon, ll.lat, spacing, 0.0);
         colors.push_back(depth > 1e-3 ? m_colormap->Get(depth, 0.0, m_color_range) : base);
     }
+    CutSiteHoles(*trimesh, m_holes);
+    if (trimesh->GetIndicesVertices().empty())
+        return vsg::Group::create();
     return m_vsys->GetVSGShapeBuilder()->CreateTrimeshColAvgShape(trimesh, transform, base, true, m_wireframe);
 }
 

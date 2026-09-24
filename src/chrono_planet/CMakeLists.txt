@@ -49,6 +49,8 @@ set(Chrono_PLANET_FILES
     ChPlanetVisualMesh.h
     ChPlanetVisualMesh.cpp
     ChSiteFrame.h
+    ChSiteHoles.h
+    ChSiteHoles.cpp
 )
 source_group("" FILES ${Chrono_PLANET_FILES})
 
@@ -116,6 +118,22 @@ set(Chrono_PLANET_DUST_FILES
 )
 source_group("dust" FILES ${Chrono_PLANET_DUST_FILES})
 
+set(Chrono_PLANET_VOLUME_FILES
+    volume/ChSdfShape.h
+    volume/ChSdfShape.cpp
+    volume/ChSiteVolume.h
+    volume/ChSiteVolume.cpp
+    volume/ChSiteVolumeShapes.h
+    volume/ChSiteVolumeShapes.cpp
+    volume/ChExcavationTool.h
+    volume/ChExcavationTool.cpp
+    volume/ChSdfMesher.h
+    volume/ChSdfMesher.cpp
+    volume/ChSoilParticles.h
+    volume/ChSoilParticles.cpp
+)
+source_group("volume" FILES ${Chrono_PLANET_VOLUME_FILES})
+
 set(Chrono_PLANET_PROCEDURAL_FILES
     procedural/ChReliefLayer.h
     procedural/ChReliefLayer.cpp
@@ -176,6 +194,7 @@ add_library(Chrono_planet
     ${Chrono_PLANET_LOD_FILES}
     ${Chrono_PLANET_FILTERS_FILES}
     ${Chrono_PLANET_DUST_FILES}
+    ${Chrono_PLANET_VOLUME_FILES}
     ${Chrono_PLANET_PROCEDURAL_FILES}
     ${Chrono_PLANET_GEOMETRY_FILES}
     ${Chrono_PLANET_PLANETS_FILES}
@@ -234,6 +253,14 @@ if(CH_ENABLE_MODULE_VSG)
   set(Chrono_PLANET_VSG_FILES
       visualization/ChPlanetVisualizationVSG.h
       visualization/ChPlanetVisualizationVSG.cpp
+      visualization/ChSiteVolumeVisualizationVSG.h
+      visualization/ChSiteVolumeVisualizationVSG.cpp
+      visualization/ChSoilParticlesVisualizationVSG.h
+      visualization/ChSoilParticlesVisualizationVSG.cpp
+      visualization/ChMeshVisualizationVSG.h
+      visualization/ChMeshVisualizationVSG.cpp
+      visualization/ChMeshDrawsVSG.h
+      visualization/ChMeshDrawsVSG.cpp
   )
   source_group("visualization" FILES ${Chrono_PLANET_VSG_FILES})
 

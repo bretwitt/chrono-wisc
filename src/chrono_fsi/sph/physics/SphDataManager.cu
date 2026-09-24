@@ -802,6 +802,15 @@ std::vector<Real3> FsiDataManager::GetProperties() {
     return prop_H;
 }
 
+void FsiDataManager::GetStresses(std::vector<Real3>& diag, std::vector<Real3>& offdiag) {
+    const auto& diag_D = sphMarkers_D->tauXxYyZzD;
+    const auto& offdiag_D = sphMarkers_D->tauXyXzYzD;
+    diag.resize(diag_D.size());
+    offdiag.resize(offdiag_D.size());
+    thrust::copy(diag_D.begin(), diag_D.end(), diag.begin());
+    thrust::copy(offdiag_D.begin(), offdiag_D.end(), offdiag.begin());
+}
+
 //--------------------------------------------------------------------------------------------------------------------------------
 
 std::vector<Real3> FsiDataManager::GetPositions(const std::vector<int>& indices) {

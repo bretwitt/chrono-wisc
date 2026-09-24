@@ -324,6 +324,14 @@ if(CH_ENABLE_MODULE_PLANET)
         terrain/PlanetSCMTerrain.cpp
     )
 endif()
+if(CH_ENABLE_MODULE_PLANET AND CH_ENABLE_MODULE_FSI_SPH)
+    set(CV_TERRAIN_FILES ${CV_TERRAIN_FILES}
+        terrain/PlanetCRMTerrain.h
+        terrain/PlanetCRMTerrain.cpp
+        terrain/PlanetCRMWindow.h
+        terrain/PlanetCRMWindow.cpp
+    )
+endif()
 source_group("terrain" FILES ${CV_TERRAIN_FILES})
 
 if(CH_USE_SCM_GPU)

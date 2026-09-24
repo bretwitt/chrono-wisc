@@ -3147,6 +3147,18 @@ std::vector<ChVector3d> ChFsiFluidSystemSPH::GetParticleForces() const {
     return frc;
 }
 
+void ChFsiFluidSystemSPH::GetParticleStresses(std::vector<ChVector3d>& diag, std::vector<ChVector3d>& offdiag) const {
+    SynchronizeCopyStream();
+    std::vector<Real3> diag3, offdiag3;
+    m_data_mgr->GetStresses(diag3, offdiag3);
+    diag.clear();
+    offdiag.clear();
+    for (const auto& d : diag3)
+        diag.push_back(ToChVector(d));
+    for (const auto& o : offdiag3)
+        offdiag.push_back(ToChVector(o));
+}
+
 std::vector<ChVector3d> ChFsiFluidSystemSPH::GetParticleFluidProperties() const {
     auto props3 = GetProperties();
 

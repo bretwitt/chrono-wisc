@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "chrono/collision/ChCollisionShapeTriangleMesh.h"
+
+#include "chrono_planet/ChSiteHoles.h"
 #include "chrono/geometry/ChTriangleMeshConnected.h"
 #include "chrono/geometry/ChTriangleMeshSoup.h"
 
@@ -99,29 +101,26 @@ void PlanetTerrain::RebuildPatch(const ChVector2d& center) {
             verts[v] = m_site.ToLocal(lon0 + i * step_lon, lat0 + j * step_lat, h[v]);
         }
 
-    std::shared_ptr<ChTriangleMesh> coll_mesh;
+    auto mesh = chrono_types::make_shared<ChTriangleMeshConnected>();
+    mesh->GetCoordsVertices() = verts;
+    auto& tris = mesh->GetIndicesVertices();
+    tris.reserve(static_cast<size_t>(n - 1) * (n - 1) * 2);
+    for (int j = 0; j < n - 1; ++j)
+        for (int i = 0; i < n - 1; ++i) {
+            const int a = j * n + i, b = a + 1, c = a + n, d = c + 1;
+            tris.emplace_back(a, b, d);
+            tris.emplace_back(a, d, c);
+        }
+    planet::CutSiteHoles(*mesh, m_holes);
+
+    std::shared_ptr<ChTriangleMesh> coll_mesh = mesh;
     if (m_soup) {
         auto soup = chrono_types::make_shared<ChTriangleMeshSoup>();
-        soup->GetTriangles().reserve(static_cast<size_t>(n - 1) * (n - 1) * 2);
-        for (int j = 0; j < n - 1; ++j)
-            for (int i = 0; i < n - 1; ++i) {
-                const int a = j * n + i, b = a + 1, c = a + n, d = c + 1;
-                soup->AddTriangle(verts[a], verts[b], verts[d]);
-                soup->AddTriangle(verts[a], verts[d], verts[c]);
-            }
+        const auto& v = mesh->GetCoordsVertices();
+        soup->GetTriangles().reserve(mesh->GetIndicesVertices().size());
+        for (const auto& f : mesh->GetIndicesVertices())
+            soup->AddTriangle(v[f[0]], v[f[1]], v[f[2]]);
         coll_mesh = soup;
-    } else {
-        auto mesh = chrono_types::make_shared<ChTriangleMeshConnected>();
-        mesh->GetCoordsVertices() = verts;
-        auto& tris = mesh->GetIndicesVertices();
-        tris.reserve(static_cast<size_t>(n - 1) * (n - 1) * 2);
-        for (int j = 0; j < n - 1; ++j)
-            for (int i = 0; i < n - 1; ++i) {
-                const int a = j * n + i, b = a + 1, c = a + n, d = c + 1;
-                tris.emplace_back(a, b, d);
-                tris.emplace_back(a, d, c);
-            }
-        coll_mesh = mesh;
     }
 
     auto body = chrono_types::make_shared<ChBody>();
@@ -129,6 +128,8 @@ void PlanetTerrain::RebuildPatch(const ChVector2d& center) {
     auto shape = chrono_types::make_shared<ChCollisionShapeTriangleMesh>(m_material, coll_mesh, true, false, 0.005);
     body->AddCollisionShape(shape);
     body->EnableCollision(true);
+    for (int family : m_disallowed_families)
+        body->GetCollisionModel()->DisallowCollisionsWith(family);
     m_system->Add(body);
     // Collision models are bound only at the system's first step, so a body added later must be bound here.
     if (auto* coll = m_system->GetCollisionSystem().get())
@@ -139,7 +140,21 @@ void PlanetTerrain::RebuildPatch(const ChVector2d& center) {
     m_ground = body;
 }
 
+void PlanetTerrain::AddHole(const planet::ChSiteRegion& hole, std::function<double(double x, double y)> height) {
+    m_holes.push_back(hole);
+    m_hole_heights.push_back(std::move(height));
+}
+
+const std::function<double(double, double)>* PlanetTerrain::HoleHeight(double x, double y) const {
+    for (size_t h = 0; h < m_holes.size(); ++h)
+        if (m_hole_heights[h] && m_holes[h].Contains(x, y))
+            return &m_hole_heights[h];
+    return nullptr;
+}
+
 double PlanetTerrain::SurfaceHeight(double x, double y) const {
+    if (const auto* height = HoleHeight(x, y))
+        return (*height)(x, y);
     double lon, lat;
     m_site.ToLonLat(x, y, lon, lat);
     return m_surface->GetElevation(lon, lat) - m_site.GetOriginElevation();

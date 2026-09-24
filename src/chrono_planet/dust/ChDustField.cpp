@@ -14,6 +14,8 @@
 
 #include "chrono_planet/dust/ChDustField.h"
 
+#include "chrono/utils/ChConstants.h"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -153,11 +155,18 @@ void ChDustField::EmitFromWheels(const std::vector<WheelState>& wheels, double t
         if (rim_speed < 1e-4)
             continue;
 
+        if (m_wheel.cohesion > 0) {
+            EmitFromTread(w, wheel, u, ground, time, dt);
+            continue;
+        }
+
         // The rim at the bottom moves along -omega e relative to the center
         const ChVector3d e = a.Cross(u).GetNormalized();
         const ChVector3d d_bottom = e * (wheel.omega > 0 ? -1.0 : 1.0);
         const ChVector3d v_bottom = wheel.velocity - e * (wheel.omega * r);
-        const double slip_speed = (v_bottom - u * v_bottom.Dot(u)).Length();
+        // Slip loosens more soil only while the wheel drives, its rim sweeping the ground back faster than the wheel
+        // advances. A braking wheel, its contact sliding forward, pushes soil ahead of it rather than throwing it.
+        const double slip_speed = std::max(0.0, (v_bottom - u * v_bottom.Dot(u)).Dot(d_bottom));
         const double mass_rate = m_wheel.bulk_density * wheel.width * m_wheel.loose_depth * (rim_speed + m_wheel.slip_gain * slip_speed);
 
         // Release angles, from the bottom of the wheel: from where the rim leaves the ground (the wheel sinks in by
@@ -177,7 +186,13 @@ void ChDustField::EmitFromWheels(const std::vector<WheelState>& wheels, double t
             carry -= count;
             const double mass = mass_rate * m_params.bins[b].mass_fraction * dt / expected;
             for (int n = 0; n < count; ++n) {
-                const double phi = phi_min + (phi_max - phi_min) * unit(m_rng);
+                // Uniform over the release arc, or shed progressively from where the rim leaves the ground
+                // (exponential in the angle ridden, truncated at the arc's end)
+                double phi = phi_min + (phi_max - phi_min) * unit(m_rng);
+                if (m_wheel.release_decay > 0 && phi_max > phi_min) {
+                    const double span = 1 - std::exp(-(phi_max - phi_min) / m_wheel.release_decay);
+                    phi = phi_min - m_wheel.release_decay * std::log(1 - unit(m_rng) * span);
+                }
                 const double lateral = (unit(m_rng) - 0.5) * wheel.width;
                 const ChVector3d offset = (d_bottom * std::sin(phi) - u * std::cos(phi)) * r + a * lateral;
                 const ChVector3d v_rim = wheel.velocity + a.Cross(offset) * wheel.omega;
@@ -188,6 +203,91 @@ void ChDustField::EmitFromWheels(const std::vector<WheelState>& wheels, double t
                 const double t_release = dt * unit(m_rng);
                 Emit(c + offset + wheel.velocity * t_release, vel, mass, static_cast<int>(b), time + t_release);
             }
+        }
+    }
+}
+
+void ChDustField::EmitFromTread(size_t w, const WheelState& wheel, const ChVector3d& u, double ground, double time, double dt) {
+    const size_t nbins = m_params.bins.size();
+    const ChVector3d a = wheel.axle.GetNormalized();
+    const ChVector3d& c = wheel.center;
+    const double r = wheel.radius;
+    const double omega = std::abs(wheel.omega);
+    const ChVector3d e = a.Cross(u).GetNormalized();
+    const ChVector3d d_bottom = e * (wheel.omega > 0 ? -1.0 : 1.0);
+    const double g = m_params.gravity;
+
+    // Soil entering the grooves: as deep as the wheel sinks, up to the grousers' height, at rim speed
+    const double sinkage = std::max(0.0, ground - (c.z() - r));
+    const double carried = std::min(sinkage, m_wheel.grouser_height);
+    const double mass_rate = m_wheel.bulk_density * wheel.width * carried * omega * r;
+    if (mass_rate <= 0)
+        return;
+    // Where the rim leaves the ground behind the contact, and where it meets it again in front
+    const double phi_min = std::acos(std::clamp((c.z() - ground) / r, -1.0, 1.0));
+    const double phi_front = 2 * CH_PI - phi_min;
+    const double centrifugal = omega * omega * r;
+    const double hold_median = m_wheel.cohesion / (m_wheel.bulk_density * m_wheel.grouser_height);
+
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    std::normal_distribution<double> normal(0.0, 1.0);
+    for (size_t b = 0; b < nbins; ++b) {
+        const double expected = m_wheel.particles_per_second * dt * m_bin_share[b];
+        if (expected <= 0)
+            continue;
+        double& carry = m_carry[w * nbins + b];
+        carry += expected;
+        const int count = static_cast<int>(carry);
+        carry -= count;
+        const double mass = mass_rate * m_params.bins[b].mass_fraction * dt / expected;
+        for (int n = 0; n < count; ++n) {
+            // This clod's hold, and the first angle past the contact where the pull out of its groove exceeds it:
+            // omega^2 r + g cos(phi) falls from the contact to the top and rises again toward the front
+            const double hold = hold_median * std::exp(m_wheel.hold_spread * normal(m_rng));
+            double phi;
+            if (centrifugal + g * std::cos(phi_min) >= hold) {
+                phi = phi_min;
+            } else {
+                const double k = (hold - centrifugal) / g;
+                if (k > 1 || k < -1)
+                    continue;  // held all the way round, pressed back into the ground
+                phi = 2 * CH_PI - std::acos(k);
+                if (phi >= phi_front)
+                    continue;
+            }
+            const double lateral = (unit(m_rng) - 0.5) * wheel.width;
+            const ChVector3d offset = (d_bottom * std::sin(phi) - u * std::cos(phi)) * r + a * lateral;
+            const ChVector3d v_rim = wheel.velocity + a.Cross(offset) * wheel.omega;
+            const ChVector3d jitter(normal(m_rng), normal(m_rng), normal(m_rng));
+            const ChVector3d vel = v_rim + jitter * (0.05 * omega * r);
+            const double t_release = dt * unit(m_rng);
+            Emit(c + offset + wheel.velocity * t_release, vel, mass, static_cast<int>(b), time + t_release);
+        }
+    }
+}
+
+void ChDustField::EmitSource(const ChVector3d& pos, double pos_spread, const ChVector3d& vel, double vel_spread, double mass, double time, double dt) {
+    const size_t nbins = m_params.bins.size();
+    if (mass <= 0 || dt <= 0 || nbins == 0)
+        return;
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+    std::normal_distribution<double> normal(0.0, 1.0);
+    if (m_source_carry.size() < nbins)
+        m_source_carry.resize(nbins, 0.0);
+    for (size_t b = 0; b < nbins; ++b) {
+        const double expected = m_wheel.particles_per_second * dt * m_bin_share[b];
+        if (expected <= 0)
+            continue;
+        m_source_carry[b] += expected;
+        const int count = static_cast<int>(m_source_carry[b]);
+        m_source_carry[b] -= count;
+        if (count == 0)
+            continue;
+        const double each = mass * m_params.bins[b].mass_fraction / count;
+        for (int n = 0; n < count; ++n) {
+            const ChVector3d dp(normal(m_rng), normal(m_rng), normal(m_rng));
+            const ChVector3d dv(normal(m_rng), normal(m_rng), normal(m_rng));
+            Emit(pos + dp * pos_spread, vel + dv * vel_spread, each, static_cast<int>(b), time + dt * unit(m_rng));
         }
     }
 }
@@ -240,19 +340,23 @@ void ChDustField::UpdateGrid(double time, const ChVector3d& center, const ChVect
     g.sun_dir = L;
     ++g.version;
 
-    // Cloud-in-cell: each particle's extinction spread over the eight voxels around it
+    // Cloud-in-cell: each particle's extinction spread over the eight voxels around it, at points along its path over
+    // the exposure, so a grain moving fast draws a streak as a camera sees it
     const double inv_volume = 1.0 / (h * h * h);
+    const int samples = m_spec.exposure > 0 ? std::max(1, m_spec.exposure_samples) : 1;
     for (const Particle& p : m_particles) {
-        if (p.time0 > time)
+        for (int smp = 0; smp < samples; ++smp) {
+        const double t_smp = samples > 1 ? time - m_spec.exposure * (smp + 0.5) / samples : time;
+        if (p.time0 > t_smp)
             continue;
-        const ChVector3d q = (Position(p, time) - origin) / h - ChVector3d(0.5, 0.5, 0.5);
+        const ChVector3d q = (Position(p, t_smp) - origin) / h - ChVector3d(0.5, 0.5, 0.5);
         const int i = static_cast<int>(std::floor(q.x()));
         const int j = static_cast<int>(std::floor(q.y()));
         const int k = static_cast<int>(std::floor(q.z()));
         if (i < -1 || j < -1 || k < -1 || i >= nx || j >= ny || k >= nz)
             continue;
         const double f[3] = {q.x() - i, q.y() - j, q.z() - k};
-        const double sigma = p.mass * m_mass_extinction[p.bin] * inv_volume;
+        const double sigma = p.mass * m_mass_extinction[p.bin] * inv_volume / samples;
         for (int c = 0; c < 8; ++c) {
             const int ii = i + (c & 1), jj = j + ((c >> 1) & 1), kk = k + ((c >> 2) & 1);
             if (ii < 0 || jj < 0 || kk < 0 || ii >= nx || jj >= ny || kk >= nz)
@@ -260,6 +364,27 @@ void ChDustField::UpdateGrid(double time, const ChVector3d& center, const ChVect
             const double w = ((c & 1) ? f[0] : 1 - f[0]) * (((c >> 1) & 1) ? f[1] : 1 - f[1]) * (((c >> 2) & 1) ? f[2] : 1 - f[2]);
             g.extinction[g.Index(ii, jj, kk)] += static_cast<float>(w * sigma);
         }
+        }
+    }
+
+    // Smoothed, so each super-particle is a soft kernel a few voxels across rather than a lump: [1 2 1] / 4 along each
+    // axis, `blur` times
+    if (m_spec.blur > 0) {
+        std::vector<float> tmp(count);
+        const int n[3] = {nx, ny, nz};
+        const size_t stride[3] = {1, size_t(nx), size_t(nx) * size_t(ny)};
+        for (int pass = 0; pass < m_spec.blur; ++pass)
+            for (int axis = 0; axis < 3; ++axis) {
+                const size_t st = stride[axis];
+                for (size_t idx = 0; idx < count; ++idx) {
+                    const int coord = static_cast<int>((idx / st) % size_t(n[axis]));
+                    const float mid = g.extinction[idx];
+                    const float lo = coord > 0 ? g.extinction[idx - st] : 0.f;
+                    const float hi = coord + 1 < n[axis] ? g.extinction[idx + st] : 0.f;
+                    tmp[idx] = 0.25f * lo + 0.5f * mid + 0.25f * hi;
+                }
+                g.extinction.swap(tmp);
+            }
     }
 
     TraceTransmittance(g, L);

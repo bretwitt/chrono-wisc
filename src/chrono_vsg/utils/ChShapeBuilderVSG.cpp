@@ -570,8 +570,10 @@ vsg::ref_ptr<vsg::Group> ShapeBuilder::CreateTrimeshPbrMatShape(std::shared_ptr<
             }
         }
 
-        // create and fill the vsg buffers
+        // create and fill the vsg buffers; a material no face uses gets none, as an empty draw cannot be recorded
         size_t nVert = tmp_vertices.size();
+        if (nVert == 0)
+            continue;
         vsg::ref_ptr<vsg::vec3Array> vsg_vertices = vsg::vec3Array::create(nVert);
         vsg::ref_ptr<vsg::vec3Array> vsg_normals = vsg::vec3Array::create(nVert);
         vsg::ref_ptr<vsg::vec2Array> vsg_texcoords = vsg::vec2Array::create(nVert);

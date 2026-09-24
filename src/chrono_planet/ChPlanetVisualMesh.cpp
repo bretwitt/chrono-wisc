@@ -13,6 +13,7 @@
 // =============================================================================
 
 #include "chrono_planet/ChPlanetVisualMesh.h"
+#include "chrono_planet/ChSiteHoles.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -77,13 +78,20 @@ void ChPlanetVisualMesh::SetMaterial(std::shared_ptr<ChVisualMaterial> material)
 }
 
 void ChPlanetVisualMesh::SetCompaction(std::shared_ptr<ChDeformationFilter> filter, std::shared_ptr<ChVisualMaterial> material, double min_depth) {
+    std::vector<CompactionLevel> levels;
+    if (material)
+        levels.push_back({min_depth, std::move(material)});
+    SetCompaction(std::move(filter), std::move(levels));
+}
+
+void ChPlanetVisualMesh::SetCompaction(std::shared_ptr<ChDeformationFilter> filter, std::vector<CompactionLevel> levels) {
     m_compaction = std::move(filter);
-    m_compacted_material = std::move(material);
-    m_compaction_depth = min_depth;
+    std::sort(levels.begin(), levels.end(), [](const CompactionLevel& a, const CompactionLevel& b) { return a.min_depth < b.min_depth; });
+    m_compaction_levels = std::move(levels);
 }
 
 bool ChPlanetVisualMesh::MarkCompaction(const ChTileMesh& tile, ChTriangleMeshConnected& mesh) const {
-    if (!m_compaction || !m_compacted_material)
+    if (!m_compaction || m_compaction_levels.empty())
         return false;
 
     // How far each vertex has been lowered, at this tile's resolution, as the terrain drawn for it has it.
@@ -116,60 +124,66 @@ bool ChPlanetVisualMesh::MarkCompaction(const ChTileMesh& tile, ChTriangleMeshCo
                 depth[i] = 0.5 * depth[i] + 0.5 * sum[i] / count[i];
     }
 
-    // Split the faces the compaction contour crosses along it, so the boundary between the two materials follows
-    // the rut outline, interpolated linearly along each edge, rather than the tile's grid. The tile's vertices
-    // come first in the mesh, and each face indexes positions, normals and UVs alike.
+    // Split the faces each compaction contour crosses along it, so the boundaries between the materials follow the
+    // rut outline, interpolated linearly along each edge, rather than the tile's grid. The tile's vertices come first
+    // in the mesh, and each face indexes positions, normals and UVs alike. Each face then takes the material of the
+    // deepest level it lies beyond.
     auto& vertices = mesh.GetCoordsVertices();
     auto& normals = mesh.GetCoordsNormals();
     auto& uvs = mesh.GetCoordsUV();
-    const auto faces = mesh.GetIndicesVertices();
-    std::vector<ChVector3i> new_faces;
-    std::vector<int> face_materials;
-    new_faces.reserve(faces.size());
-    face_materials.reserve(faces.size());
-    std::unordered_map<std::uint64_t, int> crossings;  // contour point on each split edge, by its end vertices
-    auto crossing = [&](int a, int b) {
-        const std::uint64_t key = (std::uint64_t(std::min(a, b)) << 32) | std::uint64_t(std::max(a, b));
-        auto it = crossings.find(key);
-        if (it != crossings.end())
-            return it->second;
-        // The two ends lie on either side of the contour, so the depths differ.
-        const double t = (depth[a] - m_compaction_depth) / (depth[a] - depth[b]);
-        const int i = static_cast<int>(vertices.size());
-        vertices.push_back(vertices[a] + (vertices[b] - vertices[a]) * t);
-        normals.push_back((normals[a] + (normals[b] - normals[a]) * t).GetNormalized());
-        uvs.push_back(uvs[a] + (uvs[b] - uvs[a]) * t);
-        crossings.emplace(key, i);
-        return i;
-    };
-    auto add = [&](int a, int b, int c, int material) {
-        new_faces.push_back(ChVector3i(a, b, c));
-        face_materials.push_back(material);
-    };
-
+    std::vector<ChVector3i> faces = mesh.GetIndicesVertices();
     bool any = false;
-    for (const auto& face : faces) {
-        const int v[3] = {face.x(), face.y(), face.z()};
-        const bool in[3] = {depth[v[0]] > m_compaction_depth, depth[v[1]] > m_compaction_depth, depth[v[2]] > m_compaction_depth};
-        any |= in[0] || in[1] || in[2];
-        if (in[0] == in[1] && in[1] == in[2]) {
-            add(v[0], v[1], v[2], in[0] ? 1 : 0);
-            continue;
+    for (const auto& level : m_compaction_levels) {
+        const double contour = level.min_depth;
+        std::vector<ChVector3i> split;
+        split.reserve(faces.size());
+        std::unordered_map<std::uint64_t, int> crossings;  // contour point on each split edge, by its end vertices
+        auto crossing = [&](int a, int b) {
+            const std::uint64_t key = (std::uint64_t(std::min(a, b)) << 32) | std::uint64_t(std::max(a, b));
+            auto it = crossings.find(key);
+            if (it != crossings.end())
+                return it->second;
+            // The two ends lie on either side of the contour, so the depths differ.
+            const double t = (depth[a] - contour) / (depth[a] - depth[b]);
+            const int i = static_cast<int>(vertices.size());
+            vertices.push_back(vertices[a] + (vertices[b] - vertices[a]) * t);
+            normals.push_back((normals[a] + (normals[b] - normals[a]) * t).GetNormalized());
+            uvs.push_back(uvs[a] + (uvs[b] - uvs[a]) * t);
+            depth.push_back(contour);
+            crossings.emplace(key, i);
+            return i;
+        };
+        for (const auto& face : faces) {
+            const int v[3] = {face.x(), face.y(), face.z()};
+            const bool in[3] = {depth[v[0]] > contour, depth[v[1]] > contour, depth[v[2]] > contour};
+            any |= in[0] || in[1] || in[2];
+            if (in[0] == in[1] && in[1] == in[2]) {
+                split.push_back(face);
+                continue;
+            }
+            // One vertex is alone on its side of the contour. Starting from it, in the face's order, cut off its
+            // corner and fill the rest with two triangles, keeping the face's orientation.
+            const int k = (in[0] != in[1] && in[0] != in[2]) ? 0 : (in[1] != in[0] && in[1] != in[2]) ? 1 : 2;
+            const int a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
+            const int ab = crossing(a, b), ac = crossing(a, c);
+            split.push_back(ChVector3i(a, ab, ac));
+            split.push_back(ChVector3i(ab, b, c));
+            split.push_back(ChVector3i(ab, c, ac));
         }
-        // One vertex is alone on its side of the contour. Starting from it, in the face's order, cut off its
-        // corner and fill the rest with two triangles, keeping the face's orientation.
-        const int k = (in[0] != in[1] && in[0] != in[2]) ? 0 : (in[1] != in[0] && in[1] != in[2]) ? 1 : 2;
-        const int a = v[k], b = v[(k + 1) % 3], c = v[(k + 2) % 3];
-        const int ab = crossing(a, b), ac = crossing(a, c);
-        add(a, ab, ac, in[k] ? 1 : 0);
-        add(ab, b, c, in[k] ? 0 : 1);
-        add(ab, c, ac, in[k] ? 0 : 1);
+        faces = std::move(split);
     }
     if (!any)
         return false;
-    mesh.GetIndicesVertices() = new_faces;
-    mesh.GetIndicesNormals() = new_faces;
-    mesh.GetIndicesUV() = std::move(new_faces);
+    std::vector<int> face_materials(faces.size(), 0);
+    for (size_t f = 0; f < faces.size(); ++f) {
+        const double d = (depth[faces[f].x()] + depth[faces[f].y()] + depth[faces[f].z()]) / 3;
+        for (size_t l = 0; l < m_compaction_levels.size(); ++l)
+            if (d > m_compaction_levels[l].min_depth)
+                face_materials[f] = static_cast<int>(l) + 1;
+    }
+    mesh.GetIndicesVertices() = faces;
+    mesh.GetIndicesNormals() = faces;
+    mesh.GetIndicesUV() = std::move(faces);
     mesh.GetIndicesMaterials() = std::move(face_materials);
     return true;
 }
@@ -199,6 +213,18 @@ void ChPlanetVisualMesh::PlaceOnSphere(const ChTileMesh& tile, ChTriangleMeshCon
                             enu.east.z * nl.x() + enu.north.z * nl.y() + enu.up.z * nl.z());
         normals[i] = ChVector3d(Vdot(np, m_east), Vdot(np, m_north), Vdot(np, m_up));
     }
+}
+
+void ChPlanetVisualMesh::AddHole(const ChSiteRegion& hole) {
+    m_holes.push_back(hole);
+    m_tiles.clear();
+    m_mesh_version = ~0ull;
+}
+
+void ChPlanetVisualMesh::ClearHoles() {
+    m_holes.clear();
+    m_tiles.clear();
+    m_mesh_version = ~0ull;
 }
 
 bool ChPlanetVisualMesh::Update(const ChVector3d& viewpoint, double time) {
@@ -252,14 +278,18 @@ void ChPlanetVisualMesh::Rebuild(const ChVector3d& viewpoint_planet, double time
                 PlaceOnSphere(*tile, *mesh, morph);
             // A tile with no compacted ground keeps a single material, like any other.
             const bool compacted = MarkCompaction(*tile, *mesh);
+            CutSiteHoles(*mesh, m_holes);
             shape = chrono_types::make_shared<ChVisualShapeTriangleMesh>();
             shape->SetMesh(mesh);
             shape->SetMutable(false);  // never edited: a changed tile comes back as a new tile
             shape->AddMaterial(m_material);
             if (compacted)
-                shape->AddMaterial(m_compacted_material);
+                for (const auto& level : m_compaction_levels)
+                    shape->AddMaterial(level.material);
         }
-        model->AddShape(shape);
+        // A tile wholly in a hole keeps its (empty) shape cached but is not drawn
+        if (shape->GetMesh()->GetNumTriangles() > 0)
+            model->AddShape(shape);
         m_num_triangles += shape->GetMesh()->GetNumTriangles();
         tiles.emplace(tile->id, std::move(shape));
     }
