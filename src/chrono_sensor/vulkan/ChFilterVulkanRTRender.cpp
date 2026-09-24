@@ -1989,6 +1989,17 @@ struct ChVulkanRTGpuMaterial {
 constexpr uint32_t CH_VKRT_BSDF_LEGACY = 0u;
 constexpr uint32_t CH_VKRT_BSDF_HAPKE = 1u;
 
+// Push constant flags; must match FLAG_* in the ray generation shader.
+constexpr uint32_t CH_VKRT_FLAG_USE_GI = 1u;
+constexpr uint32_t CH_VKRT_FLAG_VOLUME = 2u;
+
+// Layout of the volume buffer (binding 9); must match the VOLUME_* offsets in the ray generation shader. A header,
+// the largest extinction in each brick of CH_VKRT_VOLUME_BRICK^3 voxels and its one-voxel border (so a ray may skip
+// a brick of zeros whatever it interpolates), then two words per voxel: its extinction, and its Sun transmittance
+// and visibility as two 16-bit unorms.
+constexpr uint32_t CH_VKRT_VOLUME_HEADER_WORDS = 32;
+constexpr uint32_t CH_VKRT_VOLUME_BRICK = 8;
+
 struct ChVulkanRTGpuTexture {
     uint32_t info[4];  // texel offset, width, height, flags (bit 0 = RGB9E5 HDR)
 };
@@ -2205,6 +2216,10 @@ struct ChVulkanRTGpuRenderer {
             m_scene_revision = scene->GetRevision();
             m_descriptors_dirty = true;
         }
+        if (m_volume_revision != scene->GetVolumeRevision()) {
+            UploadVolume(scene->GetVolume().get());
+            m_volume_revision = scene->GetVolumeRevision();
+        }
 
         if (m_vertices.empty() || m_triangles.empty())
             return false;
@@ -2243,7 +2258,8 @@ struct ChVulkanRTGpuRenderer {
         pc.pipeline = static_cast<uint32_t>(frame.pipeline);
         const uint32_t recursion_count = std::min<uint32_t>(255u, std::max<uint32_t>(1u, frame.ray_recursions));
         const uint32_t sample_factor = std::min<uint32_t>(32u, std::max<uint32_t>(1u, frame.sample_factor));
-        pc.flags = (frame.use_gi ? 1u : 0u) | (recursion_count << 8) | (sample_factor << 16);
+        pc.flags = (frame.use_gi ? CH_VKRT_FLAG_USE_GI : 0u) | (m_volume_active ? CH_VKRT_FLAG_VOLUME : 0u) | (recursion_count << 8) |
+                   (sample_factor << 16);
         pc.frame_index = frame.frame_index;
         pc.rng_seed_lo = static_cast<uint32_t>(frame.rng_seed);
         pc.rng_seed_hi = static_cast<uint32_t>(frame.rng_seed >> 32);
@@ -2324,7 +2340,7 @@ struct ChVulkanRTGpuRenderer {
     }
 
     void CreatePipeline() {
-        std::array<VkDescriptorSetLayoutBinding, 9> bindings = {};
+        std::array<VkDescriptorSetLayoutBinding, 10> bindings = {};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         bindings[0].descriptorCount = 1;
@@ -2361,6 +2377,10 @@ struct ChVulkanRTGpuRenderer {
         bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[8].descriptorCount = 1;
         bindings[8].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+        bindings[9].binding = 9;
+        bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[9].descriptorCount = 1;
+        bindings[9].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
         VkDescriptorSetLayoutCreateInfo layout_info = {};
         layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -2457,7 +2477,7 @@ struct ChVulkanRTGpuRenderer {
         pool_sizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         pool_sizes[0].descriptorCount = 1;
         pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_sizes[1].descriptorCount = 8;
+        pool_sizes[1].descriptorCount = 9;
         VkDescriptorPoolCreateInfo pool_info = {};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 1;
@@ -3379,6 +3399,90 @@ struct ChVulkanRTGpuRenderer {
                      VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     }
 
+    // Pack a participating medium into the volume buffer (see CH_VKRT_VOLUME_HEADER_WORDS). With no medium, or an
+    // empty one, the buffer holds only a header and the shader leaves the medium out.
+    void UploadVolume(const ChVulkanRTVolume* volume) {
+        const size_t count = volume ? size_t(volume->nx) * volume->ny * volume->nz : 0;
+        const bool valid = volume && volume->nx >= 2 && volume->ny >= 2 && volume->nz >= 2 && volume->voxel > 0 &&
+                           volume->extinction.size() == count &&
+                           (volume->sun_transmittance.empty() || volume->sun_transmittance.size() == count) &&
+                           (volume->sun_visibility.empty() || volume->sun_visibility.size() == count);
+        if (volume && !valid)
+            std::cerr << "Chrono::Sensor Vulkan RT: participating medium ignored, its fields do not match its grid" << std::endl;
+        m_volume_active = valid && std::any_of(volume->extinction.begin(), volume->extinction.end(), [](float s) { return s > 0.f; });
+
+        std::vector<uint32_t>& words = m_volume_words;
+        if (!m_volume_active) {
+            words.assign(CH_VKRT_VOLUME_HEADER_WORDS, 0u);
+            UploadVector(m_volume_buffer, words, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            return;
+        }
+
+        const uint32_t nx = volume->nx, ny = volume->ny, nz = volume->nz;
+        const uint32_t B = CH_VKRT_VOLUME_BRICK;
+        const uint32_t bx = (nx + B - 1) / B, by = (ny + B - 1) / B, bz = (nz + B - 1) / B;
+        const uint32_t brick_offset = CH_VKRT_VOLUME_HEADER_WORDS;
+        const uint32_t voxel_offset = brick_offset + bx * by * bz;
+        words.assign(size_t(voxel_offset) + 2 * count, 0u);
+
+        auto put = [&](uint32_t i, float v) { std::memcpy(&words[i], &v, sizeof(float)); };
+        put(0, volume->origin.x());
+        put(1, volume->origin.y());
+        put(2, volume->origin.z());
+        put(3, volume->voxel);
+        words[4] = nx;
+        words[5] = ny;
+        words[6] = nz;
+        words[7] = B;
+        words[8] = bx;
+        words[9] = by;
+        words[10] = bz;
+        words[11] = brick_offset;
+        words[12] = voxel_offset;
+        const ChVector3f sun = volume->sun_dir.GetNormalized();
+        put(16, sun.x());
+        put(17, sun.y());
+        put(18, sun.z());
+        put(19, volume->albedo);
+        put(20, volume->color.x());
+        put(21, volume->color.y());
+        put(22, volume->color.z());
+        put(23, volume->phase_b);
+        put(24, volume->phase_c);
+
+        auto unorm16 = [](float v) { return static_cast<uint32_t>(std::lround(std::clamp(v, 0.f, 1.f) * 65535.f)); };
+        for (size_t i = 0; i < count; ++i) {
+            const float t = volume->sun_transmittance.empty() ? 1.f : volume->sun_transmittance[i];
+            const float v = volume->sun_visibility.empty() ? 1.f : volume->sun_visibility[i];
+            put(static_cast<uint32_t>(voxel_offset + 2 * i), std::max(0.f, volume->extinction[i]));
+            words[voxel_offset + 2 * i + 1] = unorm16(t) | (unorm16(v) << 16);
+        }
+
+        // Largest extinction per brick, over the brick and a one-voxel border
+        std::vector<float> brick_max(size_t(bx) * by * bz, 0.f);
+        for (uint32_t k = 0; k < nz; ++k)
+            for (uint32_t j = 0; j < ny; ++j)
+                for (uint32_t i = 0; i < nx; ++i) {
+                    const float sigma = volume->extinction[i + size_t(nx) * (j + size_t(ny) * k)];
+                    if (sigma <= 0.f)
+                        continue;
+                    // Bricks whose bordered range holds this voxel
+                    const uint32_t i0 = (i > 0 ? i - 1 : 0) / B, i1 = std::min(bx - 1, (i + 1) / B);
+                    const uint32_t j0 = (j > 0 ? j - 1 : 0) / B, j1 = std::min(by - 1, (j + 1) / B);
+                    const uint32_t k0 = (k > 0 ? k - 1 : 0) / B, k1 = std::min(bz - 1, (k + 1) / B);
+                    for (uint32_t kb = k0; kb <= k1; ++kb)
+                        for (uint32_t jb = j0; jb <= j1; ++jb)
+                            for (uint32_t ib = i0; ib <= i1; ++ib) {
+                                float& m = brick_max[ib + size_t(bx) * (jb + size_t(by) * kb)];
+                                m = std::max(m, sigma);
+                            }
+                }
+        for (size_t b = 0; b < brick_max.size(); ++b)
+            put(static_cast<uint32_t>(brick_offset + b), brick_max[b]);
+
+        UploadVector(m_volume_buffer, words, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+
     void WriteDescriptors() {
         VkWriteDescriptorSetAccelerationStructureKHR as_info = {};
         as_info.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -3393,8 +3497,9 @@ struct ChVulkanRTGpuRenderer {
         VkDescriptorBufferInfo texture_pixel_info = {m_texture_pixel_buffer->GetBuffer(), 0, m_texture_pixel_buffer->GetSize()};
         VkDescriptorBufferInfo light_info = {m_light_buffer->GetBuffer(), 0, m_light_buffer->GetSize()};
         VkDescriptorBufferInfo scene_info = {m_scene_buffer->GetBuffer(), 0, m_scene_buffer->GetSize()};
+        VkDescriptorBufferInfo volume_info = {m_volume_buffer->GetBuffer(), 0, m_volume_buffer->GetSize()};
 
-        std::array<VkWriteDescriptorSet, 9> writes = {};
+        std::array<VkWriteDescriptorSet, 10> writes = {};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &as_info;
         writes[0].dstSet = m_descriptor_set;
@@ -3449,6 +3554,12 @@ struct ChVulkanRTGpuRenderer {
         writes[8].descriptorCount = 1;
         writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[8].pBufferInfo = &scene_info;
+        writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[9].dstSet = m_descriptor_set;
+        writes[9].dstBinding = 9;
+        writes[9].descriptorCount = 1;
+        writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[9].pBufferInfo = &volume_info;
         vkUpdateDescriptorSets(m_device->GetDevice(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         m_descriptors_dirty = false;
     }
@@ -3577,6 +3688,10 @@ struct ChVulkanRTGpuRenderer {
     std::unique_ptr<ChVulkanRTBuffer> m_texture_pixel_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_light_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_scene_buffer;
+    std::unique_ptr<ChVulkanRTBuffer> m_volume_buffer;
+    std::vector<uint32_t> m_volume_words;
+    uint64_t m_volume_revision = 0;
+    bool m_volume_active = false;
     std::unique_ptr<ChVulkanRTBuffer> m_output_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_output_staging_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_blas_buffer;

@@ -110,6 +110,12 @@ set(Chrono_PLANET_FILTERS_FILES
 )
 source_group("filters" FILES ${Chrono_PLANET_FILTERS_FILES})
 
+set(Chrono_PLANET_DUST_FILES
+    dust/ChDustField.h
+    dust/ChDustField.cpp
+)
+source_group("dust" FILES ${Chrono_PLANET_DUST_FILES})
+
 set(Chrono_PLANET_PROCEDURAL_FILES
     procedural/ChReliefLayer.h
     procedural/ChReliefLayer.cpp
@@ -169,6 +175,7 @@ add_library(Chrono_planet
     ${Chrono_PLANET_DEM_FILES}
     ${Chrono_PLANET_LOD_FILES}
     ${Chrono_PLANET_FILTERS_FILES}
+    ${Chrono_PLANET_DUST_FILES}
     ${Chrono_PLANET_PROCEDURAL_FILES}
     ${Chrono_PLANET_GEOMETRY_FILES}
     ${Chrono_PLANET_PLANETS_FILES}

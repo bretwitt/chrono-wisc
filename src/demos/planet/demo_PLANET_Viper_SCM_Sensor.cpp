@@ -35,7 +35,9 @@
 // sets the Sun's elevation (default 12, output then goes to its own directory), --lights adds three
 // spotlights on the mast lighting the ground ahead and to either side, --sunset drives a short way and then
 // runs a time lapse of the Sun setting as the lights come on (output to its own directory),
-// --cpu-raycast forces SCM's CPU ray casting in a build with the SCM GPU backend.
+// --cpu-raycast forces SCM's CPU ray casting in a build with the SCM GPU backend, --dust has the wheels throw
+// up the soil they loosen as a ChDustField the cameras draw (Vulkan RT only). At VIPER's walking pace the
+// grains barely leave the ground, as they would on the Moon; demo_PLANET_DustRoosterTail shows a faster wheel.
 //
 // =============================================================================
 
@@ -46,6 +48,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -61,6 +64,7 @@
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/ChPlanetVisualMesh.h"
 #include "chrono_planet/ChSiteFrame.h"
+#include "chrono_planet/dust/ChDustField.h"
 #include "chrono_planet/filters/ChDeformationFilter.h"
 #include "chrono_planet/lod/ChPlanetQuadtree.h"
 #include "chrono_planet/planets/moon/ChMoon.h"
@@ -75,6 +79,7 @@
 #include "chrono_sensor/sensors/ChCameraSensor.h"
 
 #include "PlanetBoulderField.h"
+#include "PlanetDust.h"
 #include "PlanetHazardAvoidance.h"
 #include "PlanetDemoSetup.h"
 
@@ -158,6 +163,10 @@ const float light_range = 40.0f;                 // m
 const float light_cone = float(60 * CH_DEG_TO_RAD);     // full cone angle
 const float light_falloff = float(40 * CH_DEG_TO_RAD);  // full angle of the undimmed core
 
+// Lunar regolith Hapke parameters (as in demo_ROBOT_Viper_SCM_Sensor): single-scattering albedo, phase function
+// shape and back/forward weight, for the ground and the dust alike
+const float hapke_w = 0.32357f, hapke_b = 0.23955f, hapke_c = 0.30452f;
+
 std::shared_ptr<ChVisualMaterial> CreateRegolithMaterial(bool hapke, const ChColor& albedo) {
     auto mat = chrono_types::make_shared<ChVisualMaterial>();
     mat->SetAmbientColor({0.0f, 0.0f, 0.0f});
@@ -168,7 +177,7 @@ std::shared_ptr<ChVisualMaterial> CreateRegolithMaterial(bool hapke, const ChCol
     if (hapke) {
         // Lunar regolith parameters, as in demo_ROBOT_Viper_SCM_Sensor.
         mat->SetBSDF(BSDFType::HAPKE);
-        mat->SetHapkeParameters(0.32357f, 0.23955f, 0.30452f, 1.80238f, 0.07145f, 0.3f, float(23.4 * CH_DEG_TO_RAD));
+        mat->SetHapkeParameters(hapke_w, hapke_b, hapke_c, 1.80238f, 0.07145f, 0.3f, float(23.4 * CH_DEG_TO_RAD));
     }
     return mat;
 }
@@ -206,6 +215,7 @@ int main(int argc, char* argv[]) {
     bool sunset = false;
     double sun_elevation_deg = default_sun_elevation;
     bool cpu_raycast = false;
+    bool use_dust = false;
     std::vector<ChGeoTiffSource> dems;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--lambert"))
@@ -222,6 +232,8 @@ int main(int argc, char* argv[]) {
             use_rocks = false;
         else if (!std::strcmp(argv[i], "--cpu-raycast"))
             cpu_raycast = true;
+        else if (!std::strcmp(argv[i], "--dust"))
+            use_dust = true;
         else if (!std::strcmp(argv[i], "--no-avoidance"))
             avoidance = false;
         else if (!std::strcmp(argv[i], "--sun-elevation") && i + 1 < argc)
@@ -429,6 +441,19 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    // Dust the wheels throw up, over the undeformed ground
+    std::unique_ptr<ChDustField> dust;
+    if (use_dust) {
+        ChDustField::Params dust_params;
+        dust_params.gravity = gravity;
+        dust = chrono_types::make_unique<ChDustField>(dust_params, height_at);
+    }
+    auto sun_dir_at = [&](double elevation_deg) {
+        const double e = elevation_deg * CH_DEG_TO_RAD;
+        return ChVector3d(std::cos(e) * std::cos(sun_azimuth), std::cos(e) * std::sin(sun_azimuth), std::sin(e));
+    };
+    std::vector<ChDustField::WheelState> wheel_states(wheels.size());
+
     // A mast camera just ahead of the mast head, looking ahead and down, and a chase camera behind and left
     // of the rover, looking at it. The chassis body spans about x in [-0.75, 1.0] and z up to 1.2 m, and the
     // mast head sits near x = 0.5 to 0.9 m, z = 1.6 to 1.9 m in its frame.
@@ -482,6 +507,12 @@ int main(int argc, char* argv[]) {
             if (sunset)
                 manager->scene->ModifyDirectionalLight(sun, sun_color_at(elevation), float(elevation * CH_DEG_TO_RAD), sun_azimuth);
             place_lights(lights_share_at(elevation));
+            if (dust) {
+                dust->Update(time);
+                dust->UpdateGrid(time, ChVector3d(pos.x(), pos.y(), height_at(pos.x(), pos.y())), sun_dir_at(elevation));
+                if (!SetDustVolume(*manager, *dust, hapke_w, hapke_b, hapke_c, regolith_albedo) && step == 0)
+                    std::cout << "This render backend does not draw the dust; only Vulkan RT does." << std::endl;
+            }
         }
         manager->Update();
 
@@ -526,6 +557,11 @@ int main(int argc, char* argv[]) {
         if (phase == Phase::LAPSE) {
             sys.SetChTime(time + step_size);
         } else {
+            if (dust) {
+                for (size_t w = 0; w < wheels.size(); ++w)
+                    wheel_states[w] = DustWheelState(wheels[w].body, wheel_radius, wheel_width);
+                dust->EmitFromWheels(wheel_states, time, step_size);
+            }
             sys.DoStepDynamics(step_size);
             viper.Update();
         }
@@ -556,6 +592,8 @@ int main(int argc, char* argv[]) {
                 std::cout << ", steering " << plan.steering << (plan.blocked ? " (blocked)" : "");
             if (rut)
                 std::cout << ", rut area " << rut->area_m2 << " m2, max depth " << rut->max_depth_m << " m";
+            if (dust)
+                std::cout << ", dust " << dust->GetStats().aloft * 1e3 << " g aloft in " << dust->GetStats().particles << " particles";
             std::cout << std::endl;
         }
     }

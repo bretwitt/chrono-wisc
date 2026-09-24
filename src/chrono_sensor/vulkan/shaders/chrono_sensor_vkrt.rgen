@@ -84,6 +84,10 @@ layout(std430, set = 0, binding = 7) readonly buffer Lights {
 layout(std430, set = 0, binding = 8) readonly buffer Scene {
     GpuSceneData scene_data;
 };
+// Participating medium; layout in UploadVolume on the host
+layout(std430, set = 0, binding = 9) readonly buffer Volume {
+    uint volume_data[];
+};
 
 layout(location = 0) rayPayloadEXT HitPayload payload;
 
@@ -136,6 +140,7 @@ const uint INVALID_TEXTURE = 0xffffffffu;
 const uint BSDF_LEGACY = 0u;
 const uint BSDF_HAPKE = 1u;
 const uint FLAG_USE_GI = 1u;
+const uint FLAG_VOLUME = 2u;
 
 uint max_trace_depth() {
     // OptiX camera PRDs start at depth 2 and launch a child only while
@@ -580,6 +585,192 @@ float sample_local_light(GpuLight light, int type, vec3 hit_pos, out vec3 light_
     return attenuation;
 }
 
+// Hapke's double Henyey-Greenstein particle phase function at phase angle g (cos_g = dot(light, view)); it averages
+// to 1 over the sphere. c > 0 favors backscatter.
+float hapke_phase(float b, float c, float cos_g) {
+    float b_sq = b * b;
+    return (1.0 + c) / 2.0 * (1.0 - b_sq) / pow(1.0 - 2.0 * b * cos_g + b_sq, 1.5) +
+           (1.0 - c) / 2.0 * (1.0 - b_sq) / pow(1.0 + 2.0 * b * cos_g + b_sq, 1.5);
+}
+
+// ---- Participating medium (binding 9) ----
+
+struct VolumeInfo {
+    vec3 origin;
+    float voxel;
+    ivec3 dims;
+    ivec3 bricks;
+    uint brick_size;
+    uint brick_offset;
+    uint voxel_offset;
+    vec3 sun_dir;
+    float albedo;
+    vec3 color;
+    float phase_b;
+    float phase_c;
+};
+
+bool volume_enabled() {
+    return (pc.flags & FLAG_VOLUME) != 0u;
+}
+
+VolumeInfo load_volume() {
+    VolumeInfo v;
+    v.origin = vec3(uintBitsToFloat(volume_data[0]), uintBitsToFloat(volume_data[1]), uintBitsToFloat(volume_data[2]));
+    v.voxel = uintBitsToFloat(volume_data[3]);
+    v.dims = ivec3(volume_data[4], volume_data[5], volume_data[6]);
+    v.brick_size = volume_data[7];
+    v.bricks = ivec3(volume_data[8], volume_data[9], volume_data[10]);
+    v.brick_offset = volume_data[11];
+    v.voxel_offset = volume_data[12];
+    v.sun_dir = vec3(uintBitsToFloat(volume_data[16]), uintBitsToFloat(volume_data[17]), uintBitsToFloat(volume_data[18]));
+    v.albedo = uintBitsToFloat(volume_data[19]);
+    v.color = vec3(uintBitsToFloat(volume_data[20]), uintBitsToFloat(volume_data[21]), uintBitsToFloat(volume_data[22]));
+    v.phase_b = uintBitsToFloat(volume_data[23]);
+    v.phase_c = uintBitsToFloat(volume_data[24]);
+    return v;
+}
+
+// 1 / d per component, finite where d is zero
+vec3 safe_inverse(vec3 d) {
+    return 1.0 / mix(d, vec3(1e-20), lessThan(abs(d), vec3(1e-20)));
+}
+
+// The part [t0, t1] of a ray inside the grid; false if it misses.
+bool volume_clip(VolumeInfo v, vec3 ro, vec3 rd, float t_max, out float t0, out float t1) {
+    vec3 inv = safe_inverse(rd);
+    vec3 a = (v.origin - ro) * inv;
+    vec3 b = (v.origin + vec3(v.dims) * v.voxel - ro) * inv;
+    vec3 lo = min(a, b);
+    vec3 hi = max(a, b);
+    t0 = max(max(max(lo.x, lo.y), lo.z), 0.0);
+    t1 = min(min(min(hi.x, hi.y), hi.z), t_max);
+    return t0 < t1;
+}
+
+// Largest extinction the samples in the brick holding p can see, and the distance along rd to leave that brick.
+float volume_brick(VolumeInfo v, vec3 p, vec3 rd, out float t_exit) {
+    float brick_len = v.voxel * float(v.brick_size);
+    vec3 q = (p - v.origin) / brick_len;
+    ivec3 bi = clamp(ivec3(floor(q)), ivec3(0), v.bricks - 1);
+    vec3 lo = v.origin + vec3(bi) * brick_len;
+    vec3 far = lo + mix(vec3(0.0), vec3(brick_len), greaterThan(rd, vec3(0.0)));
+    vec3 t = (far - p) * safe_inverse(rd);
+    t_exit = max(min(min(t.x, t.y), t.z), 0.0);
+    return uintBitsToFloat(volume_data[v.brick_offset + uint(bi.x + v.bricks.x * (bi.y + v.bricks.y * bi.z))]);
+}
+
+// Extinction, Sun transmittance and Sun visibility at p, trilinear between voxel centers.
+vec3 volume_sample(VolumeInfo v, vec3 p) {
+    vec3 q = (p - v.origin) / v.voxel - 0.5;
+    ivec3 i0 = ivec3(floor(q));
+    vec3 f = q - vec3(i0);
+    vec3 acc = vec3(0.0);
+    for (int c = 0; c < 8; ++c) {
+        ivec3 o = ivec3(c & 1, (c >> 1) & 1, (c >> 2) & 1);
+        ivec3 ii = clamp(i0 + o, ivec3(0), v.dims - 1);
+        vec3 wv = mix(1.0 - f, f, vec3(o));
+        float w = wv.x * wv.y * wv.z;
+        uint idx = v.voxel_offset + 2u * uint(ii.x + v.dims.x * (ii.y + v.dims.y * ii.z));
+        acc += w * vec3(uintBitsToFloat(volume_data[idx]), unpackUnorm2x16(volume_data[idx + 1u]));
+    }
+    return acc;
+}
+
+// Optical depth of the medium along a ray, up to t_max.
+float volume_optical_depth(VolumeInfo v, vec3 ro, vec3 rd, float t_max) {
+    float t0, t1;
+    if (!volume_clip(v, ro, rd, t_max, t0, t1))
+        return 0.0;
+    float dt = v.voxel;
+    float tau = 0.0;
+    float t = t0 + 0.5 * dt;
+    for (int n = 0; n < 4096 && t < t1; ++n) {
+        vec3 p = ro + rd * t;
+        float t_exit;
+        if (volume_brick(v, p, rd, t_exit) <= 0.0) {
+            t += max(t_exit, 0.0) + 0.5 * dt;
+            continue;
+        }
+        tau += volume_sample(v, p).x * min(dt, t1 - t + 0.5 * dt);
+        t += dt;
+    }
+    return tau;
+}
+
+// Transmittance of the medium from a surface point toward a light. For the light the grid was traced for, a lookup
+// where the point is in the grid.
+float volume_light_transmittance(vec3 hit_pos, vec3 light_dir, int type, float max_t) {
+    if (!volume_enabled())
+        return 1.0;
+    VolumeInfo v = load_volume();
+    if (type == LIGHT_DIRECTIONAL && dot(light_dir, v.sun_dir) > 0.99999) {
+        vec3 q = (hit_pos - v.origin) / (v.voxel * vec3(v.dims));
+        if (all(greaterThanEqual(q, vec3(0.0))) && all(lessThanEqual(q, vec3(1.0))))
+            return volume_sample(v, hit_pos).y;
+    }
+    return exp(-volume_optical_depth(v, hit_pos, light_dir, max_t));
+}
+
+// Light scattered toward the viewer per unit extinction at p: w * color * sum over lights of irradiance * phase / 4 pi.
+// The traced light gets the grid's transmittance and visibility, and every light that still reaches p is checked
+// against the scene's geometry, so the medium in the shadow of a vehicle is dark.
+vec3 volume_source(VolumeInfo v, vec3 p, vec3 view_dir, vec2 sun_tv) {
+    vec3 sum = vec3(0.0);
+    for (uint i = 0u; i < scene_data.counts.x; ++i) {
+        GpuLight light = lights[i];
+        int type = int(light.dir_type.w + 0.5);
+        if (type == LIGHT_ENVIRONMENT || type == LIGHT_AREA)
+            continue;
+        vec3 light_dir;
+        float max_t;
+        float attenuation = sample_local_light(light, type, p, light_dir, max_t);
+        if (attenuation <= 0.0)
+            continue;
+        if (type == LIGHT_DIRECTIONAL && dot(light_dir, v.sun_dir) > 0.99999)
+            attenuation *= sun_tv.x * sun_tv.y;
+        if (attenuation <= 1e-4 || visibility_occluded_optix(p, light_dir, max_t))
+            continue;
+        sum += attenuation * light.color_atten.rgb * hapke_phase(v.phase_b, v.phase_c, dot(light_dir, view_dir));
+    }
+    return v.albedo * v.color * sum / (4.0 * PI);
+}
+
+// Single scattering along a camera ray up to t_max: rgb light added, a transmittance of what lies behind. Samples
+// sit a voxel apart from a random start, and each step integrates exactly for constant extinction and light over it.
+// Bricks holding no medium are skipped.
+vec4 volume_march(vec3 ro, vec3 rd, float t_max, uint seed) {
+    VolumeInfo v = load_volume();
+    float t0, t1;
+    if (!volume_clip(v, ro, rd, t_max, t0, t1))
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    vec3 view_dir = -rd;
+    float dt = v.voxel;
+    float jitter = hash_unit(seed);
+    float t = t0 + jitter * dt;
+    vec3 light = vec3(0.0);
+    float T = 1.0;
+    for (int n = 0; n < 4096 && t < t1; ++n) {
+        vec3 p = ro + rd * t;
+        float t_exit;
+        if (volume_brick(v, p, rd, t_exit) <= 0.0) {
+            t += max(t_exit, 0.0) + max(jitter, 0.01) * dt;
+            continue;
+        }
+        vec3 s = volume_sample(v, p);
+        if (s.x > 0.0) {
+            float step_len = min(dt, t1 - t + jitter * dt);
+            float transmit = exp(-s.x * step_len);
+            light += T * (1.0 - transmit) * volume_source(v, p, view_dir, s.yz);
+            T *= transmit;
+            if (T < 1e-3)
+                break;
+        }
+        t += dt;
+    }
+    return vec4(light, T);
+}
+
 // Hapke bidirectional reflectance for one light direction, as the OptiX camera Hapke shader
 // evaluates it. The result multiplies the incoming irradiance (light color times cos i) and the
 // diffuse color. The opposition effect from coherent backscatter is off (B_c0 = 0), as in OptiX.
@@ -705,6 +896,7 @@ vec3 shade_hapke(TraceResult hit, GpuMaterial gpu_mat, vec3 origin, vec3 dir, ui
             continue;
         if (visibility_occluded_optix(shadow_origin(hit_pos, n, light_dir, hit.t), light_dir, max_shadow_t))
             continue;
+        irradiance *= volume_light_transmittance(hit_pos, light_dir, type, max_shadow_t);
         color += hapke_reflectance(gpu_mat, n, view_dir, light_dir) * ndl * irradiance * albedo;
     }
     return color;
@@ -783,7 +975,7 @@ vec3 shade_direct(TraceResult hit, vec3 origin, vec3 dir, bool include_ambient, 
         vec3 light_origin = shadow_origin(hit_pos, n, light_dir, hit.t);
         if (visibility_occluded_optix(light_origin, light_dir, max_shadow_t))
             continue;
-        vec3 shadow = vec3(1.0);
+        vec3 shadow = vec3(volume_light_transmittance(hit_pos, light_dir, type, max_shadow_t));
 
         vec3 h = normalize(light_dir + view_dir);
         float ndh = max(dot(n, h), 0.0);
@@ -826,6 +1018,12 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index) {
     int trace_depth_limit = int(max_trace_depth());
     for (int depth = 0; depth < trace_depth_limit; ++depth) {
         TraceResult h = trace_scene(ro, rd, pc.origin_max_t.w, pc.aux0.y);
+        // The medium between the camera and the first surface, or the sky
+        if (depth == 0 && volume_enabled()) {
+            vec4 medium = volume_march(ro, rd, h.hit ? h.t : pc.origin_max_t.w, path_seed ^ 0x3c6ef372u);
+            accum += throughput * medium.rgb;
+            throughput *= medium.a;
+        }
         if (!h.hit) {
             accum += throughput * background_color(rd);
             break;

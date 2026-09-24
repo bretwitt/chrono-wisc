@@ -17,7 +17,7 @@ if(CH_ENABLE_MODULE_VEHICLE_MODELS)
     )
 endif()
 
-set(UTILS "PlanetBoulderField.h" "PlanetDemoSetup.h" "PlanetHazardAvoidance.h")
+set(UTILS "PlanetBoulderField.h" "PlanetDemoSetup.h" "PlanetDust.h" "PlanetHazardAvoidance.h")
 
 #--------------------------------------------------------------
 
@@ -55,7 +55,7 @@ endforeach()
 
 # Chrono::Sensor demos over the planet terrain, shaded with the Hapke BRDF.
 if(CH_ENABLE_MODULE_SENSOR)
-    foreach(PROGRAM demo_PLANET_SensorHapke demo_PLANET_Viper_SCM_Sensor demo_PLANET_MoonDescent)
+    foreach(PROGRAM demo_PLANET_SensorHapke demo_PLANET_Viper_SCM_Sensor demo_PLANET_MoonDescent demo_PLANET_DustRoosterTail)
         add_executable(${PROGRAM} ${PROGRAM}.cpp ${UTILS})
         source_group("" FILES ${PROGRAM}.cpp ${UTILS})
         if(MSVC)

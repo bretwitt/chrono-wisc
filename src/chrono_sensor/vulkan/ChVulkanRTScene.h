@@ -198,6 +198,33 @@ struct CH_SENSOR_API ChVulkanRTLight {
     std::string texture;
 };
 
+/// A participating medium on a voxel grid, such as lofted dust, drawn by camera sensors with single scattering of
+/// the scene's lights. Voxel (i, j, k) is centered at origin + voxel * (i + 1/2, j + 1/2, k + 1/2) and stored at
+/// index i + nx * (j + ny * k); values are trilinear between voxel centers.
+///
+/// Scattering follows the particle part of the Hapke model, so a medium made of the same grains as a Hapke surface
+/// looks like it: single-scattering albedo w and the double Henyey-Greenstein phase function with shape b and
+/// back/forward weight c, as ChVisualMaterial::SetHapkeParameters takes them, tinted by color.
+///
+/// Light reaching the medium is checked against the scene's geometry with a shadow ray, and the light from one
+/// directional light, the one along sun_dir, can also be given per voxel: its transmittance through the medium (the
+/// medium's own shadow, which the shadow rays do not see) and its visibility past other geometry, such as terrain
+/// outside the scene, which also spares the shadow rays where it is zero. Surfaces are shadowed by the medium from
+/// every light.
+struct ChVulkanRTVolume {
+    ChVector3f origin = ChVector3f(0.f, 0.f, 0.f);  ///< corner of the grid (m)
+    float voxel = 0.1f;                             ///< voxel edge (m)
+    unsigned int nx = 0, ny = 0, nz = 0;            ///< voxels along x, y and z
+    std::vector<float> extinction;                  ///< extinction coefficient (1/m)
+    std::vector<float> sun_transmittance;           ///< toward sun_dir, through the medium; empty for none
+    std::vector<float> sun_visibility;              ///< toward sun_dir, past other geometry; empty for full
+    ChVector3f sun_dir = ChVector3f(0.f, 0.f, 1.f);  ///< unit direction toward the light the two fields are for
+    float albedo = 0.3f;                            ///< Hapke single-scattering albedo w
+    float phase_b = 0.25f;                          ///< Hapke phase function shape b
+    float phase_c = 0.3f;                           ///< Hapke phase function back/forward weight c
+    ChVector3f color = ChVector3f(1.f, 1.f, 1.f);   ///< tint of the scattered light
+};
+
 /// Staging scene for the Vulkan backend.
 ///
 /// This object mirrors the public ChOptixScene methods used by existing Sensor demos
@@ -272,6 +299,15 @@ class CH_SENSOR_API ChVulkanRTScene {
     unsigned int AddEnvironmentLight(std::string env_tex_path, float intensity_scale);
 
     void SetLights(const std::vector<ChVulkanRTLight>& lights);
+
+    /// Set the participating medium the cameras draw (null for none). The renderers upload it again whenever it
+    /// is set, without rebuilding the scene's geometry, so set a new one each time it changes.
+    void SetVolume(std::shared_ptr<const ChVulkanRTVolume> volume) {
+        m_volume = std::move(volume);
+        ++m_volume_revision;
+    }
+    const std::shared_ptr<const ChVulkanRTVolume>& GetVolume() const { return m_volume; }
+    uint64_t GetVolumeRevision() const { return m_volume_revision; }
     void ClearLights() { if (!m_lights.empty()) { m_lights.clear(); Touch(); } }
     const std::vector<ChVulkanRTLight>& GetLights() const { return m_lights; }
 
@@ -318,6 +354,8 @@ class CH_SENSOR_API ChVulkanRTScene {
     Background m_background;
     uint64_t m_revision = 1;
     uint64_t m_system_signature = 0;
+    std::shared_ptr<const ChVulkanRTVolume> m_volume;
+    uint64_t m_volume_revision = 1;
 };
 
 /// @} sensor_vulkan
