@@ -39,6 +39,10 @@ DemResource Resource(Dem dem) {
             return {"ldem_64_fixed.tif", 0, 4, "LOLA global, 64 px/deg (~474 m)"};
         case Dem::APOLLO17_LANDING_SITE:
             return {"ldem_1024_apollo_region.tif", 5, 30, "LOLA Apollo 17 region, 1024 px/deg (~30 m)"};
+        case Dem::APOLLO17_SLDEM2015:
+            return {"sldem2015_apollo17.tif", 5, 7, "SLDEM2015 around Apollo 17, 512 px/deg (~59 m)"};
+        case Dem::APOLLO17_NAC_DTM:
+            return {"NAC_DTM_APOLLO17.TIF", 8, 30, "LROC NAC DTM of Taurus-Littrow, 5 m/px"};
     }
     throw std::invalid_argument("moon: unknown DEM resource");
 }

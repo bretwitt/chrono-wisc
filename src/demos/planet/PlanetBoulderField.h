@@ -65,6 +65,10 @@ class PlanetBoulderField {
     /// Set the color of rocks created after this call (default: a dark regolith grey).
     void SetColor(const chrono::ChColor& color) { m_color = color; }
 
+    /// Set a visual material for rocks created after this call, in place of the color (for example a Hapke
+    /// material for Chrono::Sensor cameras). Null goes back to the color.
+    void SetVisualMaterial(std::shared_ptr<chrono::ChVisualMaterial> material) { m_visual_material = std::move(material); }
+
     /// Set the collision family of the rocks and the family they ignore (defaults: kRockFamily, kTerrainFamily).
     /// Applies to rocks created after this call. The caller assigns terrain_family to the ground body.
     void SetCollisionFamilies(int rock_family, int terrain_family) {
@@ -160,7 +164,10 @@ class PlanetBoulderField {
         auto shape = chrono_types::make_shared<chrono::ChVisualShapeTriangleMesh>();
         shape->SetMesh(trimesh, false);
         shape->SetMutable(false);
-        shape->SetColor(m_color);
+        if (m_visual_material)
+            shape->AddMaterial(m_visual_material);
+        else
+            shape->SetColor(m_color);
         body->AddVisualShape(shape);
 
         // Collision: the convex hull of the coarsest LOD's vertices, plenty for a rounded boulder.
@@ -187,6 +194,7 @@ class PlanetBoulderField {
     std::shared_ptr<chrono::ChContactMaterial> m_material;
     double m_min_radius;
     chrono::ChColor m_color;
+    std::shared_ptr<chrono::ChVisualMaterial> m_visual_material;
     int m_family = kRockFamily;
     int m_ignore_family = kTerrainFamily;
 

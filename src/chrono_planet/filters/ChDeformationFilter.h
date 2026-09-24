@@ -50,11 +50,23 @@ namespace planet {
 ///
 /// The changes fade out on meshes too coarse to show them: fully visible at a relief spacing up to twice
 /// the node spacing, and gone at four times, so coarse tiles never alias a rut into a spike.
+///
+/// A node can also carry its height after the change (SetNodes). Where the ground has been lowered, the
+/// terrain then follows those heights rather than the incoming terrain moved down, so relief finer than the
+/// grid, which a wheel presses flat, fades out of compacted ground (see SetFlattenDepth).
 /// All methods are thread-safe.
 class CH_PLANET_API ChDeformationFilter : public ChSurfaceFilter {
   public:
     /// A grid of the given node spacing (m) in a site frame.
     ChDeformationFilter(const ChSiteFrame& site, double spacing);
+
+    /// A changed node: its height change (m) and its height after the change, above the reference sphere (m),
+    /// or NaN if unknown.
+    struct Node {
+        ChVector2i index;
+        double delta;
+        double height;
+    };
 
     const ChSiteFrame& GetSiteFrame() const { return m_site; }
     double GetSpacing() const { return m_spacing; }
@@ -63,11 +75,23 @@ class CH_PLANET_API ChDeformationFilter : public ChSurfaceFilter {
     /// are left alone. Returns the number of nodes changed; if any, records a change for GetChanges.
     size_t SetDeltas(const std::vector<std::pair<ChVector2i, double>>& deltas, double tolerance = 1e-3);
 
+    /// Set the height change of grid nodes, with their heights after the change. As SetDeltas otherwise.
+    size_t SetNodes(const std::vector<Node>& nodes, double tolerance = 1e-3);
+
+    /// Lowering (m) over which compacted ground goes from the incoming terrain moved down to the nodes' own
+    /// heights, where nodes carry them (default: 0.01). 0 keeps the incoming terrain's relief everywhere.
+    void SetFlattenDepth(double depth) { m_flatten_depth = depth; }
+    double GetFlattenDepth() const { return m_flatten_depth; }
+
     /// Remove every change, recording one covering them all.
     void Clear();
 
     /// Height change of a node (0 if never set).
     double GetDelta(const ChVector2i& node) const;
+
+    /// Height change (m) at a longitude and latitude (degrees), as seen at a relief spacing (degrees): bilinear
+    /// between the nodes, faded out on coarse meshes as the terrain has it.
+    double GetDelta(double lon_deg, double lat_deg, double spacing_deg) const;
 
     /// Number of nodes holding a change.
     size_t GetNumNodes() const;
@@ -85,6 +109,8 @@ class CH_PLANET_API ChDeformationFilter : public ChSurfaceFilter {
     double Weight(double spacing_deg) const;
     // Bilinear height change at site coordinates; caller holds the lock.
     double DeltaAt(double x, double y) const;
+    // The incoming height at site coordinates with the change applied, at visibility w; caller holds the lock.
+    double HeightAt(double x, double y, double w, double height) const;
     // Lon/lat rectangle of a node box, padded one node for the bilinear reach.
     ChGeoRegion RegionOf(int i0, int j0, int i1, int j1) const;
 
@@ -93,7 +119,12 @@ class CH_PLANET_API ChDeformationFilter : public ChSurfaceFilter {
     double m_meters_per_degree;
 
     mutable std::shared_mutex m_mutex;
-    std::unordered_map<std::int64_t, double> m_deltas;
+    struct Value {
+        double delta;
+        double height;  // after the change, NaN if unknown
+    };
+    std::unordered_map<std::int64_t, Value> m_deltas;
+    double m_flatten_depth = 0.01;
     int m_i0, m_j0, m_i1, m_j1;  // bounding box of the nodes ever set, in node indices
 
     struct Change {

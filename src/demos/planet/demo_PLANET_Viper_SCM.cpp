@@ -250,14 +250,15 @@ int main(int argc, char* argv[]) {
     PlanetSCMTerrain terrain(&sys, surface, site);
     PlanetSCMTerrain::Params params;
     params.delta = scm_delta;
-    // Soft, loose regolith (the lunar set of demo_ROBOT_Viper_SCM_Sensor), so the rover leaves clear ruts.
-    params.bekker_kphi = 0.2e6;  // frictional modulus (Pa/m^n)
-    params.bekker_kc = 0;        // cohesive modulus (Pa/m^(n-1))
-    params.bekker_n = 1.1;       // sinkage exponent
-    params.mohr_cohesion = 0;    // cohesion (Pa)
-    params.mohr_friction = 30;   // internal friction angle (deg)
-    params.janosi_shear = 0.01;  // Janosi shear displacement (m)
-    params.elastic_k = 4e7;      // elastic stiffness (Pa/m), must exceed bekker_kphi
+    // Soft, loose regolith, so the rover leaves clear ruts: the lunar set of demo_ROBOT_Viper_SCM_Sensor with
+    // half its stiffnesses and 1 kPa of cohesion, the upper end of Apollo estimates for the lunar surface.
+    params.bekker_kphi = 0.1e6;   // frictional modulus (Pa/m^n)
+    params.bekker_kc = 0;         // cohesive modulus (Pa/m^(n-1))
+    params.bekker_n = 1.1;        // sinkage exponent
+    params.mohr_cohesion = 1e3;   // cohesion (Pa)
+    params.mohr_friction = 30;    // internal friction angle (deg)
+    params.janosi_shear = 0.01;   // Janosi shear displacement (m)
+    params.elastic_k = 2e7;       // elastic stiffness (Pa/m), must exceed bekker_kphi
     params.damping_r = 3e4;      // vertical damping (Pa s/m)
     params.bulldozing = bulldozing;
     terrain.Initialize(params, wheels);

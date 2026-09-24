@@ -62,10 +62,12 @@ struct ChPlanetQuadtree::Impl {
     int m_view_range;         // ring half-width in tiles at ground level
     double m_split_tiles = 1.0;       // split distance, in widths of the tile
     double m_horizon_margin = 1000.0; // terrain depth assumed for horizon tests (m), < 0: off
+    int m_min_zoom = 0;               // tiles above the horizon split to at least this zoom
+    int m_max_zoom = 17;              // tiles never split past this zoom
 
     LodParams Lod() const {
         const double root_width = m_tile_size * util::kPi / 180.0 * m_radius;
-        return {m_split_tiles * root_width, m_horizon_margin, m_radius};
+        return {m_split_tiles * root_width, m_horizon_margin, m_radius, m_min_zoom, m_max_zoom};
     }
     std::uint64_t m_seen_version = 0;  // latest filter change already in the tiles
     long long m_rebuilt = 0;           // tiles rebuilt for changes
@@ -201,6 +203,26 @@ void ChPlanetQuadtree::SetSplitDistance(double tile_widths) {
     if (!(tile_widths > 0))
         throw std::invalid_argument("ChPlanetQuadtree::SetSplitDistance: must be positive");
     m_impl->m_split_tiles = tile_widths;
+}
+
+void ChPlanetQuadtree::SetMinZoom(int zoom) {
+    if (zoom < 0)
+        throw std::invalid_argument("ChPlanetQuadtree::SetMinZoom: must not be negative");
+    m_impl->m_min_zoom = zoom;
+}
+
+int ChPlanetQuadtree::GetMinZoom() const {
+    return m_impl->m_min_zoom;
+}
+
+void ChPlanetQuadtree::SetMaxZoom(int zoom) {
+    if (zoom < 0)
+        throw std::invalid_argument("ChPlanetQuadtree::SetMaxZoom: must not be negative");
+    m_impl->m_max_zoom = zoom;
+}
+
+int ChPlanetQuadtree::GetMaxZoom() const {
+    return m_impl->m_max_zoom;
 }
 
 double ChPlanetQuadtree::GetSplitDistance() const {

@@ -42,6 +42,13 @@ enum class Dem {
     GLOBAL_LOW_RES,         ///< LOLA global, 4 px/deg (~7.6 km), zooms 0-2. Shipped with Chrono.
     GLOBAL,                 ///< LOLA global, 64 px/deg (~474 m), zooms 0-4. Not shipped (480 MB).
     APOLLO17_LANDING_SITE,  ///< LOLA Apollo 17 region (Taurus-Littrow), 1024 px/deg (~30 m), zooms 5-30. Shipped.
+    /// SLDEM2015 (LOLA and SELENE Terrain Camera), 512 px/deg (~59 m), 10 x 10 degrees around the Apollo 17
+    /// site, zooms 5-7. Not shipped (100 MB, cut with make_sldem2015_crop.py). Unlike the LOLA site grid, free
+    /// of the stripes of LOLA's ground tracks.
+    APOLLO17_SLDEM2015,
+    /// LROC NAC stereo DTM of Taurus-Littrow, 5 m/px, about 58 x 51 km around the Apollo 17 site, zooms 8-30.
+    /// Not shipped (463 MB). Over APOLLO17_SLDEM2015, it replaces APOLLO17_LANDING_SITE.
+    APOLLO17_NAC_DTM,
 };
 
 /// Directory the Moon DEM resources are looked up in by default: planet/moon/ under the Chrono data directory.

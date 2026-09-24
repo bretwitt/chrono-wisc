@@ -11,6 +11,8 @@ struct GpuMaterial {
     uvec4 texture0;
     uvec4 texture1;
     vec4 tex_scale;
+    vec4 hapke0;     // Hapke w, b, c, B_s0
+    vec4 hapke1;     // Hapke h_s, phi, theta_p, reserved
 };
 
 struct GpuVertex {

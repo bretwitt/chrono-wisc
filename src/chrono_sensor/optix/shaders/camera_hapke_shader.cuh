@@ -23,6 +23,7 @@
 
 #include "chrono_sensor/optix/shaders/device_utils.cuh"
 #include "chrono_sensor/optix/shaders/shader_utils.cuh"
+#include "chrono_sensor/optix/shaders/ChOptixLightHubs.cuh"
 
 
 /// @brief Camera shader based on Hapke's BRDF model for simulating light interaction with particulate surfaces such as planetary regoliths.
@@ -72,7 +73,8 @@ static __device__ inline void CameraHapkeShader(PerRayData_camera* prd_camera,
     float h_c = 1.0f;
     float phi = mat.phi;
     float theta_p = mat.theta_p;
-    float cos_e = Dot(world_normal, -ray_dir);
+    // Interpolated normals can face slightly away from a grazing view; keep emergence just short of 90 deg.
+    float cos_e = fmaxf(Dot(world_normal, -ray_dir), 1e-3f);
 
     float3 reflected_color = make_float3(0.0f);
     {
@@ -82,15 +84,13 @@ static __device__ inline void CameraHapkeShader(PerRayData_camera* prd_camera,
             ls.hitpoint = hit_point;
             ls.wo = -ray_dir;
             ls.n = world_normal;
-            SampleLight(l, &ls);
+            // Handles every light type, directional ones included; L already carries the cos_i factor.
+            CheckVisibleAndSampleLight(params, l, ls, prd_camera);
 
-            float dist_to_light = ls.dist;  // Length(l.pos - hit_point);
-            // printf("dist_to_light:%.4f\n", dist_to_light);
-            if (1) {  // dist_to_light < 2 * l.max_range{ // Sun should have infinity range, so this condition will
-                      // always be true for ths sun
-                float3 dir_to_light = ls.dir;  // normalize(l.pos - hit_point);
-                float cos_i = Dot(dir_to_light, world_normal);
-                // printf("cos_i:%.2f",cos_i);
+            float dist_to_light = ls.dist;
+            if (ls.pdf > 0 && fmaxf(ls.L) > 0) {
+                float3 dir_to_light = ls.dir;
+                float cos_i = ls.NdL;
                 if (cos_i > 0) {
                     // Cast a shadow ray to see any attenuation of light
                     PerRayData_shadow prd_shadow = DefaultShadowPRD();
@@ -106,16 +106,16 @@ static __device__ inline void CameraHapkeShader(PerRayData_camera* prd_camera,
 
                     float3 light_attenuation = prd_shadow.attenuation;
 
-                    float point_light_falloff = 1.0f;  // ??
-                    float3 incoming_light_ray = ls.L * light_attenuation * cos_i;
+                    float3 incoming_light_ray = ls.L * light_attenuation;
                     // float3 incoming_light_ray = l.color * cos_i * light_attenuation; // Add attenuation later
                     // printf("incoming_light_ray: (%.2f,%.2f,%.2f)\n", incoming_light_ray.x, incoming_light_ray.y,
                     // incoming_light_ray.z);
                     if (fmaxf(incoming_light_ray) > 0.0f) {
                         float cos_g = Dot(dir_to_light, -ray_dir);
-                        float sin_i = sqrt(1 - (cos_i * cos_i));  // + sqrt
-                        float sin_e = sqrt(1 - (cos_e * cos_e));
-                        float sin_g = sqrt(1 - (cos_g * cos_g));
+                        // Rounding can push the cosines past 1, so clamp before every sqrt and acos.
+                        float sin_i = sqrtf(fmaxf(0.f, 1 - (cos_i * cos_i)));
+                        float sin_e = sqrtf(fmaxf(0.f, 1 - (cos_e * cos_e)));
+                        float sin_g = sqrtf(fmaxf(0.f, 1 - (cos_g * cos_g)));
 
                         float tan_i = sin_i / cos_i;
                         float tan_e = sin_e / cos_e;
@@ -126,9 +126,13 @@ static __device__ inline void CameraHapkeShader(PerRayData_camera* prd_camera,
                         float cot_e_sq = cot_e * cot_e;
 
                         // Calculate Psi
-                        float cos_psi = Dot(normalize(dir_to_light - (cos_i * world_normal)),
-                                            normalize(-ray_dir - (cos_e * world_normal)));
-                        float psi = acos(cos_psi);
+                        // Azimuth between the incidence and emergence planes; undefined (taken as 0) if either is along the normal.
+                        float3 light_tangent = dir_to_light - (cos_i * world_normal);
+                        float3 view_tangent = -ray_dir - (cos_e * world_normal);
+                        float tangent_lengths = Length(light_tangent) * Length(view_tangent);
+                        float cos_psi = tangent_lengths > 1e-12f ? Dot(light_tangent, view_tangent) / tangent_lengths : 1.f;
+                        cos_psi = fminf(fmaxf(cos_psi, -1.f), 1.f);
+                        float psi = acosf(cos_psi);
                         float psi_half = psi / 2;
                         float f_psi = expf(-2 * tan(psi_half));
                         float sin_psi_half = sin(psi_half);
@@ -157,7 +161,7 @@ static __device__ inline void CameraHapkeShader(PerRayData_camera* prd_camera,
                         float mu0_e = chi_theta_p;
                         float mu_e = chi_theta_p;
                         float S = 0.0f;
-                        if (cos_i >= cos_g) {  // for x,y \in [0,pi], if x <= y => cos(x) >= cos(y)
+                        if (cos_i >= cos_e) {  // i <= e, since cos is decreasing on [0, pi]
                             mu0_e *= cos_i + sin_i * tan_theta_p * (cos_psi * E_2_e + sin_psi_half_sq * E_2_i) /
                                                  (2 - E_1_e - psi_per_pi * E_1_i);
 

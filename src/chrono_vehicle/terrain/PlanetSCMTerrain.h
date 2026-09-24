@@ -167,7 +167,8 @@ class CH_VEHICLE_API PlanetSCMTerrain : public SCMTerrain {
     /// A deformation filter matching this terrain's site frame and grid, already set on it.
     std::shared_ptr<planet::ChDeformationFilter> MakeDeformationFilter();
 
-    /// Copy the current sinkage of every node SCM has touched into the deformation filter, if one is set.
+    /// Copy the current sinkage and height of every node SCM has touched into the deformation filter, if one
+    /// is set: the drawn terrain then shows compacted ground as SCM has it, flattened by the wheels.
     /// Call it as often as the drawn terrain should refresh, for example once per rendered frame.
     /// Returns the number of nodes whose height changed by more than a millimeter.
     std::size_t PublishDeformation();

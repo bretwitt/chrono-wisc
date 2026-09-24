@@ -23,6 +23,8 @@ struct LodParams {
     double splitDistanceM0;   // split distance of a root tile (m); level L splits at this / 2^L
     double horizonMarginM;    // assumed terrain depth below the camera and the tile for horizon tests (m), < 0: off
     double sphereRadiusM;     // body radius (m)
+    int minLevel = 0;         // tiles above the horizon split to at least this level
+    int maxLevel = 17;        // tiles never split past this level
 };
 
 // Camera distance below which a tile at level splits.

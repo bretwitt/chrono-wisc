@@ -19,6 +19,7 @@
 
 #include "chrono_vsg/utils/ChShapeBuilderVSG.h"
 
+#include "chrono_planet/ChPlanetVisualMesh.h"
 #include "chrono_planet/core/SphereMath.h"
 #include "chrono_planet/visualization/ChPlanetVisualizationVSG.h"
 
@@ -172,43 +173,7 @@ vsg::ref_ptr<vsg::Node> ChPlanetVisualizationVSG::BuildTile(const ChTileMesh& me
     const size_t n = mesh.vertexData.size() / ChTileMesh::kFloatsPerVertex;
 
     auto trimesh = chrono_types::make_shared<ChTriangleMeshConnected>();
-    auto& vertices = trimesh->GetCoordsVertices();
-    auto& normals = trimesh->GetCoordsNormals();
-    auto& uvs = trimesh->GetCoordsUV();
-    vertices.reserve(n);
-    normals.reserve(n);
-    uvs.reserve(n);
-
-    for (size_t i = 0; i < n; ++i) {
-        const float* v = &mesh.vertexData[i * ChTileMesh::kFloatsPerVertex];
-        // Center-relative planet position, re-projected through the site frame so it matches the physics.
-        const double px = mesh.centerX + v[0];
-        const double py = mesh.centerY + v[1];
-        const double pz = mesh.centerZ + v[2];
-        const util::LonLat ll = util::lonLatOf(px, py, pz);
-        vertices.push_back(m_site.ToLocal(ll.lon, ll.lat, util::elevationOf(px, py, pz, m_site.GetRadius())));
-        // Slopes are the normal's east and north components over its up component.
-        ChVector3d normal(v[3], v[4], 1.0);
-        normal.Normalize();
-        normals.push_back(normal);
-        uvs.push_back(ChVector2d(v[5], v[6]));
-    }
-
-    const auto& idx = ChTileMesh::GetIndices(mesh.level);
-    auto& faces = trimesh->GetIndicesVertices();
-    auto& face_normals = trimesh->GetIndicesNormals();
-    auto& face_uvs = trimesh->GetIndicesUV();
-    const size_t ntri = idx.size() / 3;
-    faces.reserve(ntri);
-    face_normals.reserve(ntri);
-    face_uvs.reserve(ntri);
-    for (size_t t = 0; t < ntri; ++t) {
-        const ChVector3i tri(static_cast<int>(idx[3 * t]), static_cast<int>(idx[3 * t + 1]),
-                             static_cast<int>(idx[3 * t + 2]));
-        faces.push_back(tri);
-        face_normals.push_back(tri);
-        face_uvs.push_back(tri);
-    }
+    ChPlanetVisualMesh::AppendTile(mesh, m_site, *trimesh);
 
     auto transform = vsg::MatrixTransform::create();
     if (!m_coloring)

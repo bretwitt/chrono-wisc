@@ -14,7 +14,6 @@ namespace planet {
 namespace {
 
 // Deepest level the LOD builds.
-constexpr int kMaxLeafLevel = 17;
 
 // Children merge only once the camera has retreated this far past the split distance.
 constexpr double kMergeHysteresis = 1.5;
@@ -84,9 +83,10 @@ void QuadtreeTile<CoordSystem>::updateLODRec(Node* node, const util::Vec3& camer
     const int level = node->getLevel();
     const double splitDist = lodSplitDistance(level, lod);
     const double mergeDist = splitDist * kMergeHysteresis;
-    const bool canSplit = level < kMaxLeafLevel && !hidden;
+    const bool canSplit = level < lod.maxLevel && !hidden;
+    const bool forced = level < lod.minLevel;  // with canSplit, not below the horizon
 
-    if (canSplit && distance < splitDist) {
+    if (canSplit && (distance < splitDist || forced)) {
         if (!node->isDivided()) {
             BENCH_SCOPE("split");
             node->subdivide();   // onInit builds each child mesh before the split becomes visible
@@ -95,7 +95,7 @@ void QuadtreeTile<CoordSystem>::updateLODRec(Node* node, const util::Vec3& camer
         for (Node* c : node->children()) {
             updateLODRec(c, cameraM, lod);
         }
-    } else if (distance > mergeDist || hidden) {
+    } else if ((distance > mergeDist && !forced) || hidden) {
         if (node->isDivided()) {
             BENCH_SCOPE("merge");
             node->getType()->morphFromParent = false;   // back at full detail, no split ease
@@ -107,7 +107,9 @@ void QuadtreeTile<CoordSystem>::updateLODRec(Node* node, const util::Vec3& camer
 
 template <typename CoordSystem>
 void QuadtreeTile<CoordSystem>::buildMesh(Node* node) {
-    storeMesh(node, buildTimed(node->getBoundary(), node->getLevel()));
+    Mesh m = buildTimed(node->getBoundary(), node->getLevel());
+    m.fromSplit = node->getLevel() > 0;  // only a split creates nodes below the root
+    storeMesh(node, std::move(m));
 }
 
 template <typename CoordSystem>

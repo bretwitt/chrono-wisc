@@ -729,7 +729,7 @@ int BuildTriangleBVH(ChVulkanRTRenderCache::CachedPrimitive& cached, uint32_t fi
     ResetAABB(centroid_min, centroid_max);
 
     for (uint32_t i = first; i < first + count; ++i) {
-        const auto& tri = primitive.triangles[cached.triangle_indices[i]];
+        const auto& tri = primitive.Triangles()[cached.triangle_indices[i]];
         ExpandAABB(node.bmin, node.bmax, TriangleMin(tri), TriangleMax(tri));
         ExpandAABB(centroid_min, centroid_max, TriangleCentroid(tri));
     }
@@ -744,7 +744,7 @@ int BuildTriangleBVH(ChVulkanRTRenderCache::CachedPrimitive& cached, uint32_t fi
     const uint32_t mid = first + count / 2;
     auto begin = cached.triangle_indices.begin();
     std::nth_element(begin + first, begin + mid, begin + first + count, [&](uint32_t a, uint32_t b) {
-        return TriangleCentroid(primitive.triangles[a])[axis] < TriangleCentroid(primitive.triangles[b])[axis];
+        return TriangleCentroid(primitive.Triangles()[a])[axis] < TriangleCentroid(primitive.Triangles()[b])[axis];
     });
 
     const int left = BuildTriangleBVH(cached, first, mid - first);
@@ -822,8 +822,8 @@ void BuildRenderCache(ChVulkanRTRenderCache& cache, const std::shared_ptr<ChVulk
 
     for (const auto& primitive : primitives) {
         EnsureMaterialTextures(cache, primitive.material);
-        for (const auto& tri : primitive.triangles)
-            EnsureMaterialTextures(cache, tri.material);
+        for (const auto& material : primitive.materials)
+            EnsureMaterialTextures(cache, material);
 
         ChVector3d local_min;
         ChVector3d local_max;
@@ -835,10 +835,10 @@ void BuildRenderCache(ChVulkanRTRenderCache& cache, const std::shared_ptr<ChVulk
         ResetAABB(cached.world_min, cached.world_max);
         ExpandTransformedAABB(primitive, local_min, local_max, cached.world_min, cached.world_max);
 
-        if (primitive.type == ChVulkanRTPrimitiveType::TRIANGLE_MESH && !primitive.triangles.empty()) {
-            cached.triangle_indices.resize(primitive.triangles.size());
+        if (primitive.type == ChVulkanRTPrimitiveType::TRIANGLE_MESH && !primitive.Triangles().empty()) {
+            cached.triangle_indices.resize(primitive.Triangles().size());
             std::iota(cached.triangle_indices.begin(), cached.triangle_indices.end(), 0u);
-            cached.triangle_nodes.reserve(std::max<size_t>(1, primitive.triangles.size() * 2));
+            cached.triangle_nodes.reserve(std::max<size_t>(1, primitive.Triangles().size() * 2));
             BuildTriangleBVH(cached, 0, static_cast<uint32_t>(cached.triangle_indices.size()));
         }
 
@@ -1087,7 +1087,7 @@ bool IntersectTriangle(const ChVulkanRTPrimitive& primitive,
         best.uv = ChVulkanRTTexCoord{};
         best.has_uv = false;
     }
-    best.material = tri.material;
+    best.material = primitive.TriangleMaterial(tri);
     return true;
 }
 bool IntersectMesh(const ChVulkanRTRenderCache::CachedPrimitive& cached,
@@ -1095,7 +1095,7 @@ bool IntersectMesh(const ChVulkanRTRenderCache::CachedPrimitive& cached,
                    const ChVector3d& dir,
                    RayHit& best) {
     const ChVulkanRTPrimitive& primitive = *cached.primitive;
-    if (primitive.triangles.empty() || !primitive.has_aabb)
+    if (primitive.Triangles().empty() || !primitive.has_aabb)
         return false;
 
     const ChVector3d ro = primitive.frame.TransformPointParentToLocal(origin);
@@ -1106,7 +1106,7 @@ bool IntersectMesh(const ChVulkanRTRenderCache::CachedPrimitive& cached,
 
     bool any = false;
     if (cached.triangle_nodes.empty()) {
-        for (const auto& tri : primitive.triangles)
+        for (const auto& tri : primitive.Triangles())
             any = IntersectTriangle(primitive, tri, rd, ro, best) || any;
         return any;
     }
@@ -1125,7 +1125,7 @@ bool IntersectMesh(const ChVulkanRTRenderCache::CachedPrimitive& cached,
         if (node.IsLeaf()) {
             for (uint32_t i = node.first; i < node.first + node.count; ++i) {
                 const auto tri_id = cached.triangle_indices[i];
-                any = IntersectTriangle(primitive, primitive.triangles[tri_id], rd, ro, best) || any;
+                any = IntersectTriangle(primitive, primitive.Triangles()[tri_id], rd, ro, best) || any;
             }
         } else {
             if (stack_size + 2 <= stack.size()) {
@@ -1317,6 +1317,181 @@ ChVector3f ShadowAttenuation(const ChVulkanRTRenderCache* cache,
     return pass * ShadowAttenuation(cache, scene, next_origin, dir, remaining, depth + 1);
 }
 
+bool IsLocalLight(LightType type) {
+    return type == LightType::DIRECTIONAL_LIGHT || type == LightType::POINT_LIGHT || type == LightType::SPOT_LIGHT ||
+           type == LightType::RECTANGLE_LIGHT || type == LightType::DISK_LIGHT;
+}
+
+// Direction to a directional, point, spot, rectangle or disk light from hit_pos, the shadow ray
+// length, and the light's attenuation there (0 when it does not reach the point).
+float SampleLocalLight(const ChVulkanRTLight& light, const ChVector3d& hit_pos, ChVector3d& light_dir, double& max_shadow_t) {
+    light_dir = ChVector3d(0.0, 0.0, 0.0);
+    max_shadow_t = std::numeric_limits<double>::max();
+    float attenuation = 1.f;
+
+    if (light.type == LightType::DIRECTIONAL_LIGHT) {
+        light_dir = NormalizeSafe(ChVector3d(light.dir));
+        return attenuation;
+    }
+
+    ChVector3d to_light = ChVector3d(light.pos) - hit_pos;
+    const double dist = to_light.Length();
+    max_shadow_t = std::max(CH_VKRT_EPS, dist - CH_VKRT_SHADOW_EPS);
+    light_dir = NormalizeSafe(to_light);
+    if (!light.const_color) {
+        attenuation = light.atten_scale / static_cast<float>(std::max(CH_VKRT_EPS, dist * dist));
+    }
+    if (light.type == LightType::SPOT_LIGHT) {
+        const ChVector3d spot_dir = NormalizeSafe(ChVector3d(light.dir));
+        const double cos_angle =
+            std::max(-1.0, std::min(1.0, spot_dir.Dot(-light_dir)));
+        if (cos_angle < std::cos(0.5 * static_cast<double>(light.angle))) {
+            attenuation = 0.f;
+        } else if (!light.const_color && light.angle_atten_rate >= 0.f) {
+            // Keep the OptiX-compatible soft falloff in angle space.
+            const double angle = std::acos(cos_angle);
+            float angle_attenuation = ClampFloat(
+                light.angle_atten_rate * (light.angle - 2.f * static_cast<float>(angle)), 0.f, 1.f);
+            attenuation *= angle_attenuation * angle_attenuation;
+        }
+    } else if (light.type == LightType::RECTANGLE_LIGHT || light.type == LightType::DISK_LIGHT) {
+        // Area lights are currently approximated by their center point in the Vulkan
+        // bring-up renderer. The one-sided term keeps the OptiX API semantics: the
+        // light emits along its stored surface normal/direction.
+        const ChVector3d area_dir = NormalizeSafe(ChVector3d(light.dir));
+        attenuation *= ClampFloat(static_cast<float>(area_dir.Dot(-light_dir)), 0.f, 1.f);
+    }
+    return attenuation;
+}
+
+// Host mirror of hapke_reflectance() in chrono_sensor_vkrt.rgen; keep the two identical.
+float HapkeReflectance(const ChVulkanRTMaterial& mat, const ChVector3d& normal, const ChVector3d& view_dir, const ChVector3d& light_dir) {
+    constexpr float pi = static_cast<float>(CH_PI);
+    const float w = mat.hapke_w;
+    const float b = mat.hapke_b;
+    const float c = mat.hapke_c;
+    const float B_s0 = mat.hapke_B_s0;
+    const float h_s = std::max(mat.hapke_h_s, 1e-6f);
+    const float phi = mat.hapke_phi;
+    const float theta_p = std::max(mat.hapke_theta_p, 1e-4f);
+    const float B_c0 = 0.f;
+    const float h_c = 1.f;
+
+    const float cos_i = static_cast<float>(light_dir.Dot(normal));
+    if (cos_i <= 0.f)
+        return 0.f;
+    const float cos_e = std::max(static_cast<float>(normal.Dot(view_dir)), 1e-3f);
+    const float cos_g = ClampFloat(static_cast<float>(light_dir.Dot(view_dir)), -1.f, 1.f);
+    const float sin_i = std::sqrt(std::max(0.f, 1.f - cos_i * cos_i));
+    const float sin_e = std::sqrt(std::max(0.f, 1.f - cos_e * cos_e));
+    const float sin_g = std::sqrt(std::max(0.f, 1.f - cos_g * cos_g));
+    const float cot_i = cos_i / std::max(sin_i, 1e-6f);
+    const float cot_e = cos_e / std::max(sin_e, 1e-6f);
+
+    const ChVector3d light_tangent = light_dir - double(cos_i) * normal;
+    const ChVector3d view_tangent = view_dir - double(cos_e) * normal;
+    const double tangent_lengths = light_tangent.Length() * view_tangent.Length();
+    const float cos_psi = tangent_lengths > 1e-12 ? ClampFloat(static_cast<float>(light_tangent.Dot(view_tangent) / tangent_lengths), -1.f, 1.f) : 1.f;
+    const float psi = std::acos(cos_psi);
+    const float f_psi = std::exp(-2.f * std::tan(0.5f * psi));
+    const float sin_psi_half = std::sin(0.5f * psi);
+    const float sin_psi_half_sq = sin_psi_half * sin_psi_half;
+    const float psi_per_pi = psi / pi;
+
+    const float tan_theta_p = std::tan(theta_p);
+    const float cot_theta_p = 1.f / tan_theta_p;
+    const float E_1_i = std::exp((-2.f / pi) * cot_theta_p * cot_i);
+    const float E_2_i = std::exp((-1.f / pi) * cot_theta_p * cot_theta_p * cot_i * cot_i);
+    const float E_1_e = std::exp((-2.f / pi) * cot_theta_p * cot_e);
+    const float E_2_e = std::exp((-1.f / pi) * cot_theta_p * cot_theta_p * cot_e * cot_e);
+    const float chi_theta_p = 1.f / std::sqrt(1.f + pi * tan_theta_p * tan_theta_p);
+    const float eta_i = chi_theta_p * (cos_i + sin_i * tan_theta_p * E_2_i / (2.f - E_1_i));
+    const float eta_e = chi_theta_p * (cos_e + sin_e * tan_theta_p * E_2_e / (2.f - E_1_e));
+
+    const float mu0 = cos_i;
+    const float mu = cos_e;
+    float mu0_e = chi_theta_p;
+    float mu_e = chi_theta_p;
+    float S;
+    if (cos_i >= cos_e) {
+        mu0_e *= cos_i + sin_i * tan_theta_p * (cos_psi * E_2_e + sin_psi_half_sq * E_2_i) / (2.f - E_1_e - psi_per_pi * E_1_i);
+        mu_e *= cos_e + sin_e * tan_theta_p * (E_2_e - sin_psi_half_sq * E_2_i) / (2.f - E_1_e - psi_per_pi * E_1_i);
+        S = mu_e / eta_e * mu0 / eta_i * chi_theta_p / (1.f - f_psi + f_psi * chi_theta_p * (mu0 / eta_i));
+    } else {
+        mu0_e *= cos_i + sin_i * tan_theta_p * (E_2_i - sin_psi_half_sq * E_2_e) / (2.f - E_1_i - psi_per_pi * E_1_e);
+        mu_e *= cos_e + sin_e * tan_theta_p * (cos_psi * E_2_i + sin_psi_half_sq * E_2_e) / (2.f - E_1_i - psi_per_pi * E_1_e);
+        S = mu_e / eta_e * mu0 / eta_i * chi_theta_p / (1.f - f_psi + f_psi * chi_theta_p * (mu / eta_e));
+    }
+
+    const float KPhi = 1.209f * std::pow(std::max(phi, 0.f), 2.f / 3.f);
+    const float K = KPhi > 1e-6f ? -std::log(1.f - KPhi) / KPhi : 1.f;
+    const float tan_ghalf = sin_g / std::max(1.f + cos_g, 1e-6f);
+    const float tan_ghalf_per_hC = tan_ghalf / h_c;
+    const float B_C = tan_ghalf_per_hC > 1e-6f
+                          ? (1.f + (1.f - std::exp(-tan_ghalf_per_hC)) / tan_ghalf_per_hC) / (2.f * std::pow(1.f + tan_ghalf_per_hC, 2.f))
+                          : 1.f;
+    const float B_S = 1.f / (1.f + tan_ghalf / h_s);
+    const float b_sq = b * b;
+    const float p_g = (1.f + c) / 2.f * (1.f - b_sq) / std::pow(1.f - 2.f * b * cos_g + b_sq, 1.5f) +
+                      (1.f - c) / 2.f * (1.f - b_sq) / std::pow(1.f + 2.f * b * cos_g + b_sq, 1.5f);
+
+    const float r0_term = std::sqrt(std::max(0.f, 1.f - w));
+    const float r0 = (1.f - r0_term) / (1.f + r0_term);
+    const float x_i = mu0_e / K;
+    const float x_e = mu_e / K;
+    const float H_i = 1.f / (1.f - w * x_i * (r0 + (1.f - 2.f * r0 * x_i) / 2.f * std::log((1.f + x_i) / x_i)));
+    const float H_e = 1.f / (1.f - w * x_e * (r0 + (1.f - 2.f * r0 * x_e) / 2.f * std::log((1.f + x_e) / x_e)));
+    const float M = H_i * H_e - 1.f;
+
+    const float LS = mu0_e / (mu0_e + mu_e);
+    return LS * K * w / (4.f * pi) * (p_g * (1.f + B_s0 * B_S) + M) * (1.f + B_c0 * B_C) * S / cos_i;
+}
+
+// Host mirror of shade_hapke() in chrono_sensor_vkrt.rgen.
+ChVector3f ShadeHapke(const ChVulkanRTRenderCache* cache,
+                      const std::shared_ptr<ChVulkanRTScene>& scene,
+                      const RayHit& hit,
+                      const ChVector3d& hit_pos,
+                      const ChVector3d& normal,
+                      const ChVector3d& view_dir,
+                      const ChVector3f& albedo) {
+    ChVector3f color(0.f, 0.f, 0.f);
+    if (!scene)
+        return color;
+    auto add_light = [&](const ChVector3d& light_dir, double max_shadow_t, const ChVector3f& irradiance) {
+        const float ndl = static_cast<float>(normal.Dot(light_dir));
+        if (ndl <= 0.f)
+            return;
+        const ChVector3d shadow_origin = hit_pos + light_dir * CH_VKRT_SHADOW_EPS;
+        const double shadow_max_t = std::isfinite(max_shadow_t) ? std::max(0.0, max_shadow_t - CH_VKRT_SHADOW_EPS) : max_shadow_t;
+        if (OptiXBinaryLightVisibility(cache, scene, shadow_origin, light_dir, shadow_max_t))
+            return;
+        color += HapkeReflectance(hit.material, normal, view_dir, light_dir) * ndl * Mul(irradiance, albedo);
+    };
+    for (const auto& light : scene->GetLights()) {
+        if (IsLocalLight(light.type)) {
+            ChVector3d light_dir;
+            double max_shadow_t;
+            const float attenuation = SampleLocalLight(light, hit_pos, light_dir, max_shadow_t);
+            if (attenuation > 0.f)
+                add_light(light_dir, max_shadow_t, attenuation * light.color);
+        } else if (light.type == LightType::ENVIRONMENT_LIGHT) {
+            // The same deterministic quadrature the LEGACY host path uses for environment lights.
+            const std::array<ChVector3d, 4> env_dirs = {
+                NormalizeSafe(normal + ChVector3d(0.36, 0.10, 0.93), normal),
+                NormalizeSafe(normal + ChVector3d(-0.48, 0.42, 0.77), normal),
+                NormalizeSafe(normal + ChVector3d(0.18, -0.72, 0.67), normal),
+                NormalizeSafe(normal + ChVector3d(-0.08, -0.18, 0.98), normal)};
+            const ChVector3f before = color;
+            color = ChVector3f(0.f, 0.f, 0.f);
+            for (const auto& env_dir : env_dirs)
+                add_light(env_dir, std::numeric_limits<double>::max(), Mul(light.color, EnvironmentLightRadiance(cache, scene, env_dir)));
+            color = before + color / static_cast<float>(env_dirs.size());
+        }
+    }
+    return color;
+}
+
 ChVector3f Shade(const ChVulkanRTRenderCache* cache,
                  const std::shared_ptr<ChVulkanRTScene>& scene,
                  const RayHit& hit,
@@ -1336,6 +1511,10 @@ ChVector3f Shade(const ChVulkanRTRenderCache* cache,
         return TraceCameraColor(cache, scene, hit_pos + dir * CH_VKRT_SHADOW_EPS, dir,
                                 depth + 1, max_trace_depth, use_gi);
     }
+
+    // As in OptiX, a Hapke surface is opaque and adds no ambient, emissive, mirror or GI term.
+    if (hit.material.bsdf_type == BSDFType::HAPKE)
+        return ShadeHapke(cache, scene, hit, hit_pos, normal, view_dir, mat.diffuse);
 
     const float ndv = static_cast<float>(std::max(0.0, normal.Dot(view_dir)));
     const ChVector3f ambient_light = scene ? scene->GetAmbientLight() : ChVector3f(0.08f, 0.08f, 0.08f);
@@ -1363,37 +1542,8 @@ ChVector3f Shade(const ChVulkanRTRenderCache* cache,
             double max_shadow_t = std::numeric_limits<double>::max();
             float attenuation = 1.f;
 
-            if (light.type == LightType::DIRECTIONAL_LIGHT) {
-                light_dir = NormalizeSafe(ChVector3d(light.dir));
-            } else if (light.type == LightType::POINT_LIGHT || light.type == LightType::SPOT_LIGHT ||
-                       light.type == LightType::RECTANGLE_LIGHT || light.type == LightType::DISK_LIGHT) {
-                ChVector3d to_light = ChVector3d(light.pos) - hit_pos;
-                const double dist = to_light.Length();
-                max_shadow_t = std::max(CH_VKRT_EPS, dist - CH_VKRT_SHADOW_EPS);
-                light_dir = NormalizeSafe(to_light);
-                if (!light.const_color) {
-                    attenuation = light.atten_scale / static_cast<float>(std::max(CH_VKRT_EPS, dist * dist));
-                }
-                if (light.type == LightType::SPOT_LIGHT) {
-                    const ChVector3d spot_dir = NormalizeSafe(ChVector3d(light.dir));
-                    const double cos_angle =
-                        std::max(-1.0, std::min(1.0, spot_dir.Dot(-light_dir)));
-                    if (cos_angle < std::cos(0.5 * static_cast<double>(light.angle))) {
-                        attenuation = 0.f;
-                    } else if (!light.const_color && light.angle_atten_rate >= 0.f) {
-                        // Keep the OptiX-compatible soft falloff in angle space.
-                        const double angle = std::acos(cos_angle);
-                        float angle_attenuation = ClampFloat(
-                            light.angle_atten_rate * (light.angle - 2.f * static_cast<float>(angle)), 0.f, 1.f);
-                        attenuation *= angle_attenuation * angle_attenuation;
-                    }
-                } else if (light.type == LightType::RECTANGLE_LIGHT || light.type == LightType::DISK_LIGHT) {
-                    // Area lights are currently approximated by their center point in the Vulkan
-                    // bring-up renderer. The one-sided term keeps the OptiX API semantics: the
-                    // light emits along its stored surface normal/direction.
-                    const ChVector3d area_dir = NormalizeSafe(ChVector3d(light.dir));
-                    attenuation *= ClampFloat(static_cast<float>(area_dir.Dot(-light_dir)), 0.f, 1.f);
-                }
+            if (IsLocalLight(light.type)) {
+                attenuation = SampleLocalLight(light, hit_pos, light_dir, max_shadow_t);
             } else if (light.type == LightType::ENVIRONMENT_LIGHT) {
                 // Host fallback uses deterministic quadrature, but evaluates every direction
                 // with the same OptiX LEGACY BRDF and double-NdL convention as the GPU path.
@@ -1811,17 +1961,33 @@ struct ChVulkanRTGpuTriangle {
     uint32_t material;
 };
 
+// Hash of a triangle corner's source position, normal and UV indices.
+struct CornerKeyHash {
+    size_t operator()(const std::array<int32_t, 3>& key) const {
+        uint64_t h = static_cast<uint32_t>(key[0]);
+        h = h * 0x9e3779b97f4a7c15ull ^ static_cast<uint32_t>(key[1]);
+        h = h * 0x9e3779b97f4a7c15ull ^ static_cast<uint32_t>(key[2]);
+        return static_cast<size_t>(h ^ (h >> 29));
+    }
+};
+
 struct ChVulkanRTGpuMaterial {
     float diffuse[4];   // linear diffuse rgb, scalar opacity
     float specular[4];  // specular rgb, shininess
     float emissive[4];  // emissive rgb, emissive power
     float params[4];    // opacity, roughness, metallic, use_specular_workflow
-    uint32_t ids[4];    // class_id, instance_id, reserved, reserved
+    uint32_t ids[4];    // class_id, instance_id, bsdf (CH_VKRT_BSDF_*), reserved
     float sensor[4];    // lidar_intensity, radar_backscatter, object_id, reserved
     uint32_t texture0[4];  // diffuse, specular, emissive, normal
     uint32_t texture1[4];  // roughness, metallic, opacity, weight
     float tex_scale[4];    // u scale, v scale, reserved, reserved
+    float hapke0[4];       // Hapke w, b, c, B_s0
+    float hapke1[4];       // Hapke h_s, phi, theta_p, reserved
 };
+
+// Camera BSDF selector in ChVulkanRTGpuMaterial::ids[2]; must match the shaders.
+constexpr uint32_t CH_VKRT_BSDF_LEGACY = 0u;
+constexpr uint32_t CH_VKRT_BSDF_HAPKE = 1u;
 
 struct ChVulkanRTGpuTexture {
     uint32_t info[4];  // texel offset, width, height, flags (bit 0 = RGB9E5 HDR)
@@ -1941,7 +2107,7 @@ ChVulkanRTGpuMaterial MakeGpuMaterial(const ChVulkanRTMaterial& mat, float objec
     out.params[3] = mat.use_specular_workflow ? 1.f : 0.f;
     out.ids[0] = static_cast<uint32_t>(mat.class_id);
     out.ids[1] = static_cast<uint32_t>(mat.instance_id);
-    out.ids[2] = 0u;
+    out.ids[2] = mat.bsdf_type == BSDFType::HAPKE ? CH_VKRT_BSDF_HAPKE : CH_VKRT_BSDF_LEGACY;
     out.ids[3] = 0u;
     out.sensor[0] = mat.lidar_intensity;
     out.sensor[1] = mat.radar_backscatter;
@@ -1955,6 +2121,14 @@ ChVulkanRTGpuMaterial MakeGpuMaterial(const ChVulkanRTMaterial& mat, float objec
     out.tex_scale[1] = mat.tex_scale_v;
     out.tex_scale[2] = 0.f;
     out.tex_scale[3] = 0.f;
+    out.hapke0[0] = mat.hapke_w;
+    out.hapke0[1] = mat.hapke_b;
+    out.hapke0[2] = mat.hapke_c;
+    out.hapke0[3] = mat.hapke_B_s0;
+    out.hapke1[0] = mat.hapke_h_s;
+    out.hapke1[1] = mat.hapke_phi;
+    out.hapke1[2] = mat.hapke_theta_p;
+    out.hapke1[3] = 0.f;
     return out;
 }
 
@@ -2354,21 +2528,25 @@ struct ChVulkanRTGpuRenderer {
         // These buffers are read by ray-tracing shaders for every hit.  Keeping
         // them HOST_VISIBLE makes the GPU fetch material/triangle/texture data
         // through a slow host aperture on many drivers.  Upload once through a
-        // staging buffer and keep the render data device-local.
-        EnsureBuffer(buffer,
-                     size,
-                     usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // staging buffer and keep the render data device-local.  Scenes that
+        // change every frame (moving bodies, streamed terrain) upload every
+        // frame, so a buffer that must grow gets headroom, and the staging
+        // buffer is kept mapped and reused rather than allocated per upload.
+        if (!buffer || buffer->GetSize() < size)
+            EnsureBuffer(buffer, size + size / 4, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         if (copy_size == 0)
             return;
 
-        auto staging = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                          copy_size,
-                                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!m_upload_staging || m_upload_staging->GetSize() < copy_size) {
+            m_upload_staging.reset();
+            m_upload_staging = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                  copy_size + copy_size / 2,
+                                                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
+        ChVulkanRTBuffer* staging = m_upload_staging.get();
         std::memcpy(staging->Map(), values.data(), static_cast<size_t>(copy_size));
-        staging->Unmap();
 
         BeginCommands();
         VkBufferCopy copy_region = {};
@@ -2554,6 +2732,33 @@ struct ChVulkanRTGpuRenderer {
         return out;
     }
 
+    static ChVulkanRTGpuVertex MakeGpuVertex(const ChVector3d& p,
+                                             const ChVector3d& n,
+                                             const ChVulkanRTTexCoord& uv,
+                                             const ChVector3d& tangent,
+                                             bool has_uv) {
+        const auto world_tangent = NormalizeSafe(tangent, ChVector3d(1.0, 0.0, 0.0));
+        ChVulkanRTGpuVertex out{};
+        out.pos[0] = static_cast<float>(p.x());
+        out.pos[1] = static_cast<float>(p.y());
+        out.pos[2] = static_cast<float>(p.z());
+        out.pos[3] = 1.f;
+        const auto nn = NormalizeSafe(n);
+        out.normal[0] = static_cast<float>(nn.x());
+        out.normal[1] = static_cast<float>(nn.y());
+        out.normal[2] = static_cast<float>(nn.z());
+        out.normal[3] = 0.f;
+        out.uv[0] = uv.u;
+        out.uv[1] = uv.v;
+        out.uv[2] = has_uv ? 1.f : 0.f;
+        out.uv[3] = 0.f;
+        out.tangent[0] = static_cast<float>(world_tangent.x());
+        out.tangent[1] = static_cast<float>(world_tangent.y());
+        out.tangent[2] = static_cast<float>(world_tangent.z());
+        out.tangent[3] = 0.f;
+        return out;
+    }
+
     void AddGpuTriangle(const ChVector3d& v0,
                         const ChVector3d& v1,
                         const ChVector3d& v2,
@@ -2568,27 +2773,8 @@ struct ChVulkanRTGpuRenderer {
                         const ChVector3d& tangent = ChVector3d(1.0, 0.0, 0.0),
                         bool has_uv = false) {
         const uint32_t base = static_cast<uint32_t>(m_vertices.size());
-        const auto world_tangent = NormalizeSafe(tangent, ChVector3d(1.0, 0.0, 0.0));
         auto make_vertex = [&](const ChVector3d& p, const ChVector3d& n, const ChVulkanRTTexCoord& uv) {
-            ChVulkanRTGpuVertex out{};
-            out.pos[0] = static_cast<float>(p.x());
-            out.pos[1] = static_cast<float>(p.y());
-            out.pos[2] = static_cast<float>(p.z());
-            out.pos[3] = 1.f;
-            const auto nn = NormalizeSafe(n);
-            out.normal[0] = static_cast<float>(nn.x());
-            out.normal[1] = static_cast<float>(nn.y());
-            out.normal[2] = static_cast<float>(nn.z());
-            out.normal[3] = 0.f;
-            out.uv[0] = uv.u;
-            out.uv[1] = uv.v;
-            out.uv[2] = has_uv ? 1.f : 0.f;
-            out.uv[3] = 0.f;
-            out.tangent[0] = static_cast<float>(world_tangent.x());
-            out.tangent[1] = static_cast<float>(world_tangent.y());
-            out.tangent[2] = static_cast<float>(world_tangent.z());
-            out.tangent[3] = 0.f;
-            return out;
+            return MakeGpuVertex(p, n, uv, tangent, has_uv);
         };
         m_vertices.push_back(make_vertex(v0, n0, uv0));
         m_vertices.push_back(make_vertex(v1, n1, uv1));
@@ -2782,32 +2968,136 @@ struct ChVulkanRTGpuRenderer {
         }
     }
 
-    void AddMesh(const ChVulkanRTPrimitive& primitive) {
-        for (const auto& tri : primitive.triangles) {
-            const auto p0 = primitive.frame.TransformPointLocalToParent(tri.v0);
-            const auto p1 = primitive.frame.TransformPointLocalToParent(tri.v1);
-            const auto p2 = primitive.frame.TransformPointLocalToParent(tri.v2);
-            const auto n0 = primitive.frame.TransformDirectionLocalToParent(tri.has_vertex_normals ? tri.n0 : tri.normal);
-            const auto n1 = primitive.frame.TransformDirectionLocalToParent(tri.has_vertex_normals ? tri.n1 : tri.normal);
-            const auto n2 = primitive.frame.TransformDirectionLocalToParent(tri.has_vertex_normals ? tri.n2 : tri.normal);
-            const auto tangent = primitive.frame.TransformDirectionLocalToParent(tri.tangent);
-            AddGpuTriangle(p0,
-                           p1,
-                           p2,
-                           n0,
-                           n1,
-                           n2,
-                           tri.material,
-                           primitive.object_id,
-                           tri.uv0,
-                           tri.uv1,
-                           tri.uv2,
-                           tangent,
-                           tri.has_uvs);
+    // A mesh packed for the GPU: its distinct vertices in primitive-local coordinates, and its triangles as
+    // indices into them plus the index of their material in the primitive's table. Independent of where the
+    // mesh is, so it is built once per staged triangle array.
+    struct LocalVertex {
+        ChVector3d position;
+        ChVector3d normal;
+        ChVector3d tangent;
+        ChVulkanRTTexCoord uv;
+        bool has_uv;
+    };
+    struct MeshChunk {
+        std::shared_ptr<const std::vector<ChVulkanRTTriangle>> triangles;  ///< held, so its address is not reused
+        std::vector<LocalVertex> local_vertices;
+        std::vector<std::array<uint32_t, 4>> faces;  ///< i0, i1, i2, material index in the primitive's table
+        ChFrame<double> frame;                       ///< frame the world vertices were transformed with
+        bool has_world = false;
+        std::vector<ChVulkanRTGpuVertex> vertices;   ///< GPU vertices in world coordinates
+        uint64_t last_build = 0;
+    };
+
+    // Pack a mesh. Corners with the same source position, normal and UV have the same GPU vertex, so they share
+    // one. The per-face tangent differs between them but is only read for normal mapping, so materials with a
+    // normal map keep a vertex per corner. Corners whose normal index equals their position index and whose UV
+    // index is that too (or absent), as on most meshes, are looked up in a dense table.
+    static void PackMesh(const ChVulkanRTPrimitive& primitive, MeshChunk& chunk) {
+        constexpr uint32_t unset = std::numeric_limits<uint32_t>::max();
+        std::vector<uint32_t> dense_vertex;
+        std::unordered_map<std::array<int32_t, 3>, uint32_t, CornerKeyHash> sparse_vertex;
+        auto shared_vertex = [&](const ChVulkanRTTriangle& tri, int corner) -> uint32_t* {
+            const int32_t p = tri.position_index[corner];
+            const int32_t n = tri.normal_index[corner];
+            const int32_t t = tri.uv_index[corner];
+            if (p < 0 || n < 0)
+                return nullptr;
+            if (n == p && (t == p || t < 0)) {
+                const size_t slot = 2 * static_cast<size_t>(p) + (t < 0 ? 0 : 1);
+                if (slot >= dense_vertex.size())
+                    dense_vertex.resize(std::max(slot + 1, 2 * dense_vertex.size()), unset);
+                return &dense_vertex[slot];
+            }
+            return &sparse_vertex.emplace(std::array<int32_t, 3>{p, n, t}, unset).first->second;
+        };
+
+        const auto& triangles = primitive.Triangles();
+        chunk.faces.reserve(triangles.size());
+        for (const auto& tri : triangles) {
+            const uint32_t index = tri.material_index < primitive.materials.size() ? tri.material_index : 0;
+            const bool share = primitive.materials[index].normal_texture.empty();
+            const ChVector3d* positions[3] = {&tri.v0, &tri.v1, &tri.v2};
+            const ChVector3d* normals[3] = {&tri.n0, &tri.n1, &tri.n2};
+            const ChVulkanRTTexCoord* uvs[3] = {&tri.uv0, &tri.uv1, &tri.uv2};
+            std::array<uint32_t, 4> face{0, 0, 0, index};
+            for (int k = 0; k < 3; ++k) {
+                uint32_t* slot = share ? shared_vertex(tri, k) : nullptr;
+                if (slot && *slot != unset) {
+                    face[k] = *slot;
+                    continue;
+                }
+                face[k] = static_cast<uint32_t>(chunk.local_vertices.size());
+                chunk.local_vertices.push_back({*positions[k], tri.has_vertex_normals ? *normals[k] : tri.normal, tri.tangent, *uvs[k], tri.has_uvs});
+                if (slot)
+                    *slot = face[k];
+            }
+            chunk.faces.push_back(face);
         }
     }
 
+    // Transform a packed mesh's vertices to world coordinates for the GPU.
+    static void TransformMesh(const ChFrame<double>& frame, MeshChunk& chunk) {
+        chunk.vertices.resize(chunk.local_vertices.size());
+        for (size_t i = 0; i < chunk.local_vertices.size(); ++i) {
+            const LocalVertex& v = chunk.local_vertices[i];
+            chunk.vertices[i] = MakeGpuVertex(frame.TransformPointLocalToParent(v.position), frame.TransformDirectionLocalToParent(v.normal), v.uv,
+                                              frame.TransformDirectionLocalToParent(v.tangent), v.has_uv);
+        }
+        chunk.frame = frame;
+        chunk.has_world = true;
+    }
+
+    static bool SameFrameExactly(const ChFrame<double>& a, const ChFrame<double>& b) {
+        return a.GetPos() == b.GetPos() && a.GetRot() == b.GetRot();
+    }
+
+    void AddMesh(const ChVulkanRTPrimitive& primitive) {
+        // A mesh is packed once and transformed again only when it moves.
+        MeshChunk& chunk = m_mesh_chunks[primitive.triangles.get()];
+        if (!chunk.triangles) {
+            chunk.triangles = primitive.triangles;
+            PackMesh(primitive, chunk);
+        }
+        if (!chunk.has_world || !SameFrameExactly(chunk.frame, primitive.frame))
+            TransformMesh(primitive.frame, chunk);
+        chunk.last_build = m_build_count;
+
+        // One GPU material per material the triangles use, rather than one per triangle, in order of first use.
+        constexpr uint32_t unset = std::numeric_limits<uint32_t>::max();
+        std::vector<uint32_t> gpu_material(primitive.materials.size(), unset);
+        auto material_id = [&](uint32_t index) {
+            if (gpu_material[index] == unset) {
+                gpu_material[index] = static_cast<uint32_t>(m_materials.size());
+                m_materials.push_back(MakeGpuMaterialForScene(primitive.materials[index], primitive.object_id));
+            }
+            return gpu_material[index];
+        };
+
+        const uint32_t base = static_cast<uint32_t>(m_vertices.size());
+        m_vertices.insert(m_vertices.end(), chunk.vertices.begin(), chunk.vertices.end());
+        const size_t first_index = m_indices.size();
+        const size_t first_triangle = m_triangles.size();
+        m_indices.resize(first_index + 3 * chunk.faces.size());
+        m_triangles.resize(first_triangle + chunk.faces.size());
+        uint32_t* indices = m_indices.data() + first_index;
+        ChVulkanRTGpuTriangle* triangles = m_triangles.data() + first_triangle;
+        for (const auto& face : chunk.faces) {
+            const uint32_t i0 = base + face[0], i1 = base + face[1], i2 = base + face[2];
+            *indices++ = i0;
+            *indices++ = i1;
+            *indices++ = i2;
+            *triangles++ = ChVulkanRTGpuTriangle{i0, i1, i2, material_id(face[3])};
+        }
+    }
+
+    // Forget packed meshes the last scene build did not use.
+    void EvictMeshChunks() {
+        for (auto it = m_mesh_chunks.begin(); it != m_mesh_chunks.end();)
+            it = it->second.last_build != m_build_count ? m_mesh_chunks.erase(it) : std::next(it);
+    }
+
     void BuildScene(const std::shared_ptr<ChVulkanRTScene>& scene) {
+        ++m_build_count;
         m_vertices.clear();
         m_indices.clear();
         m_triangles.clear();
@@ -2859,6 +3149,8 @@ struct ChVulkanRTGpuRenderer {
                     break;
             }
         }
+
+        EvictMeshChunks();
 
         if (background.mode == BackgroundMode::ENVIRONMENT_MAP)
             BuildEnvironmentCDF(background.env_tex, env_texture_id);
@@ -2937,10 +3229,15 @@ struct ChVulkanRTGpuRenderer {
                                                           &primitive_count,
                                                           &build_sizes);
 
-        m_blas_buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                           build_sizes.accelerationStructureSize,
-                                                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // The storage and scratch buffers are reused while large enough: the old structure is destroyed
+        // above, and the previous frame's work has completed.
+        if (!m_blas_buffer || m_blas_buffer->GetSize() < build_sizes.accelerationStructureSize) {
+            m_blas_buffer.reset();
+            m_blas_buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                               build_sizes.accelerationStructureSize + build_sizes.accelerationStructureSize / 4,
+                                                               VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
         VkAccelerationStructureCreateInfoKHR as_create = {};
         as_create.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
         as_create.buffer = m_blas_buffer->GetBuffer();
@@ -2948,12 +3245,15 @@ struct ChVulkanRTGpuRenderer {
         as_create.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
         CH_VULKAN_CHECK(m_device->vkCreateAccelerationStructureKHR(device, &as_create, nullptr, &m_blas));
 
-        auto scratch = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                          build_sizes.buildScratchSize,
-                                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!m_blas_scratch || m_blas_scratch->GetSize() < build_sizes.buildScratchSize) {
+            m_blas_scratch.reset();
+            m_blas_scratch = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                build_sizes.buildScratchSize + build_sizes.buildScratchSize / 4,
+                                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
         build_info.dstAccelerationStructure = m_blas;
-        build_info.scratchData.deviceAddress = scratch->GetDeviceAddress();
+        build_info.scratchData.deviceAddress = m_blas_scratch->GetDeviceAddress();
 
         VkAccelerationStructureBuildRangeInfoKHR range = {};
         range.primitiveCount = primitive_count;
@@ -3280,6 +3580,10 @@ struct ChVulkanRTGpuRenderer {
     std::unique_ptr<ChVulkanRTBuffer> m_output_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_output_staging_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_blas_buffer;
+    std::unique_ptr<ChVulkanRTBuffer> m_blas_scratch;    ///< reused bottom-level build scratch
+    std::unique_ptr<ChVulkanRTBuffer> m_upload_staging;  ///< reused, mapped staging for scene uploads
+    std::unordered_map<const std::vector<ChVulkanRTTriangle>*, MeshChunk> m_mesh_chunks;  ///< packed meshes
+    uint64_t m_build_count = 0;
     std::unique_ptr<ChVulkanRTBuffer> m_tlas_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_instance_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_sbt_buffer;
@@ -3564,7 +3868,9 @@ void ChFilterVulkanRTRender::Apply() {
         gpu_frame.frame_index = static_cast<uint32_t>(sensor->GetNumLaunches());
         gpu_frame.rng_seed = m_rng_seed;
         gpu_frame.max_depth = CameraMaxDepth(sensor);
-        gpu_frame.max_distance = gpu_frame.max_depth;
+        // Only a depth camera's rays stop at its maximum depth. Other cameras trace as far as OptiX camera rays
+        // do, so distant geometry (a whole planet seen from orbit) is not cut off at the 1000 m depth default.
+        gpu_frame.max_distance = std::dynamic_pointer_cast<ChDepthCamera>(sensor) ? gpu_frame.max_depth : 1e16f;
         gpu_frame.clip_near = 0.001f;
         gpu_frame.tan_half_hfov = static_cast<float>(std::tan(0.5 * static_cast<double>(gpu_frame.hfov)));
         gpu_frame.aux_ray_factor = gpu_frame.tan_half_hfov;

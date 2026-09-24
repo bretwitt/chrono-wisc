@@ -8,11 +8,13 @@ struct GpuMaterial {
     vec4 specular;
     vec4 emissive;
     vec4 params;     // opacity, roughness, metallic, use_specular_workflow
-    uvec4 ids;       // class_id, instance_id, reserved, reserved
+    uvec4 ids;       // class_id, instance_id, bsdf (BSDF_*), reserved
     vec4 sensor;     // lidar_intensity, radar_backscatter, object_id, reserved
     uvec4 texture0;  // diffuse, specular, emissive, normal
     uvec4 texture1;  // roughness, metallic, opacity, weight
     vec4 tex_scale;  // u scale, v scale, reserved, reserved
+    vec4 hapke0;     // Hapke w, b, c, B_s0
+    vec4 hapke1;     // Hapke h_s, phi, theta_p, reserved
 };
 
 struct GpuTexture {
@@ -129,6 +131,10 @@ const int LIGHT_ENVIRONMENT = 5;
 const int LIGHT_AREA = 6;
 
 const uint INVALID_TEXTURE = 0xffffffffu;
+
+// Camera BSDF selector in GpuMaterial.ids.z; must match CH_VKRT_BSDF_* on the host.
+const uint BSDF_LEGACY = 0u;
+const uint BSDF_HAPKE = 1u;
 const uint FLAG_USE_GI = 1u;
 
 uint max_trace_depth() {
@@ -141,6 +147,17 @@ uint max_trace_depth() {
 const uint TEX_FLAG_RGB9E5 = 1u;
 const float PI = 3.14159265358979323846;
 const float TRACE_EPS = 1e-4;
+
+// Origin of a shadow ray toward `dir` from a surface hit at hit_pos with normal n, a distance t along the ray
+// that found it. The hit point carries a float rounding error that grows with its distance from the origin and
+// with t, and a ray started closer than that to the surface can hit the surface it leaves: a planet seen from
+// orbit is millions of meters out. The offset is taken along the normal too, since along a grazing `dir` alone
+// it barely leaves the surface. Scenes within a few hundred meters of the origin keep TRACE_EPS.
+vec3 shadow_origin(vec3 hit_pos, vec3 n, vec3 dir, float t) {
+    vec3 a = abs(hit_pos);
+    float eps = max(TRACE_EPS, 4.0 * 1.1920929e-7 * (max(max(a.x, a.y), a.z) + t));
+    return hit_pos + eps * (dir + (dot(n, dir) >= 0.0 ? n : -n));
+}
 
 float saturate(float v) {
     return clamp(v, 0.0, 1.0);
@@ -522,7 +539,182 @@ bool sample_environment_direction(uint seed, out vec3 direction, out vec3 radian
     return pdf_gate > 0.0;
 }
 
+// Direction to a point, spot, directional, rectangle or disk light from hit_pos, the shadow ray
+// length, and the light's attenuation there (0 when it does not reach the point).
+float sample_local_light(GpuLight light, int type, vec3 hit_pos, out vec3 light_dir, out float max_shadow_t) {
+    light_dir = vec3(0.0);
+    max_shadow_t = 3.402823e38;
+    float attenuation = 1.0;
+
+    if (type == LIGHT_DIRECTIONAL) {
+        light_dir = normalize(light.dir_type.xyz);
+    } else {
+        vec3 to_light = light.pos_range.xyz - hit_pos;
+        float dist = length(to_light);
+        if (dist <= TRACE_EPS)
+            return 0.0;
+        max_shadow_t = max(TRACE_EPS, dist - TRACE_EPS);
+        light_dir = to_light / dist;
+        if (light.color_atten.w >= 0.0)
+            attenuation = light.color_atten.w / max(1e-6, dist * dist);
+
+        if (type == LIGHT_SPOT) {
+            vec3 spot_dir = normalize(light.dir_type.xyz);
+            float cos_angle = clamp(dot(spot_dir, -light_dir), -1.0, 1.0);
+            // The hard cone is a dot/cosine comparison. Avoid making a boundary
+            // decision from GLSL acos(), whose permitted error differs by vendor.
+            if (cos_angle < light.params.w) {
+                attenuation = 0.0;
+            } else if (light.color_atten.w >= 0.0 && light.params.z >= 0.0) {
+                // Keep the existing angular soft-falloff formula for OptiX parity.
+                // The transcendental is therefore paid only when soft falloff is enabled.
+                float angle = acos(cos_angle);
+                float a = saturate(light.params.z * (light.params.x - 2.0 * angle));
+                attenuation *= a * a;
+            }
+        } else if (type == LIGHT_RECTANGLE || type == LIGHT_DISK) {
+            vec3 area_dir = normalize(light.dir_type.xyz);
+            attenuation *= saturate(dot(area_dir, -light_dir));
+        }
+    }
+    return attenuation;
+}
+
+// Hapke bidirectional reflectance for one light direction, as the OptiX camera Hapke shader
+// evaluates it. The result multiplies the incoming irradiance (light color times cos i) and the
+// diffuse color. The opposition effect from coherent backscatter is off (B_c0 = 0), as in OptiX.
+float hapke_reflectance(GpuMaterial mat, vec3 n, vec3 view_dir, vec3 light_dir) {
+    float w = mat.hapke0.x;
+    float b = mat.hapke0.y;
+    float c = mat.hapke0.z;
+    float B_s0 = mat.hapke0.w;
+    float h_s = max(mat.hapke1.x, 1e-6);
+    float phi = mat.hapke1.y;
+    float theta_p = max(mat.hapke1.z, 1e-4);
+    const float B_c0 = 0.0;
+    const float h_c = 1.0;
+
+    float cos_i = dot(light_dir, n);
+    if (cos_i <= 0.0)
+        return 0.0;
+    // Interpolated normals can face slightly away from a grazing view; keep emergence just short of 90 deg.
+    float cos_e = max(dot(n, view_dir), 1e-3);
+    float cos_g = clamp(dot(light_dir, view_dir), -1.0, 1.0);
+    float sin_i = sqrt(max(0.0, 1.0 - cos_i * cos_i));
+    float sin_e = sqrt(max(0.0, 1.0 - cos_e * cos_e));
+    float sin_g = sqrt(max(0.0, 1.0 - cos_g * cos_g));
+    float cot_i = cos_i / max(sin_i, 1e-6);
+    float cot_e = cos_e / max(sin_e, 1e-6);
+
+    // Azimuth between the incidence and emergence planes; taken as 0 if either is along the normal.
+    vec3 light_tangent = light_dir - cos_i * n;
+    vec3 view_tangent = view_dir - cos_e * n;
+    float tangent_lengths = length(light_tangent) * length(view_tangent);
+    float cos_psi = tangent_lengths > 1e-12 ? clamp(dot(light_tangent, view_tangent) / tangent_lengths, -1.0, 1.0) : 1.0;
+    float psi = acos(cos_psi);
+    float f_psi = exp(-2.0 * tan(0.5 * psi));
+    float sin_psi_half = sin(0.5 * psi);
+    float sin_psi_half_sq = sin_psi_half * sin_psi_half;
+    float psi_per_pi = psi / PI;
+
+    // Macroscopic roughness shadowing.
+    float tan_theta_p = tan(theta_p);
+    float cot_theta_p = 1.0 / tan_theta_p;
+    float E_1_i = exp((-2.0 / PI) * cot_theta_p * cot_i);
+    float E_2_i = exp((-1.0 / PI) * cot_theta_p * cot_theta_p * cot_i * cot_i);
+    float E_1_e = exp((-2.0 / PI) * cot_theta_p * cot_e);
+    float E_2_e = exp((-1.0 / PI) * cot_theta_p * cot_theta_p * cot_e * cot_e);
+    float chi_theta_p = 1.0 / sqrt(1.0 + PI * tan_theta_p * tan_theta_p);
+    float eta_i = chi_theta_p * (cos_i + sin_i * tan_theta_p * E_2_i / (2.0 - E_1_i));
+    float eta_e = chi_theta_p * (cos_e + sin_e * tan_theta_p * E_2_e / (2.0 - E_1_e));
+
+    float mu0 = cos_i;
+    float mu = cos_e;
+    float mu0_e = chi_theta_p;
+    float mu_e = chi_theta_p;
+    float S;
+    if (cos_i >= cos_e) {
+        mu0_e *= cos_i + sin_i * tan_theta_p * (cos_psi * E_2_e + sin_psi_half_sq * E_2_i) / (2.0 - E_1_e - psi_per_pi * E_1_i);
+        mu_e *= cos_e + sin_e * tan_theta_p * (E_2_e - sin_psi_half_sq * E_2_i) / (2.0 - E_1_e - psi_per_pi * E_1_i);
+        S = mu_e / eta_e * mu0 / eta_i * chi_theta_p / (1.0 - f_psi + f_psi * chi_theta_p * (mu0 / eta_i));
+    } else {
+        mu0_e *= cos_i + sin_i * tan_theta_p * (E_2_i - sin_psi_half_sq * E_2_e) / (2.0 - E_1_i - psi_per_pi * E_1_e);
+        mu_e *= cos_e + sin_e * tan_theta_p * (cos_psi * E_2_i + sin_psi_half_sq * E_2_e) / (2.0 - E_1_i - psi_per_pi * E_1_e);
+        S = mu_e / eta_e * mu0 / eta_i * chi_theta_p / (1.0 - f_psi + f_psi * chi_theta_p * (mu / eta_e));
+    }
+
+    // Porosity, opposition surges, and the particle phase function.
+    float KPhi = 1.209 * pow(max(phi, 0.0), 2.0 / 3.0);
+    float K = KPhi > 1e-6 ? -log(1.0 - KPhi) / KPhi : 1.0;
+    float tan_ghalf = sin_g / max(1.0 + cos_g, 1e-6);
+    float tan_ghalf_per_hC = tan_ghalf / h_c;
+    float B_C = tan_ghalf_per_hC > 1e-6
+                    ? (1.0 + (1.0 - exp(-tan_ghalf_per_hC)) / tan_ghalf_per_hC) / (2.0 * pow(1.0 + tan_ghalf_per_hC, 2.0))
+                    : 1.0;
+    float B_S = 1.0 / (1.0 + tan_ghalf / h_s);
+    float b_sq = b * b;
+    float p_g = (1.0 + c) / 2.0 * (1.0 - b_sq) / pow(1.0 - 2.0 * b * cos_g + b_sq, 1.5) +
+                (1.0 - c) / 2.0 * (1.0 - b_sq) / pow(1.0 + 2.0 * b * cos_g + b_sq, 1.5);
+
+    // Multiple scattering through the Chandrasekhar H functions.
+    float r0_term = sqrt(max(0.0, 1.0 - w));
+    float r0 = (1.0 - r0_term) / (1.0 + r0_term);
+    float x_i = mu0_e / K;
+    float x_e = mu_e / K;
+    float H_i = 1.0 / (1.0 - w * x_i * (r0 + (1.0 - 2.0 * r0 * x_i) / 2.0 * log((1.0 + x_i) / x_i)));
+    float H_e = 1.0 / (1.0 - w * x_e * (r0 + (1.0 - 2.0 * r0 * x_e) / 2.0 * log((1.0 + x_e) / x_e)));
+    float M = H_i * H_e - 1.0;
+
+    float LS = mu0_e / (mu0_e + mu_e);
+    return LS * K * w / (4.0 * PI) * (p_g * (1.0 + B_s0 * B_S) + M) * (1.0 + B_c0 * B_C) * S / cos_i;
+}
+
+// Direct lighting of a Hapke surface, as the OptiX camera Hapke shader does it: no ambient
+// or emissive term, and each light's irradiance carries a single cos i factor.
+vec3 shade_hapke(TraceResult hit, GpuMaterial gpu_mat, vec3 origin, vec3 dir, uint sample_seed) {
+    vec3 albedo = eval_material(hit).diffuse;
+    vec3 hit_pos = origin + dir * hit.t;
+    vec3 n = shading_normal(hit);
+    vec3 view_dir = normalize(-dir);
+
+    vec3 color = vec3(0.0);
+    for (uint i = 0u; i < scene_data.counts.x; ++i) {
+        GpuLight light = lights[i];
+        int type = int(light.dir_type.w + 0.5);
+        vec3 light_dir;
+        float max_shadow_t = 3.402823e38;
+        vec3 irradiance;
+        if (type == LIGHT_ENVIRONMENT) {
+            vec3 env_radiance = vec3(0.0);
+            float env_pdf = 0.0;
+            if (!sample_environment_direction(sample_seed ^ (i + 1u) * 0x9e3779b9u, light_dir, env_radiance, env_pdf) ||
+                env_pdf <= 0.0)
+                continue;
+            irradiance = light.color_atten.rgb * env_radiance;
+        } else if (type == LIGHT_AREA) {
+            continue;
+        } else {
+            float attenuation = sample_local_light(light, type, hit_pos, light_dir, max_shadow_t);
+            if (attenuation <= 0.0)
+                continue;
+            irradiance = attenuation * light.color_atten.rgb;
+        }
+
+        float ndl = dot(n, light_dir);
+        if (ndl <= 0.0)
+            continue;
+        if (visibility_occluded_optix(shadow_origin(hit_pos, n, light_dir, hit.t), light_dir, max_shadow_t))
+            continue;
+        color += hapke_reflectance(gpu_mat, n, view_dir, light_dir) * ndl * irradiance * albedo;
+    }
+    return color;
+}
+
 vec3 shade_direct(TraceResult hit, vec3 origin, vec3 dir, bool include_ambient, uint sample_seed) {
+    GpuMaterial gpu_mat = materials[hit.mat_id];
+    if (gpu_mat.ids.z == BSDF_HAPKE)
+        return shade_hapke(hit, gpu_mat, origin, dir, sample_seed);
+
     EvalMaterial mat = eval_material(hit);
     vec3 hit_pos = origin + dir * hit.t;
     vec3 n = shading_normal(hit);
@@ -553,7 +745,7 @@ vec3 shade_direct(TraceResult hit, vec3 origin, vec3 dir, bool include_ambient, 
             float env_ndl = max(dot(n, env_dir), 0.0);
             if (env_ndl <= 0.0 || env_pdf <= 0.0)
                 continue;
-            vec3 env_origin = hit_pos + env_dir * TRACE_EPS;
+            vec3 env_origin = shadow_origin(hit_pos, n, env_dir, hit.t);
             if (visibility_occluded_optix(env_origin, env_dir, 3.402823e38))
                 continue;
             // OptiX launches a material-aware SHADOW ray next, but it necessarily
@@ -579,49 +771,16 @@ vec3 shade_direct(TraceResult hit, vec3 origin, vec3 dir, bool include_ambient, 
             continue;
         }
 
-        vec3 light_dir = vec3(0.0);
-        float max_shadow_t = 3.402823e38;
-        float attenuation = 1.0;
-
-        if (type == LIGHT_DIRECTIONAL) {
-            light_dir = normalize(light.dir_type.xyz);
-        } else {
-            vec3 to_light = light.pos_range.xyz - hit_pos;
-            float dist = length(to_light);
-            if (dist <= TRACE_EPS)
-                continue;
-            max_shadow_t = max(TRACE_EPS, dist - TRACE_EPS);
-            light_dir = to_light / dist;
-            if (light.color_atten.w >= 0.0)
-                attenuation = light.color_atten.w / max(1e-6, dist * dist);
-
-            if (type == LIGHT_SPOT) {
-                vec3 spot_dir = normalize(light.dir_type.xyz);
-                float cos_angle = clamp(dot(spot_dir, -light_dir), -1.0, 1.0);
-                // The hard cone is a dot/cosine comparison. Avoid making a boundary
-                // decision from GLSL acos(), whose permitted error differs by vendor.
-                if (cos_angle < light.params.w) {
-                    attenuation = 0.0;
-                } else if (light.color_atten.w >= 0.0 && light.params.z >= 0.0) {
-                    // Keep the existing angular soft-falloff formula for OptiX parity.
-                    // The transcendental is therefore paid only when soft falloff is enabled.
-                    float angle = acos(cos_angle);
-                    float a = saturate(light.params.z * (light.params.x - 2.0 * angle));
-                    attenuation *= a * a;
-                }
-            } else if (type == LIGHT_RECTANGLE || type == LIGHT_DISK) {
-                vec3 area_dir = normalize(light.dir_type.xyz);
-                attenuation *= saturate(dot(area_dir, -light_dir));
-            }
-        }
-
+        vec3 light_dir;
+        float max_shadow_t;
+        float attenuation = sample_local_light(light, type, hit_pos, light_dir, max_shadow_t);
         if (attenuation <= 0.0)
             continue;
         float ndl = max(dot(n, light_dir), 0.0);
         if (ndl <= 0.0)
             continue;
 
-        vec3 light_origin = hit_pos + light_dir * TRACE_EPS;
+        vec3 light_origin = shadow_origin(hit_pos, n, light_dir, hit.t);
         if (visibility_occluded_optix(light_origin, light_dir, max_shadow_t))
             continue;
         vec3 shadow = vec3(1.0);
@@ -684,6 +843,12 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index) {
         vec3 hit_pos = ro + rd * h.t;
         uint bounce_seed = hash_u32(path_seed ^ uint(depth + 1) * 83492791u);
         vec3 direct = shade_direct(h, ro, rd, depth == 0, bounce_seed);
+
+        // As in OptiX, a Hapke surface is opaque and adds no mirror or GI bounce.
+        if (materials[h.mat_id].ids.z == BSDF_HAPKE) {
+            accum += throughput * direct;
+            break;
+        }
 
         float ndv = max(dot(n, normalize(-rd)), 0.0);
         vec3 f0 = mat.use_specular_workflow ? 0.08 * mat.specular : mix(vec3(0.04), mat.diffuse, mat.metallic);

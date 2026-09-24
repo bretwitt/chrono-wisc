@@ -113,12 +113,14 @@ std::shared_ptr<planet::ChDeformationFilter> PlanetSCMTerrain::MakeDeformationFi
 std::size_t PlanetSCMTerrain::PublishDeformation() {
     if (!m_deformation)
         return 0;
+    // With each node's height (site z is height above the origin's elevation), so the drawn terrain shows
+    // compacted ground as the soil model has it.
     const auto nodes = GetModifiedNodes(true);
-    std::vector<std::pair<ChVector2i, double>> deltas;
-    deltas.reserve(nodes.size());
+    std::vector<planet::ChDeformationFilter::Node> changes;
+    changes.reserve(nodes.size());
     for (const auto& [loc, level] : nodes)
-        deltas.emplace_back(loc, level - m_functor->GetInitHeight(loc, m_params.delta));
-    return m_deformation->SetDeltas(deltas);
+        changes.push_back({loc, level - m_functor->GetInitHeight(loc, m_params.delta), level + m_site.GetOriginElevation()});
+    return m_deformation->SetNodes(changes);
 }
 
 void PlanetSCMTerrain::Initialize(const Params& params, const std::vector<Wheel>& wheels) {

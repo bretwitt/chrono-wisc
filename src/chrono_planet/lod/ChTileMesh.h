@@ -50,6 +50,7 @@ struct CH_PLANET_API ChTileMesh {
     double centerX = 0, centerY = 0, centerZ = 0, radius = 0;  ///< bounding sphere, skirts included (m)
     double maxElevation = 0;  ///< highest height: above reference sphere (Spherical) or site origin (Cartesian), m
     double minElevation = 0;  ///< lowest height in the same convention, m
+    bool fromSplit = false;   ///< built when its parent split (not a root tile, nor a rebuild after a change)
 };
 
 /// @} planet_module

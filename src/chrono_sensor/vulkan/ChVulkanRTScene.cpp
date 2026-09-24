@@ -48,6 +48,7 @@ struct ChVulkanRTCanonicalMaterialDefaults {
     float tex_scale_v;
     unsigned short int class_id;
     unsigned short int instance_id;
+    BSDFType bsdf_type;
 };
 
 const ChVulkanRTCanonicalMaterialDefaults& GetCanonicalMaterialDefaults() {
@@ -74,6 +75,7 @@ const ChVulkanRTCanonicalMaterialDefaults& GetCanonicalMaterialDefaults() {
         out.tex_scale_v = tex_scale.y();
         out.class_id = material->GetClassID();
         out.instance_id = material->GetInstanceID();
+        out.bsdf_type = material->GetBSDF();
         return out;
     }();
     return defaults;
@@ -97,6 +99,7 @@ ChVulkanRTMaterial::ChVulkanRTMaterial() {
     tex_scale_v = defaults.tex_scale_v;
     class_id = defaults.class_id;
     instance_id = defaults.instance_id;
+    bsdf_type = defaults.bsdf_type;
 }
 
 namespace {
@@ -150,6 +153,14 @@ ChVulkanRTMaterial MaterialFromVisual(const std::shared_ptr<ChVisualMaterial>& v
     mat.weight_texture = visual_mat->GetWeightTexture();
     mat.class_id = visual_mat->GetClassID();
     mat.instance_id = visual_mat->GetInstanceID();
+    mat.bsdf_type = visual_mat->GetBSDF();
+    mat.hapke_w = visual_mat->GetHapkeW();
+    mat.hapke_b = visual_mat->GetHapkeB();
+    mat.hapke_c = visual_mat->GetHapkeC();
+    mat.hapke_B_s0 = visual_mat->GetHapkeBs0();
+    mat.hapke_h_s = visual_mat->GetHapkeHs();
+    mat.hapke_phi = visual_mat->GetHapkePhi();
+    mat.hapke_theta_p = visual_mat->GetHapkeRoughness();
     return mat;
 }
 
@@ -260,9 +271,16 @@ bool FillTrianglePrimitive(ChVulkanRTPrimitive& primitive,
     primitive.type = ChVulkanRTPrimitiveType::TRIANGLE_MESH;
     primitive.scale = scale;
     primitive.backface_cull = backface_cull;
-    primitive.triangles.clear();
-    primitive.triangles.reserve(faces.size());
+    auto triangles = std::make_shared<std::vector<ChVulkanRTTriangle>>();
+    triangles->reserve(faces.size());
+    primitive.triangles.reset();
     primitive.has_aabb = false;
+
+    // Entry 0 is the primitive's own material; face material i is entry i + 1.
+    primitive.materials.clear();
+    primitive.materials.reserve(materials.size() + 1);
+    primitive.materials.push_back(primitive.material);
+    primitive.materials.insert(primitive.materials.end(), materials.begin(), materials.end());
 
     auto valid_tri_index = [](int i, size_t count) { return i >= 0 && static_cast<size_t>(i) < count; };
     auto get_uv = [&](int idx) {
@@ -280,6 +298,10 @@ bool FillTrianglePrimitive(ChVulkanRTPrimitive& primitive,
         const double len = n.Length();
         return len > CH_VKRT_SCENE_EPS ? n / len : fallback;
     };
+    // The source normal index of a corner, or -1 when get_normal falls back to the face normal.
+    auto source_normal = [&](int idx) {
+        return valid_tri_index(idx, normals.size()) && normals[static_cast<size_t>(idx)].Length() > CH_VKRT_SCENE_EPS ? idx : -1;
+    };
 
     for (size_t face_id = 0; face_id < faces.size(); ++face_id) {
         const auto& face = faces[face_id];
@@ -290,6 +312,9 @@ bool FillTrianglePrimitive(ChVulkanRTPrimitive& primitive,
             continue;
 
         ChVulkanRTTriangle tri;
+        tri.position_index[0] = i0;
+        tri.position_index[1] = i1;
+        tri.position_index[2] = i2;
         tri.v0 = ScaleVertex(vertices[static_cast<size_t>(i0)], scale);
         tri.v1 = ScaleVertex(vertices[static_cast<size_t>(i1)], scale);
         tri.v2 = ScaleVertex(vertices[static_cast<size_t>(i2)], scale);
@@ -312,6 +337,9 @@ bool FillTrianglePrimitive(ChVulkanRTPrimitive& primitive,
             tri.n1 = get_normal(ni.y(), tri.normal);
             tri.n2 = get_normal(ni.z(), tri.normal);
             tri.has_vertex_normals = true;
+            tri.normal_index[0] = source_normal(ni.x());
+            tri.normal_index[1] = source_normal(ni.y());
+            tri.normal_index[2] = source_normal(ni.z());
         }
 
         if (!uvs.empty()) {
@@ -329,6 +357,9 @@ bool FillTrianglePrimitive(ChVulkanRTPrimitive& primitive,
                 tri.uv1 = get_uv(ui1);
                 tri.uv2 = get_uv(ui2);
                 tri.has_uvs = true;
+                tri.uv_index[0] = ui0;
+                tri.uv_index[1] = ui1;
+                tri.uv_index[2] = ui2;
 
                 const ChVector3d delta_pos1 = tri.v1 - tri.v0;
                 const ChVector3d delta_pos2 = tri.v2 - tri.v0;
@@ -347,20 +378,23 @@ bool FillTrianglePrimitive(ChVulkanRTPrimitive& primitive,
             }
         }
 
-        tri.material = primitive.material;
+        tri.material_index = 0;
         if (face_id < face_materials.size()) {
             const int mat_id = face_materials[face_id];
             if (mat_id >= 0 && static_cast<size_t>(mat_id) < materials.size())
-                tri.material = materials[static_cast<size_t>(mat_id)];
+                tri.material_index = static_cast<uint32_t>(mat_id) + 1;
         }
 
         ExpandAABB(primitive, tri.v0);
         ExpandAABB(primitive, tri.v1);
         ExpandAABB(primitive, tri.v2);
-        primitive.triangles.push_back(tri);
+        triangles->push_back(tri);
     }
 
-    return !primitive.triangles.empty();
+    if (triangles->empty())
+        return false;
+    primitive.triangles = std::move(triangles);
+    return true;
 }
 
 bool AlmostEqual(double a, double b, double eps = 1e-8) {
@@ -403,7 +437,10 @@ bool SameMaterial(const ChVulkanRTMaterial& a, const ChVulkanRTMaterial& b) {
            a.emissive_texture == b.emissive_texture && a.normal_texture == b.normal_texture &&
            a.roughness_texture == b.roughness_texture && a.metallic_texture == b.metallic_texture &&
            a.opacity_texture == b.opacity_texture && a.weight_texture == b.weight_texture &&
-           a.class_id == b.class_id && a.instance_id == b.instance_id;
+           a.class_id == b.class_id && a.instance_id == b.instance_id && a.bsdf_type == b.bsdf_type &&
+           AlmostEqual(a.hapke_w, b.hapke_w) && AlmostEqual(a.hapke_b, b.hapke_b) && AlmostEqual(a.hapke_c, b.hapke_c) &&
+           AlmostEqual(a.hapke_B_s0, b.hapke_B_s0) && AlmostEqual(a.hapke_h_s, b.hapke_h_s) &&
+           AlmostEqual(a.hapke_phi, b.hapke_phi) && AlmostEqual(a.hapke_theta_p, b.hapke_theta_p);
 }
 
 bool SameBackground(const Background& a, const Background& b) {
@@ -438,7 +475,8 @@ bool SameTriangle(const ChVulkanRTTriangle& a, const ChVulkanRTTriangle& b) {
            SameVec3d(a.n2, b.n2) && SameTexCoord(a.uv0, b.uv0) && SameTexCoord(a.uv1, b.uv1) &&
            SameTexCoord(a.uv2, b.uv2) && SameVec3d(a.tangent, b.tangent) &&
            a.has_vertex_normals == b.has_vertex_normals && a.has_uvs == b.has_uvs &&
-           SameMaterial(a.material, b.material);
+           a.material_index == b.material_index && std::equal(a.position_index, a.position_index + 3, b.position_index) &&
+           std::equal(a.normal_index, a.normal_index + 3, b.normal_index) && std::equal(a.uv_index, a.uv_index + 3, b.uv_index);
 }
 
 bool SamePrimitive(const ChVulkanRTPrimitive& a, const ChVulkanRTPrimitive& b) {
@@ -447,12 +485,22 @@ bool SamePrimitive(const ChVulkanRTPrimitive& a, const ChVulkanRTPrimitive& b) {
         !SameVec3d(a.aabb_max, b.aabb_max) || a.has_aabb != b.has_aabb || a.backface_cull != b.backface_cull ||
         !SameVec3d(a.translational_velocity, b.translational_velocity) ||
         !SameVec3d(a.angular_velocity, b.angular_velocity) || !AlmostEqual(a.object_id, b.object_id) ||
-        a.triangles.size() != b.triangles.size()) {
+        a.Triangles().size() != b.Triangles().size() || a.materials.size() != b.materials.size()) {
         return false;
     }
 
-    for (size_t i = 0; i < a.triangles.size(); ++i) {
-        if (!SameTriangle(a.triangles[i], b.triangles[i]))
+    for (size_t i = 0; i < a.materials.size(); ++i) {
+        if (!SameMaterial(a.materials[i], b.materials[i]))
+            return false;
+    }
+
+    // Triangles reused from the mesh cache are the same object in both lists.
+    if (a.triangles == b.triangles)
+        return true;
+    const auto& ta = a.Triangles();
+    const auto& tb = b.Triangles();
+    for (size_t i = 0; i < ta.size(); ++i) {
+        if (!SameTriangle(ta[i], tb[i]))
             return false;
     }
     return true;
@@ -541,6 +589,14 @@ uint64_t HashMaterial(uint64_t seed, const ChVulkanRTMaterial& mat) {
     seed = HashString(seed, mat.weight_texture);
     seed = HashCombine(seed, mat.class_id);
     seed = HashCombine(seed, mat.instance_id);
+    seed = HashCombine(seed, static_cast<unsigned int>(mat.bsdf_type));
+    seed = HashFloat(seed, mat.hapke_w);
+    seed = HashFloat(seed, mat.hapke_b);
+    seed = HashFloat(seed, mat.hapke_c);
+    seed = HashFloat(seed, mat.hapke_B_s0);
+    seed = HashFloat(seed, mat.hapke_h_s);
+    seed = HashFloat(seed, mat.hapke_phi);
+    seed = HashFloat(seed, mat.hapke_theta_p);
     return seed;
 }
 
@@ -673,6 +729,60 @@ void ChVulkanRTScene::SetLights(const std::vector<ChVulkanRTLight>& lights) {
     }
 }
 
+bool ChVulkanRTScene::StageMesh(ChVulkanRTPrimitive& primitive,
+                                const std::shared_ptr<ChTriangleMeshConnected>& mesh,
+                                const ChVector3d& scale,
+                                bool backface_cull,
+                                const std::vector<ChVulkanRTMaterial>& materials,
+                                bool is_mutable) {
+    if (!mesh)
+        return false;
+    if (is_mutable)
+        return FillTrianglePrimitive(primitive, mesh, scale, backface_cull, materials);
+
+    // The material table FillTrianglePrimitive would stage: the primitive's material, then the shape's.
+    auto same_table = [&](const std::vector<ChVulkanRTMaterial>& table) {
+        if (table.size() != materials.size() + 1 || !SameMaterial(table[0], primitive.material))
+            return false;
+        for (size_t i = 0; i < materials.size(); ++i) {
+            if (!SameMaterial(table[i + 1], materials[i]))
+                return false;
+        }
+        return true;
+    };
+
+    auto& entries = m_mesh_cache[mesh.get()];
+    for (auto& entry : entries) {
+        if (SameVec3d(entry.scale, scale) && entry.backface_cull == backface_cull && same_table(entry.materials)) {
+            primitive.type = ChVulkanRTPrimitiveType::TRIANGLE_MESH;
+            primitive.scale = scale;
+            primitive.backface_cull = backface_cull;
+            primitive.materials = entry.materials;
+            primitive.triangles = entry.triangles;
+            primitive.aabb_min = entry.aabb_min;
+            primitive.aabb_max = entry.aabb_max;
+            primitive.has_aabb = entry.has_aabb;
+            entry.last_sync = m_sync_count;
+            return true;
+        }
+    }
+
+    if (!FillTrianglePrimitive(primitive, mesh, scale, backface_cull, materials))
+        return false;
+    MeshCacheEntry entry;
+    entry.mesh = mesh;
+    entry.scale = scale;
+    entry.backface_cull = backface_cull;
+    entry.materials = primitive.materials;
+    entry.triangles = primitive.triangles;
+    entry.aabb_min = primitive.aabb_min;
+    entry.aabb_max = primitive.aabb_max;
+    entry.has_aabb = primitive.has_aabb;
+    entry.last_sync = m_sync_count;
+    entries.push_back(std::move(entry));
+    return true;
+}
+
 void ChVulkanRTScene::SyncFromSystem(ChSystem* system) {
     ChVulkanRTSceneStats next_stats{};
     std::vector<ChVulkanRTPrimitive> next_primitives;
@@ -690,6 +800,7 @@ void ChVulkanRTScene::SyncFromSystem(ChSystem* system) {
     const uint64_t next_signature = ComputeSystemSignature(system);
     if (next_signature == m_system_signature)
         return;
+    ++m_sync_count;
 
     auto stage_visual_model = [&](const std::shared_ptr<ChVisualModel>& model,
                                   const ChFrame<double>& body_frame,
@@ -733,7 +844,8 @@ void ChVulkanRTScene::SyncFromSystem(ChSystem* system) {
                     std::cerr << "WARNING: Chrono::Sensor Vulkan RT does not support wireframe meshes. Defaulting back to solid mesh, please check for visual issues.\n";
                 }
                 const auto materials = BuildMaterialTable(trimesh_shape, primitive.material);
-                if (!FillTrianglePrimitive(primitive, trimesh_shape->GetMesh(), trimesh_shape->GetScale(), trimesh_shape->IsBackfaceCull(), materials)) {
+                if (!StageMesh(primitive, trimesh_shape->GetMesh(), trimesh_shape->GetScale(), trimesh_shape->IsBackfaceCull(), materials,
+                               trimesh_shape->IsMutable())) {
                     ++next_stats.unsupported_shapes;
                     continue;
                 }
@@ -750,7 +862,7 @@ void ChVulkanRTScene::SyncFromSystem(ChSystem* system) {
                 if (materials.empty())
                     materials = BuildMaterialTable(obj, primitive.material);
                 ResolveMaterialTexturePaths(materials, DirectoryOf(obj->GetFilename()));
-                if (!FillTrianglePrimitive(primitive, obj_trimesh, obj->GetScale(), false, materials)) {
+                if (!StageMesh(primitive, obj_trimesh, obj->GetScale(), false, materials, obj->IsMutable())) {
                     std::cerr << "WARNING: Chrono::Sensor Vulkan RT could not load visual model file: " << obj->GetFilename() << "\n";
                     ++next_stats.unsupported_shapes;
                     continue;
@@ -788,6 +900,14 @@ void ChVulkanRTScene::SyncFromSystem(ChSystem* system) {
         if (!item)
             continue;
         stage_visual_model(item->GetVisualModel(), identity_frame, zero_velocity, zero_velocity, 0.f);
+    }
+
+    // Forget meshes that left the scene, releasing the cache's hold on them.
+    for (auto it = m_mesh_cache.begin(); it != m_mesh_cache.end();) {
+        auto& entries = it->second;
+        entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const MeshCacheEntry& e) { return e.last_sync != m_sync_count; }),
+                      entries.end());
+        it = entries.empty() ? m_mesh_cache.erase(it) : std::next(it);
     }
 
     // Camera motion does not change renderable geometry.  Do not invalidate the

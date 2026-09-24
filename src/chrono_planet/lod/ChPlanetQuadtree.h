@@ -74,6 +74,19 @@ class CH_PLANET_API ChPlanetQuadtree {
     void SetSplitDistance(double tile_widths);
     double GetSplitDistance() const;
 
+    /// Split every tile above the camera's horizon to at least this zoom (quadtree level below the root tiles),
+    /// however far the camera is (default: 0). Root tiles have 2 x 2 cells and each zoom doubles that, up to
+    /// 64 x 64, so from far away a minimum zoom keeps the planet from being drawn as a coarse polyhedron: at 3,
+    /// with 16 degree root tiles, cells are 1/8 degree.
+    void SetMinZoom(int zoom);
+    int GetMinZoom() const;
+
+    /// Never split tiles past this zoom (default: 17). With 16 degree root tiles, cells at zoom 17 are about 6 cm
+    /// across and each zoom halves them; relief layers finer than that, such as regolith roughness, need a
+    /// higher zoom to show up close. Past the zoom a camera gets near enough to split, it has no effect.
+    void SetMaxZoom(int zoom);
+    int GetMaxZoom() const;
+
     /// Horizon culling: tiles entirely below the camera's horizon are not refined. The horizon is taken on
     /// a sphere `margin` meters below both the camera and the tile's lowest point, so terrain up to that
     /// deep between them cannot wrongly hide a tile (default: 1000 m). A negative margin turns it off.

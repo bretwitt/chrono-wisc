@@ -17,7 +17,7 @@ if(CH_ENABLE_MODULE_VEHICLE_MODELS)
     )
 endif()
 
-set(UTILS "PlanetBoulderField.h" "PlanetDemoSetup.h")
+set(UTILS "PlanetBoulderField.h" "PlanetDemoSetup.h" "PlanetHazardAvoidance.h")
 
 #--------------------------------------------------------------
 
@@ -52,3 +52,17 @@ foreach(PROGRAM ${DEMOS})
 
     install(TARGETS ${PROGRAM} CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
 endforeach()
+
+# Chrono::Sensor demos over the planet terrain, shaded with the Hapke BRDF.
+if(CH_ENABLE_MODULE_SENSOR)
+    foreach(PROGRAM demo_PLANET_SensorHapke demo_PLANET_Viper_SCM_Sensor demo_PLANET_MoonDescent)
+        add_executable(${PROGRAM} ${PROGRAM}.cpp ${UTILS})
+        source_group("" FILES ${PROGRAM}.cpp ${UTILS})
+        if(MSVC)
+          set_target_properties(${PROGRAM} PROPERTIES MSVC_RUNTIME_LIBRARY ${CH_MSVC_RUNTIME_LIBRARY})
+        endif()
+        set_property(TARGET ${PROGRAM} PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${PROGRAM}>")
+        target_link_libraries(${PROGRAM} Chrono_core Chrono_planet Chrono_vehicle ChronoModels_robot Chrono_sensor)
+        install(TARGETS ${PROGRAM} CONFIGURATIONS Release DESTINATION ${CH_INSTALL_DEMO})
+    endforeach()
+endif()

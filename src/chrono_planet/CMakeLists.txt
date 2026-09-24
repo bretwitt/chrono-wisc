@@ -46,6 +46,8 @@ set(Chrono_PLANET_FILES
     ChPlanetBody.cpp
     ChPlanetSurface.h
     ChPlanetSurface.cpp
+    ChPlanetVisualMesh.h
+    ChPlanetVisualMesh.cpp
     ChSiteFrame.h
 )
 source_group("" FILES ${Chrono_PLANET_FILES})

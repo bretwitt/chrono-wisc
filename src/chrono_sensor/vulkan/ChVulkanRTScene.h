@@ -18,7 +18,9 @@
 #define CH_VULKAN_RT_SCENE_H
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "chrono/assets/ChColor.h"
@@ -82,6 +84,17 @@ struct CH_SENSOR_API ChVulkanRTMaterial {
     float lidar_intensity = 1.f;
     float radar_backscatter = 1.f;
 
+    // Camera BSDF. Vulkan RT shades HAPKE with the Hapke model and every other type
+    // with the OptiX LEGACY model, as the OptiX camera shader does.
+    BSDFType bsdf_type;
+    float hapke_w = 0.f;        // single scattering albedo
+    float hapke_b = 0.f;        // phase function shape
+    float hapke_c = 0.f;        // backward/forward scattering weight
+    float hapke_B_s0 = 0.f;     // shadow hiding opposition amplitude
+    float hapke_h_s = 0.f;      // shadow hiding opposition width
+    float hapke_phi = 0.f;      // filling factor
+    float hapke_theta_p = 0.f;  // macroscopic roughness (rad)
+
     float tex_scale_u;
     float tex_scale_v;
     std::string diffuse_texture;
@@ -111,7 +124,16 @@ struct CH_SENSOR_API ChVulkanRTTriangle {
     ChVector3d tangent = ChVector3d(1.0, 0.0, 0.0);
     bool has_vertex_normals = false;
     bool has_uvs = false;
-    ChVulkanRTMaterial material;
+
+    /// Index of the triangle's material in ChVulkanRTPrimitive::materials.
+    uint32_t material_index = 0;
+
+    // Source-mesh indices of each corner's position, normal and UV, or -1 where the corner's value does not
+    // come from the mesh (a face normal, or no UVs). Corners with equal indices have equal positions,
+    // normals and UVs, which lets the GPU path share their vertex.
+    int32_t position_index[3] = {-1, -1, -1};
+    int32_t normal_index[3] = {-1, -1, -1};
+    int32_t uv_index[3] = {-1, -1, -1};
 };
 
 struct CH_SENSOR_API ChVulkanRTPrimitive {
@@ -122,8 +144,25 @@ struct CH_SENSOR_API ChVulkanRTPrimitive {
 
     // Triangle-mesh data in primitive-local coordinates. This mirrors the OptiX
     // triangle GAS input: vertices are kept untransformed except for the visual
-    // shape scale; the body/asset transform remains in frame.
-    std::vector<ChVulkanRTTriangle> triangles;
+    // shape scale; the body/asset transform remains in frame. The triangles are
+    // immutable once staged and shared between syncs while the mesh is unchanged.
+    std::shared_ptr<const std::vector<ChVulkanRTTriangle>> triangles;
+
+    /// The staged triangles (empty for a primitive that is not a triangle mesh).
+    const std::vector<ChVulkanRTTriangle>& Triangles() const {
+        static const std::vector<ChVulkanRTTriangle> none;
+        return triangles ? *triangles : none;
+    }
+
+    /// Materials of a triangle mesh's triangles, indexed by ChVulkanRTTriangle::material_index. Entry 0 is
+    /// the primitive's own material, for triangles without a valid material index of their own.
+    std::vector<ChVulkanRTMaterial> materials;
+
+    /// The material a triangle of this primitive is shaded with.
+    const ChVulkanRTMaterial& TriangleMaterial(const ChVulkanRTTriangle& tri) const {
+        return tri.material_index < materials.size() ? materials[tri.material_index] : material;
+    }
+
     ChVector3d aabb_min = ChVector3d(0.0, 0.0, 0.0);
     ChVector3d aabb_max = ChVector3d(0.0, 0.0, 0.0);
     bool has_aabb = false;
@@ -246,6 +285,31 @@ class CH_SENSOR_API ChVulkanRTScene {
     void Replace(unsigned int id, const ChVulkanRTLight& light);
 
     ChVulkanRTMaterial ExtractMaterial(const std::shared_ptr<ChVisualShape>& shape) const;
+
+    /// Stage a triangle mesh into primitive, reusing the triangles staged for it in an earlier sync when
+    /// the mesh is not mutable and its scale, face culling and materials are unchanged. Mutable meshes
+    /// are edited in place, so they are staged again every time. Returns false for an empty mesh.
+    bool StageMesh(ChVulkanRTPrimitive& primitive,
+                   const std::shared_ptr<ChTriangleMeshConnected>& mesh,
+                   const ChVector3d& scale,
+                   bool backface_cull,
+                   const std::vector<ChVulkanRTMaterial>& materials,
+                   bool is_mutable);
+
+    /// Triangles staged for a mesh, kept while the mesh stays in the scene.
+    struct MeshCacheEntry {
+        std::shared_ptr<ChTriangleMeshConnected> mesh;  ///< held, so the mesh's address is not reused while cached
+        ChVector3d scale;
+        bool backface_cull = false;
+        std::vector<ChVulkanRTMaterial> materials;  ///< the staged primitive's material table
+        std::shared_ptr<const std::vector<ChVulkanRTTriangle>> triangles;
+        ChVector3d aabb_min;
+        ChVector3d aabb_max;
+        bool has_aabb = false;
+        uint64_t last_sync = 0;  ///< last sync that used the entry
+    };
+    std::unordered_map<const ChTriangleMeshConnected*, std::vector<MeshCacheEntry>> m_mesh_cache;
+    uint64_t m_sync_count = 0;
 
     ChVulkanRTSceneStats m_stats;
     std::vector<ChVulkanRTPrimitive> m_primitives;

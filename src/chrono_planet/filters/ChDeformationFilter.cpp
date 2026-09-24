@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <limits>
 #include <cmath>
 #include <mutex>
 #include <stdexcept>
@@ -62,11 +63,33 @@ double ChDeformationFilter::DeltaAt(double x, double y) const {
     const double tx = fx - i, ty = fy - j;
     auto at = [&](int a, int b) {
         const auto it = m_deltas.find(Key(a, b));
-        return it == m_deltas.end() ? 0.0 : it->second;
+        return it == m_deltas.end() ? 0.0 : it->second.delta;
     };
     const double south = at(i, j) * (1 - tx) + at(i + 1, j) * tx;
     const double north = at(i, j + 1) * (1 - tx) + at(i + 1, j + 1) * tx;
     return south * (1 - ty) + north * ty;
+}
+
+double ChDeformationFilter::HeightAt(double x, double y, double w, double height) const {
+    const double delta = w * DeltaAt(x, y);
+    const double moved = height + delta;
+    if (!(m_flatten_depth > 0) || delta >= 0)
+        return moved;
+    const double c = w * util::smoothstep01(std::min(1.0, -delta / m_flatten_depth));
+    if (c <= 0)
+        return moved;
+    // The nodes' own heights, bilinear; a node without one stands in with the moved incoming height, so the
+    // blend is continuous where compacted ground meets ground the soil model has not touched.
+    const double fx = x / m_spacing, fy = y / m_spacing;
+    const int i = static_cast<int>(std::floor(fx)), j = static_cast<int>(std::floor(fy));
+    const double tx = fx - i, ty = fy - j;
+    auto at = [&](int a, int b) {
+        const auto it = m_deltas.find(Key(a, b));
+        return it == m_deltas.end() || std::isnan(it->second.height) ? moved : it->second.height;
+    };
+    const double south = at(i, j) * (1 - tx) + at(i + 1, j) * tx;
+    const double north = at(i, j + 1) * (1 - tx) + at(i + 1, j + 1) * tx;
+    return moved + c * (south * (1 - ty) + north * ty - moved);
 }
 
 double ChDeformationFilter::Apply(double lon_deg, double lat_deg, double spacing_deg, double height) const {
@@ -77,7 +100,16 @@ double ChDeformationFilter::Apply(double lon_deg, double lat_deg, double spacing
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     if (m_deltas.empty())
         return height;
-    return height + w * DeltaAt(p.x(), p.y());
+    return HeightAt(p.x(), p.y(), w, height);
+}
+
+double ChDeformationFilter::GetDelta(double lon_deg, double lat_deg, double spacing_deg) const {
+    const double w = Weight(spacing_deg);
+    if (w <= 0)
+        return 0.0;
+    const ChVector3d p = m_site.ToLocal(lon_deg, lat_deg, 0.0);
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_deltas.empty() ? 0.0 : w * DeltaAt(p.x(), p.y());
 }
 
 void ChDeformationFilter::ApplyGrid(const ChGeoGrid& grid, std::vector<double>& heights) const {
@@ -105,7 +137,7 @@ void ChDeformationFilter::ApplyGrid(const ChGeoGrid& grid, std::vector<double>& 
         double* row = &heights[static_cast<size_t>(j) * n];
         for (int i = 0; i < n; ++i) {
             const ChVector3d p = m_site.ToLocal(grid.lon0 + i * grid.step_lon, lat, 0.0);
-            row[i] += w * DeltaAt(p.x(), p.y());
+            row[i] = HeightAt(p.x(), p.y(), w, row[i]);
         }
     }
 }
@@ -124,16 +156,24 @@ ChGeoRegion ChDeformationFilter::RegionOf(int i0, int j0, int i1, int j1) const 
 }
 
 size_t ChDeformationFilter::SetDeltas(const std::vector<std::pair<ChVector2i, double>>& deltas, double tolerance) {
+    std::vector<Node> nodes;
+    nodes.reserve(deltas.size());
+    for (const auto& [node, dz] : deltas)
+        nodes.push_back({node, dz, std::numeric_limits<double>::quiet_NaN()});
+    return SetNodes(nodes, tolerance);
+}
+
+size_t ChDeformationFilter::SetNodes(const std::vector<Node>& nodes, double tolerance) {
     std::unique_lock<std::shared_mutex> lock(m_mutex);
     size_t changed = 0;
     int i0 = INT_MAX, j0 = INT_MAX, i1 = INT_MIN, j1 = INT_MIN;
-    for (const auto& [node, dz] : deltas) {
+    for (const auto& [node, dz, height] : nodes) {
         const std::int64_t k = Key(node.x(), node.y());
         const auto it = m_deltas.find(k);
-        const double old = it == m_deltas.end() ? 0.0 : it->second;
+        const double old = it == m_deltas.end() ? 0.0 : it->second.delta;
         if (std::abs(dz - old) <= tolerance)
             continue;
-        m_deltas[k] = dz;
+        m_deltas[k] = {dz, height};
         ++changed;
         i0 = std::min(i0, node.x()), i1 = std::max(i1, node.x());
         j0 = std::min(j0, node.y()), j1 = std::max(j1, node.y());
@@ -165,7 +205,7 @@ void ChDeformationFilter::Clear() {
 double ChDeformationFilter::GetDelta(const ChVector2i& node) const {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     const auto it = m_deltas.find(Key(node.x(), node.y()));
-    return it == m_deltas.end() ? 0.0 : it->second;
+    return it == m_deltas.end() ? 0.0 : it->second.delta;
 }
 
 size_t ChDeformationFilter::GetNumNodes() const {
