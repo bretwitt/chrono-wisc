@@ -113,7 +113,11 @@ const double morph_time = 0.2;
 
 // Physics
 const double gravity = moon::kGravity;
-const double step_size = 1e-3;
+// A 2 ms step and 50 solver iterations run the rover in real time. Over a 20 s drive, they keep it within 2 cm of
+// its path at 1 ms and 150 iterations, and its ruts within a millimeter of their depth; SCM's CPU and GPU ray casts
+// alone differ by 20 cm over that drive.
+const double step_size = 2e-3;
+const int solver_iterations = 50;
 
 // Soil grid
 const double scm_delta = 0.025;
@@ -128,6 +132,7 @@ const double plan_period = 0.25;
 // Boulders: every rock at least this big within this distance of the rover
 const double rock_min_radius = 0.15;
 const double rock_spawn_radius = 30.0;
+const double rock_update_period = 0.2;  // sim seconds between boulder field updates
 
 // VIPER geometry (real wheel)
 const double wheel_radius = 0.25;
@@ -289,7 +294,7 @@ int main(int argc, char* argv[]) {
     sys.SetGravitationalAcceleration(ChVector3d(0, 0, -gravity));
     sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
     sys.SetSolverType(ChSolver::Type::BARZILAIBORWEIN);
-    sys.GetSolver()->AsIterative()->SetMaxIterations(150);
+    sys.GetSolver()->AsIterative()->SetMaxIterations(solver_iterations);
     // SCM ray-casts every wheel's grid nodes in parallel on Chrono's threads. Gains flatten past about 8 threads.
     sys.SetNumThreads(std::min(8, ChOMP::GetNumProcs()), 1, 4);
 
@@ -465,6 +470,8 @@ int main(int argc, char* argv[]) {
 
     // Simulation loop. Ruts and the terrain level of detail are refreshed once per camera update.
     const int sensor_steps = static_cast<int>(std::round(1.0 / (sensor_rate * step_size)));
+    const int rock_steps = static_cast<int>(std::round(rock_update_period / step_size));
+    const int report_steps = static_cast<int>(std::round(1.0 / step_size));
     const auto wall_start = std::chrono::steady_clock::now();
     double distance = 0;
     double next_rut_request = rut_stats_period;
@@ -575,12 +582,12 @@ int main(int argc, char* argv[]) {
             rut = stats;
 
         // Boulders around the rover
-        if (use_rocks && step % 200 == 0)
+        if (use_rocks && step % rock_steps == 0)
             boulders.Update(pos, rock_spawn_radius);
 
         distance += (pos - last_pos).Length();
         last_pos = pos;
-        if (++step % 1000 == 0) {
+        if (++step % report_steps == 0) {
             const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
             std::cout << "t = " << time << " s (" << time / wall << "x real time), at (" << pos.x() << ", " << pos.y()
                       << ") m, distance " << distance << " m, " << visual_terrain.GetNumTiles() << " tiles ("

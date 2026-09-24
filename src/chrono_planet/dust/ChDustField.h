@@ -20,11 +20,11 @@
 #ifndef CH_DUST_FIELD_H
 #define CH_DUST_FIELD_H
 
+#include <climits>
 #include <cstdint>
 #include <functional>
 #include <random>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "chrono/core/ChVector3.h"
@@ -218,8 +218,15 @@ class CH_PLANET_API ChDustField {
     Grid m_grid;
     Stats m_stats;
 
+    // Ground heights on a lattice of the grid's voxel size, cached in a direct-mapped table: a lattice point has one
+    // slot, which holds the last point that hashed to it
+    struct HeightSlot {
+        std::int32_t i = INT32_MIN;
+        std::int32_t j = INT32_MIN;
+        float height = 0;
+    };
     double m_lattice = 0;  // spacing of the height cache (m)
-    std::unordered_map<std::int64_t, float> m_heights;
+    std::vector<HeightSlot> m_heights;
 
     // Where the grid's visibility was last traced, and toward which Sun
     ChVector3d m_vis_origin;

@@ -1,5 +1,7 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 struct GpuMaterial {
     vec4 diffuse;
@@ -36,31 +38,49 @@ struct HitPayload {
 layout(std430, set = 0, binding = 1) readonly buffer Materials {
     GpuMaterial materials[];
 };
-layout(std430, set = 0, binding = 2) readonly buffer Vertices {
-    GpuVertex vertices[];
+// A mesh instance: device addresses of its vertices and triangles, which are in the mesh's own coordinates, and
+// the first of its materials (ChVulkanRTGpuInstance on the host)
+struct GpuInstance {
+    uvec2 vertices;
+    uvec2 triangles;
+    uvec4 material_base;
 };
-layout(std430, set = 0, binding = 3) readonly buffer Triangles {
-    GpuTriangle triangles[];
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer VertexRef {
+    GpuVertex v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer TriangleRef {
+    GpuTriangle t[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer Instances {
+    GpuInstance instances[];
 };
 
 hitAttributeEXT vec2 attribs;
 layout(location = 0) rayPayloadInEXT HitPayload payload;
 
 void main() {
-    GpuTriangle tri = triangles[gl_PrimitiveID];
+    GpuInstance inst = instances[gl_InstanceCustomIndexEXT];
+    VertexRef vertices = VertexRef(inst.vertices);
+    GpuTriangle tri = TriangleRef(inst.triangles).t[gl_PrimitiveID];
     uint i0 = tri.index_material.x;
     uint i1 = tri.index_material.y;
     uint i2 = tri.index_material.z;
-    uint mat_id = tri.index_material.w;
+    uint mat_id = inst.material_base.x + tri.index_material.w;
 
     float b1 = attribs.x;
     float b2 = attribs.y;
     float b0 = 1.0 - b1 - b2;
 
-    vec3 n = normalize(vertices[i0].normal.xyz * b0 + vertices[i1].normal.xyz * b1 + vertices[i2].normal.xyz * b2);
-    vec3 t = normalize(vertices[i0].tangent.xyz * b0 + vertices[i1].tangent.xyz * b1 + vertices[i2].tangent.xyz * b2);
-    vec2 uv = vertices[i0].uv.xy * b0 + vertices[i1].uv.xy * b1 + vertices[i2].uv.xy * b2;
-    float has_uv = max(vertices[i0].uv.z, max(vertices[i1].uv.z, vertices[i2].uv.z));
+    GpuVertex v0 = vertices.v[i0];
+    GpuVertex v1 = vertices.v[i1];
+    GpuVertex v2 = vertices.v[i2];
+    // Instances place meshes by rotation and translation only (a shape's scale is in its vertices), so the
+    // rotation turns normals and tangents to world coordinates.
+    mat3 to_world = mat3(gl_ObjectToWorldEXT);
+    vec3 n = normalize(to_world * (v0.normal.xyz * b0 + v1.normal.xyz * b1 + v2.normal.xyz * b2));
+    vec3 t = normalize(to_world * (v0.tangent.xyz * b0 + v1.tangent.xyz * b1 + v2.tangent.xyz * b2));
+    vec2 uv = v0.uv.xy * b0 + v1.uv.xy * b1 + v2.uv.xy * b2;
+    float has_uv = max(v0.uv.z, max(v1.uv.z, v2.uv.z));
 
     // Do not face-forward the staged shading normal based on triangle winding.
     // Chrono/OptiX keeps object/mesh normals in material space and uses them

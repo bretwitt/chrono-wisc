@@ -1961,6 +1961,17 @@ struct ChVulkanRTGpuTriangle {
     uint32_t material;
 };
 
+// An instance of a mesh in the top-level acceleration structure, at gl_InstanceCustomIndexEXT; must match GpuInstance
+// in the hit shaders. The mesh's vertices and triangles are in its own coordinates, and its triangles' materials are
+// indices from material_base.
+struct ChVulkanRTGpuInstance {
+    VkDeviceAddress vertices;
+    VkDeviceAddress triangles;
+    uint32_t material_base;
+    uint32_t reserved[3];
+};
+static_assert(sizeof(ChVulkanRTGpuInstance) == 32, "ChVulkanRTGpuInstance must match GpuInstance in the hit shaders");
+
 // Hash of a triangle corner's source position, normal and UV indices.
 struct CornerKeyHash {
     size_t operator()(const std::array<int32_t, 3>& key) const {
@@ -2221,7 +2232,7 @@ struct ChVulkanRTGpuRenderer {
             m_volume_revision = scene->GetVolumeRevision();
         }
 
-        if (m_vertices.empty() || m_triangles.empty())
+        if (!m_tlas)
             return false;
 
         EnsureOutput(frame.width, frame.height, frame.pipeline);
@@ -2277,8 +2288,10 @@ struct ChVulkanRTGpuRenderer {
         vkDeviceWaitIdle(device);
         if (m_tlas)
             m_device->vkDestroyAccelerationStructureKHR(device, m_tlas, nullptr);
-        if (m_blas)
-            m_device->vkDestroyAccelerationStructureKHR(device, m_blas, nullptr);
+        for (auto& entry : m_mesh_chunks)
+            ReleaseChunk(entry.second);
+        m_mesh_chunks.clear();
+        ReleaseChunk(m_loose);
         if (m_pipeline)
             vkDestroyPipeline(device, m_pipeline, nullptr);
         if (m_pipeline_layout)
@@ -2292,7 +2305,6 @@ struct ChVulkanRTGpuRenderer {
         if (m_fence)
             vkDestroyFence(device, m_fence, nullptr);
         m_tlas = VK_NULL_HANDLE;
-        m_blas = VK_NULL_HANDLE;
         m_pipeline = VK_NULL_HANDLE;
         m_pipeline_layout = VK_NULL_HANDLE;
         m_descriptor_pool = VK_NULL_HANDLE;
@@ -2340,7 +2352,7 @@ struct ChVulkanRTGpuRenderer {
     }
 
     void CreatePipeline() {
-        std::array<VkDescriptorSetLayoutBinding, 10> bindings = {};
+        std::array<VkDescriptorSetLayoutBinding, 9> bindings = {};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         bindings[0].descriptorCount = 1;
@@ -2353,34 +2365,30 @@ struct ChVulkanRTGpuRenderer {
         bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[2].descriptorCount = 1;
         bindings[2].stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
-        bindings[3].binding = 3;
+        bindings[3].binding = 4;
         bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[3].descriptorCount = 1;
-        bindings[3].stageFlags = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
-        bindings[4].binding = 4;
+        bindings[3].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        bindings[4].binding = 5;
         bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[4].descriptorCount = 1;
-        bindings[4].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-        bindings[5].binding = 5;
+        bindings[4].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+        bindings[5].binding = 6;
         bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[5].descriptorCount = 1;
         bindings[5].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
-        bindings[6].binding = 6;
+        bindings[6].binding = 7;
         bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[6].descriptorCount = 1;
-        bindings[6].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
-        bindings[7].binding = 7;
+        bindings[6].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        bindings[7].binding = 8;
         bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[7].descriptorCount = 1;
-        bindings[7].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
-        bindings[8].binding = 8;
+        bindings[7].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+        bindings[8].binding = 9;
         bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[8].descriptorCount = 1;
-        bindings[8].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
-        bindings[9].binding = 9;
-        bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[9].descriptorCount = 1;
-        bindings[9].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        bindings[8].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
         VkDescriptorSetLayoutCreateInfo layout_info = {};
         layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -2477,7 +2485,7 @@ struct ChVulkanRTGpuRenderer {
         pool_sizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         pool_sizes[0].descriptorCount = 1;
         pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_sizes[1].descriptorCount = 9;
+        pool_sizes[1].descriptorCount = 8;
         VkDescriptorPoolCreateInfo pool_info = {};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 1;
@@ -2988,24 +2996,35 @@ struct ChVulkanRTGpuRenderer {
         }
     }
 
-    // A mesh packed for the GPU: its distinct vertices in primitive-local coordinates, and its triangles as
-    // indices into them plus the index of their material in the primitive's table. Independent of where the
-    // mesh is, so it is built once per staged triangle array.
-    struct LocalVertex {
-        ChVector3d position;
-        ChVector3d normal;
-        ChVector3d tangent;
-        ChVulkanRTTexCoord uv;
-        bool has_uv;
-    };
+    // A triangle mesh on the GPU, in primitive-local coordinates: its distinct vertices, their indices, and its
+    // triangles as the indices plus the index of their material in the primitive's table, in one buffer followed by
+    // the mesh's bottom-level acceleration structure. Independent of where the mesh is, so it is built once per
+    // staged triangle array, and instances in the top-level structure place it: a body that moves moves only its
+    // instances, and the rest of the scene is not uploaded or built again.
     struct MeshChunk {
         std::shared_ptr<const std::vector<ChVulkanRTTriangle>> triangles;  ///< held, so its address is not reused
-        std::vector<LocalVertex> local_vertices;
-        std::vector<std::array<uint32_t, 4>> faces;  ///< i0, i1, i2, material index in the primitive's table
-        ChFrame<double> frame;                       ///< frame the world vertices were transformed with
-        bool has_world = false;
-        std::vector<ChVulkanRTGpuVertex> vertices;   ///< GPU vertices in world coordinates
+        std::vector<ChVulkanRTGpuVertex> vertices;  ///< held until uploaded
+        std::vector<uint32_t> indices;              ///< held until uploaded
+        std::vector<ChVulkanRTGpuTriangle> faces;   ///< held until uploaded; material: index in the primitive's table
+        std::vector<char> used_materials;           ///< entries of the primitive's table the triangles use
+        uint32_t num_vertices = 0;
+        uint32_t num_faces = 0;
+        std::unique_ptr<ChVulkanRTBuffer> buffer;
+        VkDeviceSize index_offset = 0;
+        VkDeviceSize face_offset = 0;
+        VkDeviceSize data_size = 0;  ///< bytes of vertices, indices and triangles, ahead of the structure
+        VkDeviceSize blas_offset = 0;
+        VkDeviceSize scratch_size = 0;
+        VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
+        VkDeviceAddress blas_address = 0;
         uint64_t last_build = 0;
+    };
+
+    // A mesh placed in the scene, with the first of its materials in the scene's material table
+    struct MeshInstance {
+        const MeshChunk* chunk;
+        ChFrame<double> frame;
+        uint32_t material_base;
     };
 
     // Pack a mesh. Corners with the same source position, normal and UV have the same GPU vertex, so they share
@@ -3032,88 +3051,77 @@ struct ChVulkanRTGpuRenderer {
         };
 
         const auto& triangles = primitive.Triangles();
+        chunk.used_materials.assign(primitive.materials.size(), 0);
+        chunk.indices.reserve(3 * triangles.size());
         chunk.faces.reserve(triangles.size());
         for (const auto& tri : triangles) {
             const uint32_t index = tri.material_index < primitive.materials.size() ? tri.material_index : 0;
+            if (index < chunk.used_materials.size())
+                chunk.used_materials[index] = 1;
             const bool share = primitive.materials[index].normal_texture.empty();
             const ChVector3d* positions[3] = {&tri.v0, &tri.v1, &tri.v2};
             const ChVector3d* normals[3] = {&tri.n0, &tri.n1, &tri.n2};
             const ChVulkanRTTexCoord* uvs[3] = {&tri.uv0, &tri.uv1, &tri.uv2};
-            std::array<uint32_t, 4> face{0, 0, 0, index};
+            uint32_t corner[3];
             for (int k = 0; k < 3; ++k) {
                 uint32_t* slot = share ? shared_vertex(tri, k) : nullptr;
                 if (slot && *slot != unset) {
-                    face[k] = *slot;
+                    corner[k] = *slot;
                     continue;
                 }
-                face[k] = static_cast<uint32_t>(chunk.local_vertices.size());
-                chunk.local_vertices.push_back({*positions[k], tri.has_vertex_normals ? *normals[k] : tri.normal, tri.tangent, *uvs[k], tri.has_uvs});
+                corner[k] = static_cast<uint32_t>(chunk.vertices.size());
+                chunk.vertices.push_back(MakeGpuVertex(*positions[k], tri.has_vertex_normals ? *normals[k] : tri.normal, *uvs[k], tri.tangent, tri.has_uvs));
                 if (slot)
-                    *slot = face[k];
+                    *slot = corner[k];
             }
-            chunk.faces.push_back(face);
+            chunk.indices.insert(chunk.indices.end(), corner, corner + 3);
+            chunk.faces.push_back(ChVulkanRTGpuTriangle{corner[0], corner[1], corner[2], index});
         }
-    }
-
-    // Transform a packed mesh's vertices to world coordinates for the GPU.
-    static void TransformMesh(const ChFrame<double>& frame, MeshChunk& chunk) {
-        chunk.vertices.resize(chunk.local_vertices.size());
-        for (size_t i = 0; i < chunk.local_vertices.size(); ++i) {
-            const LocalVertex& v = chunk.local_vertices[i];
-            chunk.vertices[i] = MakeGpuVertex(frame.TransformPointLocalToParent(v.position), frame.TransformDirectionLocalToParent(v.normal), v.uv,
-                                              frame.TransformDirectionLocalToParent(v.tangent), v.has_uv);
-        }
-        chunk.frame = frame;
-        chunk.has_world = true;
-    }
-
-    static bool SameFrameExactly(const ChFrame<double>& a, const ChFrame<double>& b) {
-        return a.GetPos() == b.GetPos() && a.GetRot() == b.GetRot();
+        chunk.num_vertices = static_cast<uint32_t>(chunk.vertices.size());
+        chunk.num_faces = static_cast<uint32_t>(chunk.faces.size());
     }
 
     void AddMesh(const ChVulkanRTPrimitive& primitive) {
-        // A mesh is packed once and transformed again only when it moves.
+        // A mesh is packed and its structure built once; each primitive using it is an instance of it.
         MeshChunk& chunk = m_mesh_chunks[primitive.triangles.get()];
         if (!chunk.triangles) {
             chunk.triangles = primitive.triangles;
             PackMesh(primitive, chunk);
+            if (chunk.num_faces > 0)
+                m_pending_chunks.push_back(&chunk);
         }
-        if (!chunk.has_world || !SameFrameExactly(chunk.frame, primitive.frame))
-            TransformMesh(primitive.frame, chunk);
         chunk.last_build = m_build_count;
+        if (chunk.num_faces == 0)
+            return;
 
-        // One GPU material per material the triangles use, rather than one per triangle, in order of first use.
-        constexpr uint32_t unset = std::numeric_limits<uint32_t>::max();
-        std::vector<uint32_t> gpu_material(primitive.materials.size(), unset);
-        auto material_id = [&](uint32_t index) {
-            if (gpu_material[index] == unset) {
-                gpu_material[index] = static_cast<uint32_t>(m_materials.size());
-                m_materials.push_back(MakeGpuMaterialForScene(primitive.materials[index], primitive.object_id));
-            }
-            return gpu_material[index];
-        };
-
-        const uint32_t base = static_cast<uint32_t>(m_vertices.size());
-        m_vertices.insert(m_vertices.end(), chunk.vertices.begin(), chunk.vertices.end());
-        const size_t first_index = m_indices.size();
-        const size_t first_triangle = m_triangles.size();
-        m_indices.resize(first_index + 3 * chunk.faces.size());
-        m_triangles.resize(first_triangle + chunk.faces.size());
-        uint32_t* indices = m_indices.data() + first_index;
-        ChVulkanRTGpuTriangle* triangles = m_triangles.data() + first_triangle;
-        for (const auto& face : chunk.faces) {
-            const uint32_t i0 = base + face[0], i1 = base + face[1], i2 = base + face[2];
-            *indices++ = i0;
-            *indices++ = i1;
-            *indices++ = i2;
-            *triangles++ = ChVulkanRTGpuTriangle{i0, i1, i2, material_id(face[3])};
+        // The primitive's material table, the entries its triangles do not use left blank
+        const uint32_t base = static_cast<uint32_t>(m_materials.size());
+        for (size_t i = 0; i < primitive.materials.size(); ++i) {
+            const bool used = i < chunk.used_materials.size() && chunk.used_materials[i];
+            m_materials.push_back(used ? MakeGpuMaterialForScene(primitive.materials[i], primitive.object_id) : ChVulkanRTGpuMaterial{});
         }
+        m_instances.push_back({&chunk, primitive.frame, base});
     }
 
-    // Forget packed meshes the last scene build did not use.
+    void ReleaseChunk(MeshChunk& chunk) {
+        if (chunk.blas)
+            m_device->vkDestroyAccelerationStructureKHR(m_device->GetDevice(), chunk.blas, nullptr);
+        chunk.blas = VK_NULL_HANDLE;
+        chunk.blas_address = 0;
+        chunk.buffer.reset();
+    }
+
+    // Forget packed meshes the last scene build did not use. Every submission is waited on, so the GPU no longer
+    // reads them.
     void EvictMeshChunks() {
-        for (auto it = m_mesh_chunks.begin(); it != m_mesh_chunks.end();)
-            it = it->second.last_build != m_build_count ? m_mesh_chunks.erase(it) : std::next(it);
+        for (auto it = m_mesh_chunks.begin(); it != m_mesh_chunks.end();) {
+            if (it->second.last_build != m_build_count) {
+                ReleaseChunk(it->second);
+                it = m_mesh_chunks.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     void BuildScene(const std::shared_ptr<ChVulkanRTScene>& scene) {
@@ -3122,14 +3130,13 @@ struct ChVulkanRTGpuRenderer {
         m_indices.clear();
         m_triangles.clear();
         m_materials.clear();
-        m_textures.clear();
-        m_texture_pixels.clear();
-        m_texture_ids.clear();
-        m_texture_has_alpha.clear();
         m_lights.clear();
+        m_instances.clear();
+        m_pending_chunks.clear();
         m_scene_has_transparency = false;
         m_scene_data = ChVulkanRTGpuSceneData{};
 
+        // Textures are kept from build to build, so a scene that changes does not load its images again.
         const auto& background = scene->GetBackground();
         const uint32_t env_texture_id =
             background.mode == BackgroundMode::ENVIRONMENT_MAP
@@ -3172,169 +3179,311 @@ struct ChVulkanRTGpuRenderer {
 
         EvictMeshChunks();
 
-        if (background.mode == BackgroundMode::ENVIRONMENT_MAP)
-            BuildEnvironmentCDF(background.env_tex, env_texture_id);
+        // The environment's sampling tables are appended to the texture pixels once per environment texture
+        if (background.mode == BackgroundMode::ENVIRONMENT_MAP) {
+            if (m_env_cdf_file != background.env_tex || m_env_cdf_texture != env_texture_id) {
+                BuildEnvironmentCDF(background.env_tex, env_texture_id);
+                m_env_cdf_file = background.env_tex;
+                m_env_cdf_texture = env_texture_id;
+                m_env_cdf_offsets[0] = m_scene_data.background0[3];
+                m_env_cdf_offsets[1] = m_scene_data.background1[3];
+            }
+            m_scene_data.background0[3] = m_env_cdf_offsets[0];
+            m_scene_data.background1[3] = m_env_cdf_offsets[1];
+        }
 
-        if (m_vertices.empty() || m_triangles.empty())
+        // The triangles of boxes, spheres and cylinders, already in world coordinates, as one more mesh, built
+        // again every time
+        if (!m_triangles.empty()) {
+            m_loose.vertices.swap(m_vertices);
+            m_loose.indices.swap(m_indices);
+            m_loose.faces.swap(m_triangles);
+            m_loose.num_vertices = static_cast<uint32_t>(m_loose.vertices.size());
+            m_loose.num_faces = static_cast<uint32_t>(m_loose.faces.size());
+            m_pending_chunks.push_back(&m_loose);
+            m_instances.push_back({&m_loose, ChFrame<double>(), 0u});
+        }
+
+        if (m_instances.empty()) {
+            if (m_tlas)
+                m_device->vkDestroyAccelerationStructureKHR(m_device->GetDevice(), m_tlas, nullptr);
+            m_tlas = VK_NULL_HANDLE;
             return;
+        }
 
-        UploadVector(m_vertex_buffer,
-                     m_vertices,
-                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-        UploadVector(m_index_buffer,
-                     m_indices,
-                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        BuildMeshChunks(m_pending_chunks);
+
         if (m_textures.empty())
             m_textures.push_back(ChVulkanRTGpuTexture{});
         if (m_texture_pixels.empty())
             m_texture_pixels.push_back(0xffffffffu);
         m_scene_data.counts[3] = static_cast<uint32_t>(m_textures.size());
 
-        UploadVector(m_triangle_buffer, m_triangles, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
         UploadVector(m_material_buffer, m_materials, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        UploadVector(m_texture_buffer, m_textures, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        UploadVector(m_texture_pixel_buffer, m_texture_pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        if (m_textures.size() != m_uploaded_textures || m_texture_pixels.size() != m_uploaded_texture_pixels) {
+            UploadVector(m_texture_buffer, m_textures, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            UploadVector(m_texture_pixel_buffer, m_texture_pixels, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            m_uploaded_textures = m_textures.size();
+            m_uploaded_texture_pixels = m_texture_pixels.size();
+        }
         UploadVector(m_light_buffer, m_lights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
         m_scene_data.ambient[3] = m_scene_has_transparency ? 1.f : 0.f;
         const std::vector<ChVulkanRTGpuSceneData> scene_upload = {m_scene_data};
         UploadVector(m_scene_buffer, scene_upload, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        BuildAccelerationStructures();
+        BuildTopLevelAccelerationStructure();
+        m_descriptors_dirty = true;
     }
 
-    void BuildAccelerationStructures() {
-        VkDevice device = m_device->GetDevice();
-        if (m_tlas) {
-            m_device->vkDestroyAccelerationStructureKHR(device, m_tlas, nullptr);
-            m_tlas = VK_NULL_HANDLE;
+    VkDeviceSize ScratchAlignment() {
+        if (!m_scratch_alignment) {
+            VkPhysicalDeviceAccelerationStructurePropertiesKHR as_props = {};
+            as_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR;
+            VkPhysicalDeviceProperties2 props = {};
+            props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            props.pNext = &as_props;
+            vkGetPhysicalDeviceProperties2(m_device->GetPhysicalDevice(), &props);
+            m_scratch_alignment = std::max<VkDeviceSize>(1, as_props.minAccelerationStructureScratchOffsetAlignment);
         }
-        if (m_blas) {
-            m_device->vkDestroyAccelerationStructureKHR(device, m_blas, nullptr);
-            m_blas = VK_NULL_HANDLE;
-        }
+        return m_scratch_alignment;
+    }
 
+    // Triangles of a mesh whose buffer starts at `base`. Geometry is left non-opaque: instances are forced opaque
+    // when the scene holds nothing that transmits light, so a mesh's structure does not depend on the rest of the
+    // scene.
+    static VkAccelerationStructureGeometryKHR ChunkGeometry(const MeshChunk& chunk, VkDeviceAddress base) {
         VkAccelerationStructureGeometryTrianglesDataKHR triangles = {};
         triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
         triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-        triangles.vertexData.deviceAddress = m_vertex_buffer->GetDeviceAddress();
+        triangles.vertexData.deviceAddress = base;
         triangles.vertexStride = sizeof(ChVulkanRTGpuVertex);
-        triangles.maxVertex = static_cast<uint32_t>(m_vertices.size() - 1);
+        triangles.maxVertex = chunk.num_vertices > 0 ? chunk.num_vertices - 1 : 0;
         triangles.indexType = VK_INDEX_TYPE_UINT32;
-        triangles.indexData.deviceAddress = m_index_buffer->GetDeviceAddress();
+        triangles.indexData.deviceAddress = base ? base + chunk.index_offset : 0;
 
         VkAccelerationStructureGeometryKHR geometry = {};
         geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
         geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-        // Use opaque AS geometry whenever possible.  Fully opaque scenes then
-        // get the fast OptiX-style shadow path (terminate on first hit, skip
-        // closest-hit shading).  Scenes with opacity still build non-opaque
-        // geometry so a future any-hit shadow path can inspect alpha masks.
-        geometry.flags = m_scene_has_transparency ? 0 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+        geometry.flags = 0;
         geometry.geometry.triangles = triangles;
+        return geometry;
+    }
 
+    static VkAccelerationStructureBuildGeometryInfoKHR BlasBuildInfo(const VkAccelerationStructureGeometryKHR* geometry) {
         VkAccelerationStructureBuildGeometryInfoKHR build_info = {};
         build_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
         build_info.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
         build_info.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
         build_info.geometryCount = 1;
-        build_info.pGeometries = &geometry;
+        build_info.pGeometries = geometry;
         build_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-
-        const uint32_t primitive_count = static_cast<uint32_t>(m_triangles.size());
-        VkAccelerationStructureBuildSizesInfoKHR build_sizes = {};
-        build_sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-        m_device->vkGetAccelerationStructureBuildSizesKHR(device,
-                                                          VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                          &build_info,
-                                                          &primitive_count,
-                                                          &build_sizes);
-
-        // The storage and scratch buffers are reused while large enough: the old structure is destroyed
-        // above, and the previous frame's work has completed.
-        if (!m_blas_buffer || m_blas_buffer->GetSize() < build_sizes.accelerationStructureSize) {
-            m_blas_buffer.reset();
-            m_blas_buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                               build_sizes.accelerationStructureSize + build_sizes.accelerationStructureSize / 4,
-                                                               VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        }
-        VkAccelerationStructureCreateInfoKHR as_create = {};
-        as_create.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-        as_create.buffer = m_blas_buffer->GetBuffer();
-        as_create.size = build_sizes.accelerationStructureSize;
-        as_create.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-        CH_VULKAN_CHECK(m_device->vkCreateAccelerationStructureKHR(device, &as_create, nullptr, &m_blas));
-
-        if (!m_blas_scratch || m_blas_scratch->GetSize() < build_sizes.buildScratchSize) {
-            m_blas_scratch.reset();
-            m_blas_scratch = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                                build_sizes.buildScratchSize + build_sizes.buildScratchSize / 4,
-                                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        }
-        build_info.dstAccelerationStructure = m_blas;
-        build_info.scratchData.deviceAddress = m_blas_scratch->GetDeviceAddress();
-
-        VkAccelerationStructureBuildRangeInfoKHR range = {};
-        range.primitiveCount = primitive_count;
-        const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = &range;
-
-        BeginCommands();
-        m_device->vkCmdBuildAccelerationStructuresKHR(m_command_buffer, 1, &build_info, &range_ptr);
-        VkMemoryBarrier barrier = {};
-        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-        barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-        vkCmdPipelineBarrier(m_command_buffer,
-                             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                             VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                             0,
-                             1,
-                             &barrier,
-                             0,
-                             nullptr,
-                             0,
-                             nullptr);
-        EndSubmitWait();
-
-        BuildTopLevelAccelerationStructure();
-        m_descriptors_dirty = true;
+        return build_info;
     }
 
+    // Upload new meshes and build their bottom-level structures, in batches that bound the staging and scratch
+    // memory; the meshes' host copies are released after.
+    void BuildMeshChunks(const std::vector<MeshChunk*>& chunks) {
+        if (chunks.empty())
+            return;
+        VkDevice device = m_device->GetDevice();
+        const VkDeviceSize scratch_alignment = ScratchAlignment();
+
+        // Lay out each mesh's buffer, and create the buffer and its structure
+        for (MeshChunk* chunk : chunks) {
+            chunk->index_offset = AlignUpVk(sizeof(ChVulkanRTGpuVertex) * VkDeviceSize(chunk->num_vertices), 16);
+            chunk->face_offset = AlignUpVk(chunk->index_offset + sizeof(uint32_t) * 3 * VkDeviceSize(chunk->num_faces), 16);
+            chunk->data_size = chunk->face_offset + sizeof(ChVulkanRTGpuTriangle) * VkDeviceSize(chunk->num_faces);
+            chunk->blas_offset = AlignUpVk(chunk->data_size, 256);
+
+            const VkAccelerationStructureGeometryKHR geometry = ChunkGeometry(*chunk, 0);
+            const VkAccelerationStructureBuildGeometryInfoKHR build_info = BlasBuildInfo(&geometry);
+            VkAccelerationStructureBuildSizesInfoKHR sizes = {};
+            sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+            m_device->vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, &chunk->num_faces, &sizes);
+            chunk->scratch_size = AlignUpVk(sizes.buildScratchSize, scratch_alignment);
+
+            if (chunk->blas)
+                m_device->vkDestroyAccelerationStructureKHR(device, chunk->blas, nullptr);
+            chunk->blas = VK_NULL_HANDLE;
+            const VkDeviceSize size = chunk->blas_offset + sizes.accelerationStructureSize;
+            if (!chunk->buffer || chunk->buffer->GetSize() < size) {
+                // The loose triangles are built again every time, so their buffer gets headroom to be reused
+                const VkDeviceSize allocation = chunk == &m_loose ? size + size / 4 : size;
+                chunk->buffer.reset();
+                chunk->buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                   allocation,
+                                                                   VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                                                                       VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            }
+            VkAccelerationStructureCreateInfoKHR as_create = {};
+            as_create.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+            as_create.buffer = chunk->buffer->GetBuffer();
+            as_create.offset = chunk->blas_offset;
+            as_create.size = sizes.accelerationStructureSize;
+            as_create.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            CH_VULKAN_CHECK(m_device->vkCreateAccelerationStructureKHR(device, &as_create, nullptr, &chunk->blas));
+        }
+
+        // Batches of meshes whose data and scratch each fit in the limit (a larger mesh gets a batch of its own)
+        constexpr VkDeviceSize batch_limit = VkDeviceSize(256) << 20;
+        size_t first = 0;
+        while (first < chunks.size()) {
+            size_t last = first;
+            VkDeviceSize staged_size = 0, scratch_size = 0;
+            while (last < chunks.size()) {
+                const VkDeviceSize data = AlignUpVk(chunks[last]->data_size, 16);
+                const VkDeviceSize scratch = chunks[last]->scratch_size;
+                if (last > first && (staged_size + data > batch_limit || scratch_size + scratch > batch_limit))
+                    break;
+                staged_size += data;
+                scratch_size += scratch;
+                ++last;
+            }
+
+            if (!m_upload_staging || m_upload_staging->GetSize() < staged_size) {
+                m_upload_staging.reset();
+                m_upload_staging = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                      staged_size + staged_size / 2,
+                                                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            }
+            if (!m_blas_scratch || m_blas_scratch->GetSize() < scratch_size) {
+                m_blas_scratch.reset();
+                m_blas_scratch = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                    scratch_size + scratch_size / 4,
+                                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            }
+            char* staging = static_cast<char*>(m_upload_staging->Map());
+            const VkDeviceAddress scratch_base = AlignUpVk(m_blas_scratch->GetDeviceAddress(), scratch_alignment);
+            if (scratch_base + scratch_size > m_blas_scratch->GetDeviceAddress() + m_blas_scratch->GetSize()) {
+                // An unaligned scratch buffer: make room for the alignment
+                m_blas_scratch.reset();
+                m_blas_scratch = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                    scratch_size + scratch_alignment,
+                                                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                continue;
+            }
+
+            const size_t count = last - first;
+            std::vector<VkAccelerationStructureGeometryKHR> geometries(count);
+            std::vector<VkAccelerationStructureBuildGeometryInfoKHR> infos(count);
+            std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges(count);
+            std::vector<const VkAccelerationStructureBuildRangeInfoKHR*> range_ptrs(count);
+
+            BeginCommands();
+            VkDeviceSize staged = 0, scratch_offset = 0;
+            for (size_t n = 0; n < count; ++n) {
+                MeshChunk& chunk = *chunks[first + n];
+                char* dst = staging + staged;
+                std::memcpy(dst, chunk.vertices.data(), sizeof(ChVulkanRTGpuVertex) * chunk.vertices.size());
+                std::memcpy(dst + chunk.index_offset, chunk.indices.data(), sizeof(uint32_t) * chunk.indices.size());
+                std::memcpy(dst + chunk.face_offset, chunk.faces.data(), sizeof(ChVulkanRTGpuTriangle) * chunk.faces.size());
+                VkBufferCopy region = {};
+                region.srcOffset = staged;
+                region.dstOffset = 0;
+                region.size = chunk.data_size;
+                vkCmdCopyBuffer(m_command_buffer, m_upload_staging->GetBuffer(), chunk.buffer->GetBuffer(), 1, &region);
+                staged += AlignUpVk(chunk.data_size, 16);
+
+                geometries[n] = ChunkGeometry(chunk, chunk.buffer->GetDeviceAddress());
+                infos[n] = BlasBuildInfo(&geometries[n]);
+                infos[n].dstAccelerationStructure = chunk.blas;
+                infos[n].scratchData.deviceAddress = scratch_base + scratch_offset;
+                scratch_offset += chunk.scratch_size;
+                ranges[n] = {};
+                ranges[n].primitiveCount = chunk.num_faces;
+                range_ptrs[n] = &ranges[n];
+            }
+
+            VkMemoryBarrier upload_barrier = {};
+            upload_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            upload_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            upload_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(m_command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1, &upload_barrier, 0,
+                                 nullptr, 0, nullptr);
+            m_device->vkCmdBuildAccelerationStructuresKHR(m_command_buffer, static_cast<uint32_t>(count), infos.data(), range_ptrs.data());
+            VkMemoryBarrier build_barrier = {};
+            build_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            build_barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+            build_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+            vkCmdPipelineBarrier(m_command_buffer, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1,
+                                 &build_barrier, 0, nullptr, 0, nullptr);
+            EndSubmitWait();
+            first = last;
+        }
+
+        for (MeshChunk* chunk : chunks) {
+            VkAccelerationStructureDeviceAddressInfoKHR addr_info = {};
+            addr_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+            addr_info.accelerationStructure = chunk->blas;
+            chunk->blas_address = m_device->vkGetAccelerationStructureDeviceAddressKHR(device, &addr_info);
+            // The loose triangles' vectors are reused as the next build's lists; the meshes' are not needed again
+            if (chunk == &m_loose) {
+                chunk->vertices.clear();
+                chunk->indices.clear();
+                chunk->faces.clear();
+            } else {
+                std::vector<ChVulkanRTGpuVertex>().swap(chunk->vertices);
+                std::vector<uint32_t>().swap(chunk->indices);
+                std::vector<ChVulkanRTGpuTriangle>().swap(chunk->faces);
+            }
+        }
+    }
+
+    // One instance per mesh placed in the scene, with the table the hit shaders find each instance's vertices,
+    // triangles and materials by. Rebuilt with every scene build, which is cheap: it holds only the instances.
     void BuildTopLevelAccelerationStructure() {
         VkDevice device = m_device->GetDevice();
-        VkAccelerationStructureDeviceAddressInfoKHR addr_info = {};
-        addr_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-        addr_info.accelerationStructure = m_blas;
-        const VkDeviceAddress blas_addr = m_device->vkGetAccelerationStructureDeviceAddressKHR(device, &addr_info);
+        const uint32_t count = static_cast<uint32_t>(m_instances.size());
+        const VkGeometryInstanceFlagsKHR flags =
+            VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR | (m_scene_has_transparency ? 0 : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR);
 
-        VkAccelerationStructureInstanceKHR instance = {};
-        instance.transform.matrix[0][0] = 1.f;
-        instance.transform.matrix[1][1] = 1.f;
-        instance.transform.matrix[2][2] = 1.f;
-        instance.instanceCustomIndex = 0;
-        instance.mask = 0xff;
-        instance.instanceShaderBindingTableRecordOffset = 0;
-        instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        instance.accelerationStructureReference = blas_addr;
+        std::vector<VkAccelerationStructureInstanceKHR> instances(count);
+        m_gpu_instances.resize(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            const MeshInstance& mesh = m_instances[i];
+            const ChMatrix33<>& rot = mesh.frame.GetRotMat();
+            const ChVector3d& pos = mesh.frame.GetPos();
+            VkAccelerationStructureInstanceKHR& instance = instances[i];
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c)
+                    instance.transform.matrix[r][c] = static_cast<float>(rot(r, c));
+                instance.transform.matrix[r][3] = static_cast<float>(pos[r]);
+            }
+            instance.instanceCustomIndex = i;
+            instance.mask = 0xff;
+            instance.instanceShaderBindingTableRecordOffset = 0;
+            instance.flags = flags;
+            instance.accelerationStructureReference = mesh.chunk->blas_address;
 
-        m_instance_buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                               sizeof(instance),
-                                                               VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-                                                                   VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        std::memcpy(m_instance_buffer->Map(), &instance, sizeof(instance));
-        m_instance_buffer->Unmap();
+            const VkDeviceAddress base = mesh.chunk->buffer->GetDeviceAddress();
+            m_gpu_instances[i] = ChVulkanRTGpuInstance{base, base + mesh.chunk->face_offset, mesh.material_base, {0u, 0u, 0u}};
+        }
+        UploadVector(m_instance_table_buffer, m_gpu_instances, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-        VkAccelerationStructureGeometryInstancesDataKHR instances = {};
-        instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
-        instances.arrayOfPointers = VK_FALSE;
-        instances.data.deviceAddress = m_instance_buffer->GetDeviceAddress();
+        const VkDeviceSize instance_bytes = sizeof(VkAccelerationStructureInstanceKHR) * VkDeviceSize(count);
+        if (!m_instance_buffer || m_instance_buffer->GetSize() < instance_bytes) {
+            m_instance_buffer.reset();
+            m_instance_buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                   instance_bytes + instance_bytes / 4,
+                                                                   VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                                                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
+        std::memcpy(m_instance_buffer->Map(), instances.data(), static_cast<size_t>(instance_bytes));
+
+        VkAccelerationStructureGeometryInstancesDataKHR instances_data = {};
+        instances_data.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+        instances_data.arrayOfPointers = VK_FALSE;
+        instances_data.data.deviceAddress = m_instance_buffer->GetDeviceAddress();
 
         VkAccelerationStructureGeometryKHR geometry = {};
         geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
         geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
-        geometry.geometry.instances = instances;
+        geometry.geometry.instances = instances_data;
 
         VkAccelerationStructureBuildGeometryInfoKHR build_info = {};
         build_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
@@ -3344,19 +3493,22 @@ struct ChVulkanRTGpuRenderer {
         build_info.pGeometries = &geometry;
         build_info.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
 
-        const uint32_t primitive_count = 1;
         VkAccelerationStructureBuildSizesInfoKHR build_sizes = {};
         build_sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-        m_device->vkGetAccelerationStructureBuildSizesKHR(device,
-                                                          VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                          &build_info,
-                                                          &primitive_count,
-                                                          &build_sizes);
+        m_device->vkGetAccelerationStructureBuildSizesKHR(device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info, &count, &build_sizes);
 
-        m_tlas_buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                           build_sizes.accelerationStructureSize,
-                                                           VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // The storage and scratch buffers are reused while large enough: every submission is waited on, so the
+        // previous structure is no longer read.
+        if (m_tlas)
+            m_device->vkDestroyAccelerationStructureKHR(device, m_tlas, nullptr);
+        m_tlas = VK_NULL_HANDLE;
+        if (!m_tlas_buffer || m_tlas_buffer->GetSize() < build_sizes.accelerationStructureSize) {
+            m_tlas_buffer.reset();
+            m_tlas_buffer = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                               build_sizes.accelerationStructureSize + build_sizes.accelerationStructureSize / 4,
+                                                               VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
         VkAccelerationStructureCreateInfoKHR as_create = {};
         as_create.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
         as_create.buffer = m_tlas_buffer->GetBuffer();
@@ -3364,15 +3516,20 @@ struct ChVulkanRTGpuRenderer {
         as_create.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
         CH_VULKAN_CHECK(m_device->vkCreateAccelerationStructureKHR(device, &as_create, nullptr, &m_tlas));
 
-        auto scratch = std::make_unique<ChVulkanRTBuffer>(m_device,
-                                                          build_sizes.buildScratchSize,
-                                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        const VkDeviceSize scratch_alignment = ScratchAlignment();
+        const VkDeviceSize scratch_needed = build_sizes.buildScratchSize + scratch_alignment;
+        if (!m_tlas_scratch || m_tlas_scratch->GetSize() < scratch_needed) {
+            m_tlas_scratch.reset();
+            m_tlas_scratch = std::make_unique<ChVulkanRTBuffer>(m_device,
+                                                                scratch_needed + scratch_needed / 4,
+                                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        }
         build_info.dstAccelerationStructure = m_tlas;
-        build_info.scratchData.deviceAddress = scratch->GetDeviceAddress();
+        build_info.scratchData.deviceAddress = AlignUpVk(m_tlas_scratch->GetDeviceAddress(), scratch_alignment);
 
         VkAccelerationStructureBuildRangeInfoKHR range = {};
-        range.primitiveCount = primitive_count;
+        range.primitiveCount = count;
         const VkAccelerationStructureBuildRangeInfoKHR* range_ptr = &range;
 
         BeginCommands();
@@ -3450,35 +3607,36 @@ struct ChVulkanRTGpuRenderer {
         put(23, volume->phase_b);
         put(24, volume->phase_c);
 
-        auto unorm16 = [](float v) { return static_cast<uint32_t>(std::lround(std::clamp(v, 0.f, 1.f) * 65535.f)); };
-        for (size_t i = 0; i < count; ++i) {
-            const float t = volume->sun_transmittance.empty() ? 1.f : volume->sun_transmittance[i];
-            const float v = volume->sun_visibility.empty() ? 1.f : volume->sun_visibility[i];
+        // Rounded to nearest, as std::lround would, without its cost: the grid has a million voxels or more
+        auto unorm16 = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.f, 1.f) * 65535.f + 0.5f); };
+        const bool has_transmittance = !volume->sun_transmittance.empty();
+        const bool has_visibility = !volume->sun_visibility.empty();
+#pragma omp parallel for schedule(static) if (count >= 65536)
+        for (int64_t n = 0; n < static_cast<int64_t>(count); ++n) {
+            const size_t i = static_cast<size_t>(n);
+            const float t = has_transmittance ? volume->sun_transmittance[i] : 1.f;
+            const float v = has_visibility ? volume->sun_visibility[i] : 1.f;
             put(static_cast<uint32_t>(voxel_offset + 2 * i), std::max(0.f, volume->extinction[i]));
             words[voxel_offset + 2 * i + 1] = unorm16(t) | (unorm16(v) << 16);
         }
 
-        // Largest extinction per brick, over the brick and a one-voxel border
-        std::vector<float> brick_max(size_t(bx) * by * bz, 0.f);
-        for (uint32_t k = 0; k < nz; ++k)
-            for (uint32_t j = 0; j < ny; ++j)
-                for (uint32_t i = 0; i < nx; ++i) {
-                    const float sigma = volume->extinction[i + size_t(nx) * (j + size_t(ny) * k)];
-                    if (sigma <= 0.f)
-                        continue;
-                    // Bricks whose bordered range holds this voxel
-                    const uint32_t i0 = (i > 0 ? i - 1 : 0) / B, i1 = std::min(bx - 1, (i + 1) / B);
-                    const uint32_t j0 = (j > 0 ? j - 1 : 0) / B, j1 = std::min(by - 1, (j + 1) / B);
-                    const uint32_t k0 = (k > 0 ? k - 1 : 0) / B, k1 = std::min(bz - 1, (k + 1) / B);
-                    for (uint32_t kb = k0; kb <= k1; ++kb)
-                        for (uint32_t jb = j0; jb <= j1; ++jb)
-                            for (uint32_t ib = i0; ib <= i1; ++ib) {
-                                float& m = brick_max[ib + size_t(bx) * (jb + size_t(by) * kb)];
-                                m = std::max(m, sigma);
-                            }
+        // Largest extinction per brick, over the brick and a one-voxel border, each brick from its own range
+        const int64_t num_bricks = int64_t(bx) * by * bz;
+#pragma omp parallel for schedule(dynamic, 16) if (count >= 65536)
+        for (int64_t b = 0; b < num_bricks; ++b) {
+            const uint32_t ib = static_cast<uint32_t>(b % bx), jb = static_cast<uint32_t>((b / bx) % by), kb = static_cast<uint32_t>(b / (int64_t(bx) * by));
+            const uint32_t i0 = ib * B > 0 ? ib * B - 1 : 0, i1 = std::min(nx - 1, ib * B + B);
+            const uint32_t j0 = jb * B > 0 ? jb * B - 1 : 0, j1 = std::min(ny - 1, jb * B + B);
+            const uint32_t k0 = kb * B > 0 ? kb * B - 1 : 0, k1 = std::min(nz - 1, kb * B + B);
+            float m = 0.f;
+            for (uint32_t k = k0; k <= k1; ++k)
+                for (uint32_t j = j0; j <= j1; ++j) {
+                    const float* row = &volume->extinction[size_t(nx) * (j + size_t(ny) * k)];
+                    for (uint32_t i = i0; i <= i1; ++i)
+                        m = std::max(m, row[i]);
                 }
-        for (size_t b = 0; b < brick_max.size(); ++b)
-            put(static_cast<uint32_t>(brick_offset + b), brick_max[b]);
+            put(static_cast<uint32_t>(brick_offset + b), m);
+        }
 
         UploadVector(m_volume_buffer, words, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     }
@@ -3490,8 +3648,7 @@ struct ChVulkanRTGpuRenderer {
         as_info.pAccelerationStructures = &m_tlas;
 
         VkDescriptorBufferInfo material_info = {m_material_buffer->GetBuffer(), 0, m_material_buffer->GetSize()};
-        VkDescriptorBufferInfo vertex_info = {m_vertex_buffer->GetBuffer(), 0, m_vertex_buffer->GetSize()};
-        VkDescriptorBufferInfo triangle_info = {m_triangle_buffer->GetBuffer(), 0, m_triangle_buffer->GetSize()};
+        VkDescriptorBufferInfo instance_info = {m_instance_table_buffer->GetBuffer(), 0, m_instance_table_buffer->GetSize()};
         VkDescriptorBufferInfo output_info = {m_output_buffer->GetBuffer(), 0, m_output_buffer->GetSize()};
         VkDescriptorBufferInfo texture_info = {m_texture_buffer->GetBuffer(), 0, m_texture_buffer->GetSize()};
         VkDescriptorBufferInfo texture_pixel_info = {m_texture_pixel_buffer->GetBuffer(), 0, m_texture_pixel_buffer->GetSize()};
@@ -3499,7 +3656,7 @@ struct ChVulkanRTGpuRenderer {
         VkDescriptorBufferInfo scene_info = {m_scene_buffer->GetBuffer(), 0, m_scene_buffer->GetSize()};
         VkDescriptorBufferInfo volume_info = {m_volume_buffer->GetBuffer(), 0, m_volume_buffer->GetSize()};
 
-        std::array<VkWriteDescriptorSet, 10> writes = {};
+        std::array<VkWriteDescriptorSet, 9> writes = {};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &as_info;
         writes[0].dstSet = m_descriptor_set;
@@ -3517,49 +3674,43 @@ struct ChVulkanRTGpuRenderer {
         writes[2].dstBinding = 2;
         writes[2].descriptorCount = 1;
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[2].pBufferInfo = &vertex_info;
+        writes[2].pBufferInfo = &instance_info;
         writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[3].dstSet = m_descriptor_set;
-        writes[3].dstBinding = 3;
+        writes[3].dstBinding = 4;
         writes[3].descriptorCount = 1;
         writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[3].pBufferInfo = &triangle_info;
+        writes[3].pBufferInfo = &output_info;
         writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[4].dstSet = m_descriptor_set;
-        writes[4].dstBinding = 4;
+        writes[4].dstBinding = 5;
         writes[4].descriptorCount = 1;
         writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[4].pBufferInfo = &output_info;
+        writes[4].pBufferInfo = &texture_info;
         writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[5].dstSet = m_descriptor_set;
-        writes[5].dstBinding = 5;
+        writes[5].dstBinding = 6;
         writes[5].descriptorCount = 1;
         writes[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[5].pBufferInfo = &texture_info;
+        writes[5].pBufferInfo = &texture_pixel_info;
         writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[6].dstSet = m_descriptor_set;
-        writes[6].dstBinding = 6;
+        writes[6].dstBinding = 7;
         writes[6].descriptorCount = 1;
         writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[6].pBufferInfo = &texture_pixel_info;
+        writes[6].pBufferInfo = &light_info;
         writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[7].dstSet = m_descriptor_set;
-        writes[7].dstBinding = 7;
+        writes[7].dstBinding = 8;
         writes[7].descriptorCount = 1;
         writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[7].pBufferInfo = &light_info;
+        writes[7].pBufferInfo = &scene_info;
         writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[8].dstSet = m_descriptor_set;
-        writes[8].dstBinding = 8;
+        writes[8].dstBinding = 9;
         writes[8].descriptorCount = 1;
         writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[8].pBufferInfo = &scene_info;
-        writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[9].dstSet = m_descriptor_set;
-        writes[9].dstBinding = 9;
-        writes[9].descriptorCount = 1;
-        writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[9].pBufferInfo = &volume_info;
+        writes[8].pBufferInfo = &volume_info;
         vkUpdateDescriptorSets(m_device->GetDevice(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         m_descriptors_dirty = false;
     }
@@ -3680,9 +3831,6 @@ struct ChVulkanRTGpuRenderer {
     bool m_scene_has_transparency = false;
     ChVulkanRTGpuSceneData m_scene_data{};
 
-    std::unique_ptr<ChVulkanRTBuffer> m_vertex_buffer;
-    std::unique_ptr<ChVulkanRTBuffer> m_index_buffer;
-    std::unique_ptr<ChVulkanRTBuffer> m_triangle_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_material_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_texture_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_texture_pixel_buffer;
@@ -3694,16 +3842,26 @@ struct ChVulkanRTGpuRenderer {
     bool m_volume_active = false;
     std::unique_ptr<ChVulkanRTBuffer> m_output_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_output_staging_buffer;
-    std::unique_ptr<ChVulkanRTBuffer> m_blas_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_blas_scratch;    ///< reused bottom-level build scratch
     std::unique_ptr<ChVulkanRTBuffer> m_upload_staging;  ///< reused, mapped staging for scene uploads
-    std::unordered_map<const std::vector<ChVulkanRTTriangle>*, MeshChunk> m_mesh_chunks;  ///< packed meshes
+    std::unordered_map<const std::vector<ChVulkanRTTriangle>*, MeshChunk> m_mesh_chunks;  ///< meshes on the GPU
+    MeshChunk m_loose;                                    ///< the triangles of boxes, spheres and cylinders
+    std::vector<MeshChunk*> m_pending_chunks;             ///< meshes the current build uploads
+    std::vector<MeshInstance> m_instances;
+    std::vector<ChVulkanRTGpuInstance> m_gpu_instances;
     uint64_t m_build_count = 0;
+    VkDeviceSize m_scratch_alignment = 0;
+    size_t m_uploaded_textures = 0;        ///< textures in the texture buffer
+    size_t m_uploaded_texture_pixels = 0;  ///< words in the texture pixel buffer
+    std::string m_env_cdf_file;            ///< environment texture whose sampling tables are in the texture pixels
+    uint32_t m_env_cdf_texture = CH_VKRT_INVALID_TEXTURE;
+    float m_env_cdf_offsets[2] = {0.f, 0.f};
+    std::unique_ptr<ChVulkanRTBuffer> m_instance_table_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_tlas_buffer;
+    std::unique_ptr<ChVulkanRTBuffer> m_tlas_scratch;
     std::unique_ptr<ChVulkanRTBuffer> m_instance_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_sbt_buffer;
 
-    VkAccelerationStructureKHR m_blas = VK_NULL_HANDLE;
     VkAccelerationStructureKHR m_tlas = VK_NULL_HANDLE;
     VkCommandPool m_command_pool = VK_NULL_HANDLE;
     VkCommandBuffer m_command_buffer = VK_NULL_HANDLE;

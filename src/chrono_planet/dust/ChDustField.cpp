@@ -27,8 +27,13 @@ namespace planet {
 
 namespace {
 
-// Height cache entries kept before the cache is cleared
-constexpr size_t kMaxCachedHeights = 4000000;
+// Slots of the height cache along each axis, a power of two: the cache covers this many lattice points around any
+// point without collisions
+constexpr int kHeightCacheSide = 1024;
+
+// Rays per slice from which the Sun sweep splits each slice over a team. A slice is a few microseconds of work per
+// thousand rays, and the sweep synchronizes the team twice per slice.
+constexpr size_t kSweepParallelMinRays = 2048;
 
 // A sweep toward the Sun: slices across the dominant axis a of the direction, each voxel reading the point one
 // slice upstream, which lies off its own row by (off_b, off_c) voxels along the other two axes.
@@ -80,21 +85,20 @@ ChVector3d ChDustField::Position(const Particle& p, double time) const {
 }
 
 double ChDustField::LatticeHeight(int i, int j) {
-    const std::int64_t key = (static_cast<std::int64_t>(i) << 32) | static_cast<std::uint32_t>(j);
-    auto it = m_heights.find(key);
-    if (it != m_heights.end())
-        return it->second;
-    if (m_heights.size() >= kMaxCachedHeights)
-        m_heights.clear();
-    const float h = static_cast<float>(m_ground(i * m_lattice, j * m_lattice));
-    m_heights.emplace(key, h);
-    return h;
+    constexpr int mask = kHeightCacheSide - 1;
+    HeightSlot& slot = m_heights[size_t(i & mask) + size_t(kHeightCacheSide) * size_t(j & mask)];
+    if (slot.i != i || slot.j != j) {
+        slot.i = i;
+        slot.j = j;
+        slot.height = static_cast<float>(m_ground(i * m_lattice, j * m_lattice));
+    }
+    return slot.height;
 }
 
 double ChDustField::Ground(double x, double y) {
-    if (m_lattice != m_spec.voxel) {
+    if (m_lattice != m_spec.voxel || m_heights.empty()) {
         m_lattice = m_spec.voxel;
-        m_heights.clear();
+        m_heights.assign(size_t(kHeightCacheSide) * kHeightCacheSide, HeightSlot());
     }
     const double fx = x / m_lattice;
     const double fy = y / m_lattice;
@@ -271,6 +275,37 @@ void ChDustField::TraceTransmittance(Grid& g, const ChVector3d& sun_dir) {
     const Sweep s = MakeSweep(sun_dir.GetNormalized(), g.voxel);
     const int n[3] = {g.nx, g.ny, g.nz};
     const int nb = n[s.b], nc = n[s.c];
+
+    // The box of voxels holding any extinction. Dust usually fills a small part of the grid: light is not dimmed in
+    // the slices the sweep crosses before reaching the box, and extinction is sampled only inside it.
+    int lo[3] = {n[0], n[1], n[2]}, hi[3] = {-1, -1, -1};
+    for (int k = 0; k < g.nz; ++k)
+        for (int j = 0; j < g.ny; ++j) {
+            const float* row = &g.extinction[g.Index(0, j, k)];
+            int first = -1, last = -1;
+            for (int i = 0; i < g.nx; ++i)
+                if (row[i] > 0) {
+                    if (first < 0)
+                        first = i;
+                    last = i;
+                }
+            if (first < 0)
+                continue;
+            lo[0] = std::min(lo[0], first);
+            hi[0] = std::max(hi[0], last);
+            lo[1] = std::min(lo[1], j);
+            hi[1] = std::max(hi[1], j);
+            lo[2] = std::min(lo[2], k);
+            hi[2] = std::max(hi[2], k);
+        }
+    if (hi[0] < 0) {
+        std::fill(g.sun_transmittance.begin(), g.sun_transmittance.end(), 1.f);
+        return;
+    }
+    const int lo_a = lo[s.a], hi_a = hi[s.a];
+    // Points further than this outside the box along b or c interpolate only voxels outside it
+    const double lo_b = lo[s.b] - 1.0, hi_b = hi[s.b] + 1.0, lo_c = lo[s.c] - 1.0, hi_c = hi[s.c] + 1.0;
+
     auto index = [&](int ia, int ib, int ic) {
         int ijk[3];
         ijk[s.a] = ia;
@@ -282,6 +317,8 @@ void ChDustField::TraceTransmittance(Grid& g, const ChVector3d& sun_dir) {
     // out to the faces of the grid and none past them
     auto extinction = [&](int ia, double qb, double qc) {
         if (qb < -0.5 || qc < -0.5 || qb > nb - 0.5 || qc > nc - 0.5)
+            return 0.0;
+        if (ia < lo_a || ia > hi_a || qb < lo_b || qb > hi_b || qc < lo_c || qc > hi_c)
             return 0.0;
         qb = std::clamp(qb, 0.0, nb - 1.0);
         qc = std::clamp(qc, 0.0, nc - 1.0);
@@ -302,7 +339,7 @@ void ChDustField::TraceTransmittance(Grid& g, const ChVector3d& sun_dir) {
     std::vector<double> last(tau.size(), 0.0), last_next(tau.size());  // extinction at each ray's previous sample
     const double shift_b = -s.off_b, shift_c = -s.off_c;               // ray displacement per slice (voxels)
     std::int64_t floor_b = 0, floor_c = 0;
-    const bool par = util::parallelGrid(size_t(nb) * size_t(nc));
+    const bool par = size_t(nb) * size_t(nc) >= kSweepParallelMinRays;
 
     for (int t = 0; t < n[s.a]; ++t) {
         const int ia = s.step > 0 ? n[s.a] - 1 - t : t;
@@ -312,6 +349,15 @@ void ChDustField::TraceTransmittance(Grid& g, const ChVector3d& sun_dir) {
         const int db = static_cast<int>(fb_t - floor_b), dc = static_cast<int>(fc_t - floor_c);
         floor_b = fb_t;
         floor_c = fc_t;
+
+        // Before the sweep reaches the box, every ray is still clear
+        const bool before_box = s.step > 0 ? ia > hi_a : ia < lo_a;
+        if (before_box) {
+            for (int ic = 0; ic < nc; ++ic)
+                for (int ib = 0; ib < nb; ++ib)
+                    g.sun_transmittance[index(ia, ib, ic)] = 1.f;
+            continue;
+        }
 
 #pragma omp parallel for num_threads(util::parallelThreads()) schedule(static) if (par)
         for (int l = 0; l < wc; ++l) {
@@ -339,8 +385,12 @@ void ChDustField::TraceTransmittance(Grid& g, const ChVector3d& sun_dir) {
         for (int ic = 0; ic < nc; ++ic) {
             for (int ib = 0; ib < nb; ++ib) {
                 const size_t r00 = size_t(ib) + size_t(wb) * ic;  // ray (ib - 1, ic - 1)
-                const double depth = phase_b * phase_c * tau[r00] + (1 - phase_b) * phase_c * tau[r00 + 1] + phase_b * (1 - phase_c) * tau[r00 + wb] +
-                                     (1 - phase_b) * (1 - phase_c) * tau[r00 + wb + 1];
+                const double t00 = tau[r00], t10 = tau[r00 + 1], t01 = tau[r00 + wb], t11 = tau[r00 + wb + 1];
+                if (t00 == 0 && t10 == 0 && t01 == 0 && t11 == 0) {
+                    g.sun_transmittance[index(ia, ib, ic)] = 1.f;
+                    continue;
+                }
+                const double depth = phase_b * phase_c * t00 + (1 - phase_b) * phase_c * t10 + phase_b * (1 - phase_c) * t01 + (1 - phase_b) * (1 - phase_c) * t11;
                 g.sun_transmittance[index(ia, ib, ic)] = static_cast<float>(std::exp(-depth));
             }
         }
@@ -407,6 +457,7 @@ void ChDustField::TraceVisibility(Grid& g, const ChVector3d& sun_dir, const Heig
         }
     }
 
+#pragma omp parallel for num_threads(util::parallelThreads()) schedule(static) if (util::parallelGrid(g.sun_visibility.size()))
     for (int k = 0; k < nz; ++k) {
         const double z = g.origin.z() + (k + 0.5) * h;
         for (int j = 0; j < ny; ++j)

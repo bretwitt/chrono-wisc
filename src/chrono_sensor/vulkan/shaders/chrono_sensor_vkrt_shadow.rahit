@@ -1,5 +1,7 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
 
 struct GpuMaterial {
     vec4 diffuse;
@@ -44,11 +46,20 @@ struct ShadowPayload {
 layout(std430, set = 0, binding = 1) readonly buffer Materials {
     GpuMaterial materials[];
 };
-layout(std430, set = 0, binding = 2) readonly buffer Vertices {
-    GpuVertex vertices[];
+// A mesh instance, as in the closest-hit shader
+struct GpuInstance {
+    uvec2 vertices;
+    uvec2 triangles;
+    uvec4 material_base;
 };
-layout(std430, set = 0, binding = 3) readonly buffer Triangles {
-    GpuTriangle triangles[];
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer VertexRef {
+    GpuVertex v[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer TriangleRef {
+    GpuTriangle t[];
+};
+layout(std430, set = 0, binding = 2) readonly buffer Instances {
+    GpuInstance instances[];
 };
 layout(std430, set = 0, binding = 5) readonly buffer TextureTable {
     GpuTexture textures[];
@@ -160,17 +171,19 @@ float material_opacity(uint mat_id, vec2 uv, bool has_uv) {
 }
 
 void main() {
-    GpuTriangle tri = triangles[gl_PrimitiveID];
+    GpuInstance inst = instances[gl_InstanceCustomIndexEXT];
+    VertexRef vertices = VertexRef(inst.vertices);
+    GpuTriangle tri = TriangleRef(inst.triangles).t[gl_PrimitiveID];
     uint i0 = tri.index_material.x;
     uint i1 = tri.index_material.y;
     uint i2 = tri.index_material.z;
-    uint mat_id = tri.index_material.w;
+    uint mat_id = inst.material_base.x + tri.index_material.w;
 
     float b1 = attribs.x;
     float b2 = attribs.y;
     float b0 = 1.0 - b1 - b2;
-    vec2 uv = vertices[i0].uv.xy * b0 + vertices[i1].uv.xy * b1 + vertices[i2].uv.xy * b2;
-    bool has_uv = max(vertices[i0].uv.z, max(vertices[i1].uv.z, vertices[i2].uv.z)) > 0.5;
+    vec2 uv = vertices.v[i0].uv.xy * b0 + vertices.v[i1].uv.xy * b1 + vertices.v[i2].uv.xy * b2;
+    bool has_uv = max(vertices.v[i0].uv.z, max(vertices.v[i1].uv.z, vertices.v[i2].uv.z)) > 0.5;
 
     float opacity = material_opacity(mat_id, uv, has_uv);
     if (opacity >= 1.0 - 1e-5) {
