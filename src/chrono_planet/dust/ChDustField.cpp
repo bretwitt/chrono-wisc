@@ -167,7 +167,12 @@ void ChDustField::EmitFromWheels(const std::vector<WheelState>& wheels, double t
         // Slip loosens more soil only while the wheel drives, its rim sweeping the ground back faster than the wheel
         // advances. A braking wheel, its contact sliding forward, pushes soil ahead of it rather than throwing it.
         const double slip_speed = std::max(0.0, (v_bottom - u * v_bottom.Dot(u)).Dot(d_bottom));
-        const double mass_rate = m_wheel.bulk_density * wheel.width * m_wheel.loose_depth * (rim_speed + m_wheel.slip_gain * slip_speed);
+        double loose_depth = m_wheel.loose_depth;
+        if (m_wheel.scale_with_sinkage && m_wheel.grouser_height > 0) {
+            const double sinkage = std::max(0.0, ground - bottom.z());
+            loose_depth *= std::min(sinkage, m_wheel.grouser_height) / m_wheel.grouser_height;
+        }
+        const double mass_rate = m_wheel.bulk_density * wheel.width * loose_depth * (rim_speed + m_wheel.slip_gain * slip_speed);
 
         // Release angles, from the bottom of the wheel: from where the rim leaves the ground (the wheel sinks in by
         // r - (center height above ground)) up to the release limit

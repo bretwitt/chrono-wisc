@@ -1,7 +1,7 @@
 set(TESTS
     utest_PLANET_Generic
     utest_PLANET_Dust
-    utest_PLANET_Volume
+    utest_PLANET_Meshing
     utest_PLANET_MoonRegression
 )
 

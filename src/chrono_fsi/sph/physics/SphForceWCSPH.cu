@@ -1164,7 +1164,7 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
         const Real3 vAB = velMasA - velMasB;
         Real derivRho = Mass * dot(vAB, gradW);
         if (paramsD.use_delta_sph) {
-            Real Psi = paramsD.density_delta * paramsD.h * paramsD.Cs * volumej * 2. * (rhoPresMuA.x - rhoPresMuB.x) / (d * d + eps_hh);
+            Real Psi = paramsD.density_delta * paramsD.h * paramsD.Cs * volumej * 2 * (rhoPresMuA.x - rhoPresMuB.x) / (d * d + eps_hh);
             derivRho += Psi * dot(dist3, gradW);
         }
 
@@ -1201,7 +1201,7 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
             Real Pb = -0.333333333f * (TauXxYyZzB.x + TauXxYyZzB.y + TauXxYyZzB.z);
             Real Rb = Pb * tension_eps * invRhoBSq;
             Real fAB = W3h(kernelType, d, ooh) * w_ini_inv;
-            Real small_F = Mass * pow(fAB, 2.55) * (RaA + Rb);
+            Real small_F = Mass * pow(fAB, Real(2.55)) * (RaA + Rb);
             derivVx += small_F * gradW.x;
             derivVy += small_F * gradW.y;
             derivVz += small_F * gradW.z;
@@ -1241,12 +1241,12 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
     Real Dxx = Lxx;
     Real Dyy = Lyy;
     Real Dzz = Lzz;
-    Real Dxy = 0.5 * (Lxy + Lyx);
-    Real Dxz = 0.5 * (Lxz + Lzx);
-    Real Dyz = 0.5 * (Lyz + Lzy);
-    Real Wxy = 0.5 * (Lxy - Lyx);
-    Real Wxz = 0.5 * (Lxz - Lzx);
-    Real Wyz = 0.5 * (Lyz - Lzy);
+    Real Dxy = Real(0.5) * (Lxy + Lyx);
+    Real Dxz = Real(0.5) * (Lxz + Lzx);
+    Real Dyz = Real(0.5) * (Lyz + Lzy);
+    Real Wxy = Real(0.5) * (Lxy - Lyx);
+    Real Wxz = Real(0.5) * (Lxz - Lzx);
+    Real Wyz = Real(0.5) * (Lyz - Lzy);
 
     Real trD = Dxx + Dyy + Dzz;
     Real edia = 1.0f / 3.0f * trD;
@@ -1267,7 +1267,7 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
         Real K_clamped = fmin(fmax(K_cand, Real(0.1) * paramsD.K_bulk), Real(1.0) * paramsD.K_bulk);
 
         // Shear
-        Real G_cand = (3.0 * K_clamped * (1.0 - 2.0 * paramsD.Nu_poisson)) / (2.0 * (1.0 + paramsD.Nu_poisson));
+        Real G_cand = (3 * K_clamped * (1 - 2 * paramsD.Nu_poisson)) / (2 * (1 + paramsD.Nu_poisson));
         Real G_clamped = fmin(fmax(G_cand, Real(0.1) * paramsD.G_shear), Real(1.0) * paramsD.G_shear);
 
         twoG = 2 * G_clamped;
@@ -1278,9 +1278,9 @@ __global__ void CrmCalcRHS_D(const Real4* __restrict__ sortedPosRad,
     }
 
     // Final stress rate using isotropic elasticity
-    Real dTauxx = twoG * (Dxx - edia) + 2.0 * (tauxy * Wxy + tauxz * Wxz) + threeK * edia;
-    Real dTauyy = twoG * (Dyy - edia) - 2.0 * (tauxy * Wxy - tauyz * Wyz) + threeK * edia;
-    Real dTauzz = twoG * (Dzz - edia) - 2.0 * (tauxz * Wxz + tauyz * Wyz) + threeK * edia;
+    Real dTauxx = twoG * (Dxx - edia) + 2 * (tauxy * Wxy + tauxz * Wxz) + threeK * edia;
+    Real dTauyy = twoG * (Dyy - edia) - 2 * (tauxy * Wxy - tauyz * Wyz) + threeK * edia;
+    Real dTauzz = twoG * (Dzz - edia) - 2 * (tauxz * Wxz + tauyz * Wyz) + threeK * edia;
 
     // off-diagonals
     Real dTauxy = twoG * Dxy - (tauxx * Wxy - tauxz * Wyz) + (Wxy * tauyy + Wxz * tauyz);

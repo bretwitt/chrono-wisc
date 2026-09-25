@@ -25,7 +25,10 @@
 // ground is drawn as ground (ruts and berms). Dust is thrown off the wheels as
 // in demo_PLANET_Viper_SCM_Sensor (ChDustField::EmitFromWheels), at the rate
 // the wheels' speed and slip over the CRM soil give; with
-// --dust-model physics (the default) takes the dust from physics: soil carried
+// --dust-model hybrid (the default) throws soil off the tread as the kinematic
+// wheel model does (shed progressively, some wrapping over the wheel), as much as
+// the wheel's sinkage and driving slip in the CRM soil give; --dust-model physics
+// takes the dust from physics alone: soil carried
 // in the tread's grooves, held there by the soil's cohesion and released where
 // the pull out of the groove exceeds it (ChDustField::WheelEmission::cohesion),
 // and soil the CRM soil throws into free flight at each wheel, measured and
@@ -56,7 +59,10 @@
 // --dust-voxel <m> (default 0.025) and --dust-blur <passes> (default 0) set the
 // dust grid, --start <x> <y> <heading deg> sets where the rover starts (the
 // Sun stays behind and to its right; --start -27 22 60 takes one side of the
-// rover through a small crater).
+// rover through a small crater). --noise-tolerance <steps> lets the cameras stop
+// sampling a pixel once its noise is below that many 8-bit steps (default 0.5;
+// 0 takes every sample), --profile reports where the wall time goes each second, and
+// --gpu-checks turns on the CRM solver's checks for GPU errors.
 //
 // =============================================================================
 
@@ -135,6 +141,10 @@ const double wheel_radius = 0.245, wheel_width = 0.29;
 double drive_speed = 0.4;  // rad/s, about 0.1 m/s
 const double settle_time = 2.0;
 
+// Pixel noise (8-bit steps) at which a camera stops sampling a pixel (ChCameraSensor::SetNoiseTolerance), 0 for every
+// sample: sunlit ground stops after 16 of the 64 samples, and the cameras take about half the time
+float noise_tolerance = 0.5f;
+
 // Boulders around the rover
 const double rock_min_radius = 0.15;
 const double rock_spawn_radius = 30.0;
@@ -195,6 +205,7 @@ void AddCamera(ChSensorManager& manager,
     cam->SetName(name);
     cam->SetLag(0.f);
     cam->SetCollectionWindow(0.f);
+    cam->SetNoiseTolerance(noise_tolerance);
     if (window)
         cam->PushFilter(chrono_types::make_shared<ChFilterVisualize>(640, 360, name));
     cam->PushFilter(chrono_types::make_shared<ChFilterRGBA8Access>());
@@ -263,7 +274,9 @@ int main(int argc, char* argv[]) {
     double friction = 0.5, cohesion = 200;  // loose surface regolith (demo_PLANET_Viper_CRM)
     double dust_voxel = 0.025;
     int dust_blur = 0;
-    std::string dust_model = "physics";  // physics, kinematic or particles
+    bool profile = false;
+    bool gpu_checks = false;  // the CRM solver's checks for GPU errors, a wait on the GPU after each of its kernels
+    std::string dust_model = "hybrid";  // hybrid, physics, kinematic or particles
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--spacing") && i + 1 < argc)
             spacing = std::atof(argv[++i]);
@@ -315,6 +328,12 @@ int main(int argc, char* argv[]) {
             fine_boost = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--camera") && i + 1 < argc)
             cameras = argv[++i];
+        else if (!std::strcmp(argv[i], "--noise-tolerance") && i + 1 < argc)
+            noise_tolerance = float(std::atof(argv[++i]));
+        else if (!std::strcmp(argv[i], "--profile"))
+            profile = true;
+        else if (!std::strcmp(argv[i], "--gpu-checks"))
+            gpu_checks = true;
         else if (!std::strcmp(argv[i], "--no-gi"))
             gi = false;
     }
@@ -410,6 +429,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < 4; ++i)
             crm.AddRigidBody(viper.GetWheels()[i]->GetBody(), wheel_geometry, true);
         crm.SetActiveDomain(ChVector3d(0.5, 0.5, 0.5));
+        crm.GetFluidSystemSPH()->EnableGPUErrorCheck(gpu_checks);
     };
     PlanetCRMWindow soil(sys, surface, site, ruts, spacing, setup);
     soil.SetWindow(window_length, window_width, window_depth, window_margin);
@@ -473,8 +493,17 @@ int main(int argc, char* argv[]) {
             emission.cohesion = cohesion;
             emission.grouser_height = 0.01;
         } else {
+            // Soil shed progressively off the tread: most right behind the contact, some riding up and over the top
             emission.max_release_angle = 150 * CH_DEG_TO_RAD;
             emission.release_decay = 0.6;
+            if (dust_model == "hybrid") {
+                // as much as the wheel's state in the CRM soil gives: the tread bites as deep as the wheel sinks, up to
+                // its grousers (about 1 cm), and driving slip loosens more
+                emission.bulk_density = 1700;
+                emission.grouser_height = 0.01;
+                emission.scale_with_sinkage = true;
+                emission.loose_depth = 4e-4;
+            }
         }
         dust->SetWheelEmission(emission);
         // Fine voxels around the rover, so the spray keeps its shape
@@ -566,18 +595,34 @@ int main(int argc, char* argv[]) {
     std::vector<ThrownSoil> thrown_soil(4);
     size_t thrown = 0;
     const auto wall_start = std::chrono::steady_clock::now();
+    // Wall time spent per report period in each part of the loop (--profile)
+    enum Part { kRuts, kTerrain, kDust, kEmission, kSensors, kSoil, kParts };
+    const char* part_names[kParts] = {"ruts", "terrain", "dust", "emission", "sensors", "soil"};
+    double part_time[kParts] = {};
+    auto lap = std::chrono::steady_clock::now();
+    auto clock = [&](Part part) {
+        if (!profile)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        part_time[part] += std::chrono::duration<double>(now - lap).count();
+        lap = now;
+    };
     while (sys.GetChTime() < end_time) {
+        lap = std::chrono::steady_clock::now();
         const double time = sys.GetChTime();
         const ChVector3d pos = chassis->GetPos();
         if (time >= next_frame) {
             soil.Publish();
+            clock(kRuts);
             visual_terrain.Update(pos, time);
+            clock(kTerrain);
             if (dust) {
                 dust->Update(time);
                 dust->UpdateGrid(time, ChVector3d(pos.x(), pos.y(), height_at(pos.x(), pos.y())), sun_dir);
                 SetDustVolume(*manager, *dust, hapke_w, hapke_b, hapke_c, regolith_albedo);
                 update_grains(time);
             }
+            clock(kDust);
             next_frame += frame_period;
         }
         if (dust && dust_model == "particles" && time >= next_dust) {
@@ -624,10 +669,13 @@ int main(int argc, char* argv[]) {
             next_rocks += rock_update_period;
         }
         move_rig(exchange_step);
+        clock(kEmission);
         manager->Update();
+        clock(kSensors);
 
         viper.Update();
         soil.Advance(exchange_step);
+        clock(kSoil);
 
         if (sys.GetChTime() >= next_report) {
             next_report += 1.0;
@@ -649,6 +697,14 @@ int main(int argc, char* argv[]) {
             if (dust)
                 std::cout << ", dust " << dust->GetStats().aloft * 1e3 << " g aloft";
             std::cout << std::endl;
+            if (profile) {
+                std::cout << "  wall s:";
+                for (int k = 0; k < kParts; ++k) {
+                    std::cout << " " << part_names[k] << " " << part_time[k];
+                    part_time[k] = 0;
+                }
+                std::cout << std::endl;
+            }
         }
     }
     if (save)

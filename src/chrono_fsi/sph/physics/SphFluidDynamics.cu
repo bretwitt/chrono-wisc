@@ -18,6 +18,8 @@
 #include <thrust/execution_policy.h>
 #include <thrust/scan.h>
 #include <thrust/logical.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/iterator/zip_iterator.h>
 
 #include "chrono/utils/ChConstants.h"
 #include "chrono_fsi/sph/physics/SphFluidDynamics.cuh"
@@ -41,6 +43,12 @@ namespace sph {
 
 struct real_min {
     __host__ __device__ Real operator()(const Real& a, const Real& b) const { return a < b ? a : b; }
+};
+
+struct pair_min {
+    __host__ __device__ Real operator()(const thrust::tuple<Real, Real>& t) const {
+        return thrust::get<0>(t) < thrust::get<1>(t) ? thrust::get<0>(t) : thrust::get<1>(t);
+    }
 };
 
 void CopyParametersToDevice_SphFluidDynamics(std::shared_ptr<ChFsiParamsSPH> paramsH, std::shared_ptr<Counters> countersH) {
@@ -89,18 +97,24 @@ void SphFluidDynamics::ProximitySearch() {
 // -----------------------------------------------------------------------------
 
 void SphFluidDynamics::CopySortedMarkers(const std::shared_ptr<SphMarkerDataD>& in, std::shared_ptr<SphMarkerDataD>& out) {
-    thrust::copy(in->posRadD.begin(), in->posRadD.begin() + m_data_mgr.countersH->numExtendedParticles, out->posRadD.begin());
-    thrust::copy(in->velMasD.begin(), in->velMasD.begin() + m_data_mgr.countersH->numExtendedParticles, out->velMasD.begin());
-    thrust::copy(in->rhoPresMuD.begin(), in->rhoPresMuD.begin() + m_data_mgr.countersH->numExtendedParticles, out->rhoPresMuD.begin());
+    thrust::copy(SPH_NOSYNC, in->posRadD.begin(), in->posRadD.begin() + m_data_mgr.countersH->numExtendedParticles, out->posRadD.begin());
+    thrust::copy(SPH_NOSYNC, in->velMasD.begin(), in->velMasD.begin() + m_data_mgr.countersH->numExtendedParticles, out->velMasD.begin());
+    thrust::copy(SPH_NOSYNC, in->rhoPresMuD.begin(), in->rhoPresMuD.begin() + m_data_mgr.countersH->numExtendedParticles, out->rhoPresMuD.begin());
     if (m_data_mgr.paramsH->physics_problem == PhysicsProblem::CRM) {
-        thrust::copy(in->tauXxYyZzD.begin(), in->tauXxYyZzD.end(), out->tauXxYyZzD.begin());
-        thrust::copy(in->tauXyXzYzD.begin(), in->tauXyXzYzD.end(), out->tauXyXzYzD.begin());
-        thrust::copy(in->pcEvSvD.begin(), in->pcEvSvD.end(), out->pcEvSvD.begin());
+        thrust::copy(SPH_NOSYNC, in->tauXxYyZzD.begin(), in->tauXxYyZzD.end(), out->tauXxYyZzD.begin());
+        thrust::copy(SPH_NOSYNC, in->tauXyXzYzD.begin(), in->tauXyXzYzD.end(), out->tauXyXzYzD.begin());
+        thrust::copy(SPH_NOSYNC, in->pcEvSvD.begin(), in->pcEvSvD.end(), out->pcEvSvD.begin());
     }
 }
 
 double SphFluidDynamics::computeTimeStep() const {
     size_t valid_entries = m_data_mgr.countersH->numExtendedParticles;
+#ifndef FSI_COUNT_LOGGING_ENABLED
+    // Both limits in one reduction, so the host waits on the device once per step
+    auto limits = thrust::make_zip_iterator(thrust::make_tuple(m_data_mgr.courantViscousTimeStepD.begin(), m_data_mgr.accelerationTimeStepD.begin()));
+    const Real min_time_step = thrust::transform_reduce(thrust::device, limits, limits + valid_entries, pair_min(), std::numeric_limits<Real>::max(), real_min());
+    return 0.3 * static_cast<double>(min_time_step);
+#else
     double min_courant_viscous_time_step =
         static_cast<double>(thrust::reduce(thrust::device, m_data_mgr.courantViscousTimeStepD.begin(), m_data_mgr.courantViscousTimeStepD.begin() + valid_entries,
                                            std::numeric_limits<Real>::max(), real_min()));
@@ -110,12 +124,11 @@ double SphFluidDynamics::computeTimeStep() const {
 
     double adjusted_time_step = 0.3 * std::min(min_courant_viscous_time_step, min_acceleration_time_step);
     // Log the time step values for analysis
-#ifdef FSI_COUNT_LOGGING_ENABLED
     QuantityLogger::GetInstance().AddValue("time_step", adjusted_time_step);
     QuantityLogger::GetInstance().AddValue("min_courant_viscous_time_step", min_courant_viscous_time_step);
     QuantityLogger::GetInstance().AddValue("min_acceleration_time_step", min_acceleration_time_step);
-#endif
     return adjusted_time_step;
+#endif
 }
 
 //// TODO - revisit application of particle shifting (explicit schemes)

@@ -111,6 +111,7 @@ layout(push_constant) uniform PushConstants {
     uint frame_index;
     uint rng_seed_lo;
     uint rng_seed_hi;
+    float noise_tolerance;  // camera pixel noise (8-bit steps) at which sampling stops, 0 for every sample
 } pc;
 
 const uint PIPE_CAMERA = 0u;
@@ -1032,11 +1033,15 @@ uint camera_sample_factor();
 // Direction of the GI bounce ray of a pixel's camera sample: over the cap 0.35 < cos < 1 about n, uniform in solid
 // angle. The pixel's samples are stratified over the cap (a k x k grid of azimuth and cos, k the supersampling factor),
 // in an order shuffled per pixel, so they cover it evenly instead of clumping as independent random directions do.
+// The offset of a pixel's GI strata from its sample indices
+uint gi_shuffle(uint count) {
+    return ((gl_LaunchIDEXT.x + 1u) * 2246822519u ^ (gl_LaunchIDEXT.y + 1u) * 3266489917u ^ (pc.frame_index + 1u) * 668265263u) % count;
+}
+
 vec3 gi_direction(vec3 n, uint seed, uint sample_index, out float z) {
     uint k = camera_sample_factor();
     uint count = k * k;
-    uint shuffle = ((gl_LaunchIDEXT.x + 1u) * 2246822519u ^ (gl_LaunchIDEXT.y + 1u) * 3266489917u ^ (pc.frame_index + 1u) * 668265263u) % count;
-    uint stratum = (sample_index + shuffle) % count;
+    uint stratum = (sample_index + gi_shuffle(count)) % count;
     float u = (float(stratum % k) + hash_unit(seed ^ 0x9e3779b9u)) / float(k);
     float v = (float(stratum / k) + hash_unit(seed ^ 0x85ebca6bu)) / float(k);
     float a = 2.0 * PI * u;
@@ -1048,7 +1053,10 @@ vec3 gi_direction(vec3 n, uint seed, uint sample_index, out float z) {
     return normalize(t * (r * cos(a)) + b * (r * sin(a)) + n * z);
 }
 
-vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index) {
+// The light of a camera ray's path, and the depth of its first hit (0 for none). With march_volume the medium between
+// the camera and the first surface is marched along it; trace_camera_samples leaves that out and marches the medium
+// once for the whole pixel.
+vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index, bool march_volume) {
     vec3 accum = vec3(0.0);
     uint path_seed = (gl_LaunchIDEXT.x + 1u) * 73856093u ^
                      (gl_LaunchIDEXT.y + 1u) * 19349663u ^
@@ -1064,7 +1072,7 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index) {
     for (int depth = 0; depth < trace_depth_limit; ++depth) {
         TraceResult h = trace_scene(ro, rd, pc.origin_max_t.w, pc.aux0.y);
         // The medium between the camera and the first surface, or the sky
-        if (depth == 0 && volume_enabled()) {
+        if (depth == 0 && march_volume && volume_enabled()) {
             vec4 medium = volume_march(ro, rd, h.hit ? h.t : pc.origin_max_t.w, path_seed ^ 0x3c6ef372u);
             accum += throughput * medium.rgb;
             throughput *= medium.a;
@@ -1189,20 +1197,61 @@ vec4 trace_camera_samples(vec3 origin, uint x, uint y) {
     uint sample_count = factor * factor;
     vec3 accumulated = vec3(0.0);
     float center_depth = 0.0;
-    for (uint sy = 0u; sy < factor; ++sy) {
-        for (uint sx = 0u; sx < factor; ++sx) {
-            uint sample_index = sy * factor + sx;
-            bool center_sample = sample_index + 1u == sample_count;
-            float jitter_x = (factor == 1u || center_sample) ? 0.5 : camera_sample_jitter(x, y, sample_index, 0u);
-            float jitter_y = (factor == 1u || center_sample) ? 0.5 : camera_sample_jitter(x, y, sample_index, 1u);
-            vec3 sample_dir = camera_ray_sample(x, y, jitter_x, jitter_y, false);
-            vec4 traced = trace_camera(origin, sample_dir, sample_index);
+    // With a noise tolerance the samples go in blocks of factor, each taking every row (elevation) and column (azimuth)
+    // of the GI strata once, starting with the block of the center sample. The first pilot_count samples only decide
+    // how many more the pixel takes: pilot_count if their noise, as that of the gamma-encoded mean of so many samples,
+    // is under the tolerance, else all the rest. The pixel's color is the mean of the samples taken after the
+    // decision, so which pixels stop early is independent of their estimates and adds no bias.
+    bool adaptive = pc.noise_tolerance > 0.0 && factor >= 4u;
+    uint shuffle = gi_shuffle(sample_count);
+    uint center_stratum = (sample_count - 1u + shuffle) % sample_count;
+    uint first_block = (center_stratum % factor + factor - center_stratum / factor) % factor;
+    uint pilot_count = adaptive ? factor * ((8u + factor - 1u) / factor) : 0u;
+    uint limit = sample_count;
+    float tolerance = pc.noise_tolerance / 255.0;
+    float gamma = pc.up_gamma.w > 0.0 ? pc.up_gamma.w : 1.0;
+    float mean_y = 0.0, m2_y = 0.0;  // running mean and sum of squared deviations of the pilot's luminance
+    uint taken = 0u;
+    for (uint i = 0u; i < limit; ++i) {
+        uint sample_index = i;
+        if (adaptive) {
+            uint row = i % factor, column = (row + i / factor + first_block) % factor;
+            sample_index = (row * factor + column + sample_count - shuffle) % sample_count;
+        }
+        bool center_sample = sample_index + 1u == sample_count;
+        float jitter_x = (factor == 1u || center_sample) ? 0.5 : camera_sample_jitter(x, y, sample_index, 0u);
+        float jitter_y = (factor == 1u || center_sample) ? 0.5 : camera_sample_jitter(x, y, sample_index, 1u);
+        vec3 sample_dir = camera_ray_sample(x, y, jitter_x, jitter_y, false);
+        vec4 traced = trace_camera(origin, sample_dir, sample_index, factor == 1u);
+        if (center_sample || factor == 1u)
+            center_depth = traced.a;
+        if (i >= pilot_count) {
             accumulated += traced.rgb;
-            if (center_sample || factor == 1u)
-                center_depth = traced.a;
+            ++taken;
+            continue;
+        }
+        float lum = dot(traced.rgb, vec3(0.2126, 0.7152, 0.0722));
+        float d = lum - mean_y;
+        mean_y += d / float(i + 1u);
+        m2_y += d * (lum - mean_y);
+        if (i + 1u == pilot_count) {
+            float se = sqrt(m2_y / float(pilot_count - 1u) / float(pilot_count));
+            // the error the gamma encoding gives it: none once surely clipped white
+            float slope = mean_y - 2.0 * se > 1.0 ? 0.0 : pow(clamp(mean_y, 1e-4, 1.0), 1.0 / gamma - 1.0) / gamma;
+            if (slope * se < tolerance)
+                limit = 2u * pilot_count;
         }
     }
-    return vec4(accumulated / float(max(sample_count, 1u)), center_depth);
+    vec3 color = accumulated / float(max(taken, 1u));
+    // The medium in front of the surfaces, marched once along the pixel's center ray up to its first hit: it varies
+    // over a voxel, several pixels across, so marching it for every sample only repeats the same march
+    if (factor > 1u && volume_enabled()) {
+        uint seed = (x + 1u) * 73856093u ^ (y + 1u) * 19349663u ^ (pc.frame_index + 1u) * 2654435761u ^ camera_rng_key();
+        vec4 medium = volume_march(origin, camera_ray_sample(x, y, 0.5, 0.5, false), center_depth > 0.0 ? center_depth : pc.origin_max_t.w,
+                                   seed ^ 0x3c6ef372u);
+        color = medium.rgb + medium.a * color;
+    }
+    return vec4(color, center_depth);
 }
 
 vec3 lidar_ray(uint x, uint y) {

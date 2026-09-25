@@ -380,26 +380,26 @@ void FsiDataManager::ResetData() {
     auto zero4 = mR4(0);
     auto zero3 = mR3(0);
 
-    thrust::fill(derivVelRhoD.begin(), derivVelRhoD.end(), zero4);
-    thrust::fill(derivVelRhoOriginalD.begin(), derivVelRhoOriginalD.end(), zero4);
-    thrust::fill(freeSurfaceIdD.begin(), freeSurfaceIdD.end(), 0);
-    thrust::fill(posDivergenceD.begin(), posDivergenceD.end(), Real(0));
+    thrust::fill(SPH_NOSYNC, derivVelRhoD.begin(), derivVelRhoD.end(), zero4);
+    thrust::fill(SPH_NOSYNC, derivVelRhoOriginalD.begin(), derivVelRhoOriginalD.end(), zero4);
+    thrust::fill(SPH_NOSYNC, freeSurfaceIdD.begin(), freeSurfaceIdD.end(), 0);
+    thrust::fill(SPH_NOSYNC, posDivergenceD.begin(), posDivergenceD.end(), Real(0));
 
-    thrust::fill(vel_XSPH_D.begin(), vel_XSPH_D.end(), zero3);
+    thrust::fill(SPH_NOSYNC, vel_XSPH_D.begin(), vel_XSPH_D.end(), zero3);
 
     if (paramsH->integration_scheme == IntegrationScheme::IMPLICIT_SPH)
-        thrust::fill(sr_tau_I_mu_i.begin(), sr_tau_I_mu_i.end(), zero4);
+        thrust::fill(SPH_NOSYNC, sr_tau_I_mu_i.begin(), sr_tau_I_mu_i.end(), zero4);
 
     //// TODO: ISPH only
-    thrust::fill(bceAcc.begin(), bceAcc.end(), zero3);
+    thrust::fill(SPH_NOSYNC, bceAcc.begin(), bceAcc.end(), zero3);
 
     //// TODO: CRM only
-    thrust::fill(derivTauXxYyZzD.begin(), derivTauXxYyZzD.end(), zero3);
-    thrust::fill(derivTauXyXzYzD.begin(), derivTauXyXzYzD.end(), zero3);
+    thrust::fill(SPH_NOSYNC, derivTauXxYyZzD.begin(), derivTauXxYyZzD.end(), zero3);
+    thrust::fill(SPH_NOSYNC, derivTauXyXzYzD.begin(), derivTauXyXzYzD.end(), zero3);
 
     //// Time step vectors
-    thrust::fill(courantViscousTimeStepD.begin(), courantViscousTimeStepD.end(), std::numeric_limits<Real>::max());
-    thrust::fill(accelerationTimeStepD.begin(), accelerationTimeStepD.end(), std::numeric_limits<Real>::max());
+    thrust::fill(SPH_NOSYNC, courantViscousTimeStepD.begin(), courantViscousTimeStepD.end(), std::numeric_limits<Real>::max());
+    thrust::fill(SPH_NOSYNC, accelerationTimeStepD.begin(), accelerationTimeStepD.end(), std::numeric_limits<Real>::max());
 }
 
 // ------------------------------------------------------------------------------

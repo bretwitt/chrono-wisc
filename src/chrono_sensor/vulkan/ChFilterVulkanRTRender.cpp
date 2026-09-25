@@ -1739,6 +1739,12 @@ float CameraGamma(const std::shared_ptr<ChVulkanSensor>& sensor) {
     return 1.f;
 }
 
+float CameraNoiseTolerance(const std::shared_ptr<ChVulkanSensor>& sensor) {
+    if (auto camera = std::dynamic_pointer_cast<ChCameraSensor>(sensor))
+        return std::max(0.f, camera->GetNoiseTolerance());
+    return 0.f;
+}
+
 bool CameraUseGI(const std::shared_ptr<ChVulkanSensor>& sensor) {
 #if defined(CHRONO_HAS_VULKAN_RT) && !defined(CHRONO_HAS_OPTIX)
     if (auto camera = std::dynamic_pointer_cast<ChPhysCameraSensor>(sensor))
@@ -2057,6 +2063,7 @@ struct ChVulkanRTGpuPushConstants {
     uint32_t frame_index;  // Decorrelate stochastic camera launches.
     uint32_t rng_seed_lo;  // Low half of ChSensorManager-derived stream seed.
     uint32_t rng_seed_hi;  // High half of ChSensorManager-derived stream seed.
+    float noise_tolerance;  // Camera pixel noise (8-bit steps) at which sampling stops; 0 takes every sample.
 };
 static_assert(sizeof(ChVulkanRTGpuPushConstants) <= 128,
               "Vulkan RT push constants exceed Vulkan's guaranteed 128-byte minimum");
@@ -2082,6 +2089,7 @@ struct ChVulkanRTGpuFrame {
     float tan_half_hfov = 1.f;
     float aux_ray_factor = 1.f;
     bool use_gi = false;
+    float noise_tolerance = 0.f;
     uint32_t ray_recursions = 1;
     uint32_t sample_factor = 1;
     uint32_t frame_index = 0;
@@ -2288,6 +2296,7 @@ struct ChVulkanRTGpuRenderer {
         pc.frame_index = frame.frame_index;
         pc.rng_seed_lo = static_cast<uint32_t>(frame.rng_seed);
         pc.rng_seed_hi = static_cast<uint32_t>(frame.rng_seed >> 32);
+        pc.noise_tolerance = frame.noise_tolerance;
 
         RecordAndSubmitRender(pc, frame.width, frame.height, frame.pipeline);
         CopyOutputToHost(frame);
@@ -4148,6 +4157,7 @@ void ChFilterVulkanRTRender::Apply() {
         gpu_frame.hfov = CameraHFOV(sensor);
         gpu_frame.gamma = CameraGamma(sensor);
         gpu_frame.use_gi = CameraUseGI(sensor);
+        gpu_frame.noise_tolerance = CameraNoiseTolerance(sensor);
         gpu_frame.ray_recursions = static_cast<uint32_t>(std::max(1, m_ray_recursions));
         gpu_frame.sample_factor = CameraSampleFactor(sensor);
         // Frame index advances the stream across launches; m_rng_seed selects the

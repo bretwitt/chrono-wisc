@@ -25,6 +25,7 @@
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
+#include <thrust/execution_policy.h>
 
 #include "chrono/core/ChTypes.h"
 
@@ -81,7 +82,15 @@ namespace sph {
 
 // ----------------------------------------------------------------------------
 
-// The four error-flag macros call gpuMalloc, gpuMemcpy and gpuFree, each of which returns a
+// Execution policy for device algorithms that return nothing to the host. Thrust's default CUDA policy ends each
+// algorithm with a device synchronization; this one leaves the work queued in stream order, as a kernel launch is.
+#if defined(__CUDACC__) && !defined(__HIPCC__) && THRUST_VERSION >= 101600
+    #define SPH_NOSYNC thrust::cuda::par_nosync
+#else
+    #define SPH_NOSYNC thrust::device
+#endif
+
+// The four error-flag macros call gpuMalloc, gpuMemset, gpuMemcpy and gpuFree, each of which returns a
 // gpuError. Discarding those codes lets an allocation or copy failure pass unnoticed: the flag is
 // then read from memory that was never written, and a failed device-to-host copy reports "no error"
 // because error_flag_H keeps whatever the stack held. So every call is checked. gpuFreeErrorFlag
@@ -109,12 +118,12 @@ namespace sph {
         }                                                                               \
     }
 
-#define gpuResetErrorFlag(error_flag_D)                                                              \
-    {                                                                                                \
-        bool error_flag_H = false;                                                                   \
-        gpuError err_ = gpuMemcpy(error_flag_D, &error_flag_H, sizeof(bool), gpuMemcpyHostToDevice); \
-        if (err_ != gpuSuccess)                                                                      \
-            gpuThrowError(gpuGetErrorString(err_));                                                  \
+// A memset of device memory is queued in stream order and does not wait for the device, unlike a copy from the host
+#define gpuResetErrorFlag(error_flag_D)                            \
+    {                                                              \
+        gpuError err_ = gpuMemset(error_flag_D, 0, sizeof(bool));  \
+        if (err_ != gpuSuccess)                                    \
+            gpuThrowError(gpuGetErrorString(err_));                \
     }
 
 #define gpuCheckErrorFlag(error_flag_D, kernel_name)                                                         \

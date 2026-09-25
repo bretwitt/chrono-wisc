@@ -3111,6 +3111,7 @@ std::vector<ChVector3d> ChFsiFluidSystemSPH::GetParticlePositions() const {
     auto pos3 = GetPositions();
 
     std::vector<ChVector3d> pos;
+    pos.reserve(pos3.size());
     for (const auto& p : pos3)
         pos.push_back(ToChVector(p));
 
@@ -3121,6 +3122,7 @@ std::vector<ChVector3d> ChFsiFluidSystemSPH::GetParticleVelocities() const {
     auto vel3 = GetVelocities();
 
     std::vector<ChVector3d> vel;
+    vel.reserve(vel3.size());
     for (const auto& v : vel3)
         vel.push_back(ToChVector(v));
 

@@ -132,6 +132,14 @@ class CH_SENSOR_API ChCameraSensor : public ChCameraSensorBase {
     unsigned int GetSampleFactor() { return m_supersample_factor; }
     void SetSampleFactor(unsigned int sample_factor) {m_supersample_factor = sample_factor;}
 
+    /// Set the noise a pixel may keep and stop sampling (Vulkan RT only, 16 samples or more): a pilot of at least 8
+    /// samples, spread evenly over the pixel's GI directions, estimates the pixel's noise; where the noise of the mean of so many samples, in 8-bit
+    /// steps of the gamma-encoded image, is below this, the pixel takes that many more, else all the rest, and its
+    /// color is the mean of those taken after the pilot (so stopping early adds noise but no bias). Sunlit ground
+    /// stops early; shadows lit by GI take every sample. 0 (default) takes every sample.
+    void SetNoiseTolerance(float steps) { m_noise_tolerance = steps; }
+    float GetNoiseTolerance() const { return m_noise_tolerance; }
+
     /// returns if the camera should use fog as dictated by the scene
     /// @return True if it does request
     bool GetUseFog() { return m_use_fog; }
@@ -151,6 +159,7 @@ class CH_SENSOR_API ChCameraSensor : public ChCameraSensorBase {
   private:
     float m_hFOV;                           ///< the horizontal field of view of the sensor
     unsigned int m_supersample_factor;      ///< super sampling factor for antialiasing
+    float m_noise_tolerance = 0;            ///< pixel noise (8-bit steps) at which sampling stops, 0 for none
     CameraLensModelType m_lens_model_type;  ///< lens model used by the camera
     bool m_use_gi;                          ///< holds whether the camera considers diffuse reflection
     bool m_use_denoiser;                    ///< holds whether the camera requests OptiX denoiser

@@ -82,6 +82,9 @@ class CH_PLANET_API ChDustField {
         /// bulk_density * width * loose_depth * (rim speed + slip_gain * slip speed), the slip speed counting only
         /// while the wheel drives (its contact sliding backward); a braking wheel's slide loosens no extra soil.
         double loose_depth = 2e-4;
+        /// Scale loose_depth by how deep the tread bites: min(sinkage, grouser_height) / grouser_height, so a wheel
+        /// skimming the ground throws little and one sunk to its grousers throws the full amount (default: false).
+        bool scale_with_sinkage = false;
         double slip_gain = 4.0;  ///< extra loosening per unit of slip speed, relative to rim speed
         /// The rim releases soil from where it leaves the ground up to this angle from the bottom of the wheel
         /// (rad); 90 deg is level with the hub behind it. A fender lowers it.

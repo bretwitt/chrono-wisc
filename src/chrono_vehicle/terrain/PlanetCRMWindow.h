@@ -38,7 +38,7 @@
 #include "chrono_planet/ChSiteFrame.h"
 #include "chrono_planet/filters/ChDeformationFilter.h"
 #include "chrono_planet/dust/ChDustField.h"
-#include "chrono_planet/volume/ChSdfMesher.h"
+#include "chrono_planet/geometry/ChSdfMesher.h"
 
 namespace chrono {
 namespace vehicle {

@@ -12,7 +12,7 @@
 // Authors: bgwitt
 // =============================================================================
 
-#include "chrono_planet/volume/ChSdfMesher.h"
+#include "chrono_planet/geometry/ChSdfMesher.h"
 
 #include <algorithm>
 #include <cmath>
