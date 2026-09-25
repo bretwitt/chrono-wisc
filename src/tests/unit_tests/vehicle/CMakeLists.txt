@@ -1,6 +1,7 @@
 set(TESTS
     utest_VEH_destructors
     utest_VEH_tire_contact
+    utest_VEH_DustField
 )
 
 if(CH_ENABLE_MODULE_PLANET)

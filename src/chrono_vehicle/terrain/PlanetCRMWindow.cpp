@@ -263,7 +263,7 @@ void PlanetCRMWindow::Advance(double step) {
 }
 
 std::shared_ptr<ChTriangleMeshConnected> PlanetCRMWindow::UpdateLooseSoil() {
-    // Clods as planet::ChSoilParticles draws them: radius 0.45 to 0.65 spacings, blend 0.15, meshed at half a spacing
+    // Clods: radius 0.45 to 0.65 spacings, blend 0.15, meshed at half a spacing
     const double s = m_spacing;
     if (!m_loose)
         m_loose = std::make_unique<planet::ChSparseSdfGrid>(0.5 * s, static_cast<float>(2 * s));
@@ -395,7 +395,7 @@ std::vector<PlanetCRMWindow::Ejecta> PlanetCRMWindow::MeasureEjecta(double time,
     return ejecta;
 }
 
-size_t PlanetCRMWindow::EmitDust(planet::ChDustField& dust, double time, double min_speed, int splits) {
+size_t PlanetCRMWindow::EmitDust(ChDustField& dust, double time, double min_speed, int splits) {
     // Particles in free flight: clear of the drawn ground, moving, and falling freely since the last call (their
     // velocity changed as gravity alone would change it; soil pushed aside by a wheel, still in contact, does not).
     // Each is handed over once, its mass shared among the dust's grain sizes and among a few super-particles spread

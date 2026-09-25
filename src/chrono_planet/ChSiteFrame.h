@@ -83,7 +83,7 @@ class CH_PLANET_API ChSiteFrame {
     double m_elev0;
 };
 
-/// A rectangle of site x/y coordinates (m), for example ground a ChSiteVolume takes over from the terrain.
+/// A rectangle of site x/y coordinates (m), for example a CRM soil window or a hole cut out of the terrain.
 struct CH_PLANET_API ChSiteRegion {
     double min_x = 0, min_y = 0, max_x = 0, max_y = 0;
 

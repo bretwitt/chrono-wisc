@@ -227,74 +227,51 @@ region a change touched. `ChPlanetQuadtree::Invalidate` rebuilds a region on
 demand for changes made outside the chain.
 
 
-# Excavation {#planet_excavation}
+# CRM soil under a rover {#planet_crm}
 
-A height field holds one height per point, so it cannot hold what digging
-makes: a trench with vertical or undercut walls, or spoil piled over a cut. At
-a work site, `ChSiteVolume` takes the ground over from the terrain as a signed
-distance field (negative in the soil), stored in bricks of 8^3 lattice points
-only in a narrow band around the ground. It starts as the terrain, and edits
-change it as solids (`ChSdfShape`): `Subtract`, `SubtractSwept` (a shape moved
-between two placements), `Add`, and `Deposit`, which pours a volume of soil as
-a cone at the angle of repose and fills what lies under it. Every edit returns
-the volume it changed, measured on the lattice, so what is dug and put back
-balances exactly. Edits keep to `GetEditRegion()`, inside the region, so where
-the volume meets the terrain around it both have the same ground.
-
-The rest of the scene cuts the site out where the volume takes over:
-`GetHole()` goes to `ChPlanetVisualMesh::AddHole` and
-`ChPlanetVisualizationVSG::AddHole` for the drawn tiles, and to
-`vehicle::PlanetTerrain::AddHole` for the collision patch (with the volume's top
-height for height queries inside it). Faces that cross the hole's edges are cut
-along them. `ChSiteVolumeShapes` meshes the volume's bricks (surface nets) as
-visual shapes and, optionally, collision meshes on fixed bodies of one collision
-family; after each edit it rebuilds only the bricks that changed. With VSG, draw
-them with `ChSiteVolumeVisualizationVSG`, which follows them as they change.
-`PublishTopSurface` writes the top of the ground into a `ChDeformationFilter`
-on the drawn surface, for coarse tiles and other height-field consumers.
+With Chrono::FSI, `vehicle::PlanetCRMWindow` runs CRM soil (SPH continuum
+soil) in a window of the site that follows a rover, over the terrain the rest
+of the scene draws. The window is seeded from the ground's heights
+(`vehicle::PlanetCRMTerrain::ConstructFromHeight`); when the rover nears its
+edge, a new window is seeded ahead of it, and the soil of the old one where the
+two overlap is carried over as it is, particles with their stress, so the rover
+does not sink into fresh soil. The wheels, added with `AddWheel`, stamp their
+footprints as ruts into a `ChDeformationFilter`, and `Publish` writes them, with
+the berms of soil the wheels push up beside them, so the drawn terrain and the
+sensors see them. `UpdateLooseSoil` meshes the soil thrown up or pushed aside
+(`ChSparseSdfGrid`, clods of about the particle spacing), and `MeasureEjecta`
+reports the soil thrown into free flight at each wheel, for a `vehicle::ChDustField`.
 
 ~~~{.cpp}
-auto volume = chrono_types::make_shared<ChSiteVolume>(ChSiteRegion(-4, -3, 4, 3), params, height_at);
-auto shapes = chrono_types::make_shared<ChSiteVolumeShapes>(&sys, volume);
-shapes->EnableCollision(contact_material);
-terrain.AddHole(volume->GetHole(), [volume](double x, double y) { return volume->GetTopHeight(x, y); });
-terrain.DisallowCollisionsWith(shapes->GetCollisionFamily());
-vis_planet->AddHole(volume->GetHole());
-
-ChExcavationTool tool(volume, bucket_body, chrono_types::make_shared<ChSdfBox>(bucket_size));
-tool.SetCapacity(0.06);
-auto particles = chrono_types::make_shared<ChSoilParticles>(&sys, volume);
-tool.SetParticles(particles, cavity);   // the load stays in view, and pours when the bucket tips
+PlanetCRMWindow soil(sys, surface, site, ruts, spacing, [&](PlanetCRMTerrain& crm) {
+    crm.SetCrmSPH(soil_properties);
+    crm.SetSPHParameters(sph_parameters);
+    for (auto& wheel : wheels)
+        crm.AddRigidBody(wheel, wheel_geometry, true);
+    crm.SetActiveDomain(ChVector3d(0.5, 0.5, 0.5));
+});
+soil.SetWindow(5.0, 3.5, 0.25, 1.3);  // length, width, depth, margin (m)
+for (auto& wheel : wheels)
+    soil.AddWheel(wheel, wheel_radius, wheel_width);
+soil.Initialize(chassis);
 
 while (...) {
-    tool.Update();                // cut what the bucket swept, carry it, feel the soil's resistance
-    particles->Advance(step);     // falling soil lands and becomes ground where it lands
-    sys.DoStepDynamics(step);
-    if (render) {
-        shapes->Update();         // re-mesh the bricks that changed
-        particles->UpdateMesh();
-        vis->Render();
-    }
+    soil.Advance(step);           // moves the window when the rover nears its edge
+    if (render)
+        soil.Publish();           // ruts and berms into the deformation filter
 }
 ~~~
 
-`ChExcavationTool` gives a body a cutting shape. Each update removes what the
-shape swept through since the last edit and carries it, up to a capacity; what
-a full tool cuts beyond that is pushed ahead of it as a pile. The soil resists
-with the fundamental equation of earthmoving (Reece; McKyes), from the cutting
-depth ahead of the tool, its width across the motion and its rake angle.
-`ChSoilParticles` keeps soil in view between leaving the ground and going back:
-the load fills the tool's cavity as particles, pours out when the tool tips past
-the angle of repose, falls, and merges into the ground where it lands. The
-particles are splatted into a sparse lattice of bricks (`ChSparseSdfGrid`) and
-drawn as one smooth mass; bricks whose particles did not move keep their mesh.
+Where other ground takes over part of the site, `ChPlanetVisualMesh::AddHole`,
+`ChPlanetVisualizationVSG::AddHole` and `vehicle::PlanetTerrain::AddHole` leave
+a rectangle out of the drawn tiles and the collision patch, cutting the faces
+that cross its edges along them.
 
-For soil mechanics beyond the earthmoving equation, `vehicle::PlanetCRMTerrain`
-(with Chrono::FSI) runs CRM soil over a window of the site, seeded from the
-volume, trenches and piles included, and writes the particles back into it
-(`PublishToVolume`), so the volume's meshes and collision shapes follow what the
-soil model does. It is far slower than real time; the kinematic tool is the
-real-time path. See `demo_PLANET_Excavation` and `demo_PLANET_Excavation_CRM`.
+See `demo_PLANET_Viper_CRM` (VSG), and, through Chrono::Sensor with the Hapke
+BRDF, `demo_PLANET_Viper_CRM_Sensor`, `demo_PLANET_Viper_CRM_HillClimb` (up a
+slope, until the wheels slip and dig in) and
+`demo_PLANET_Viper_CRM_CraterFording` (through a small crater). CRM soil is far
+slower than real time: at 0.03 m spacing with two cameras, about 0.05x.
 
 
 # Module layout {#planet_layout}
@@ -309,12 +286,11 @@ listed before it:
 | `samplers/` | The sampler interface and generic samplers |
 | `dem/` | GeoTIFF stacks (GDAL stays inside this folder's sources) |
 | `filters/` | The filter interface, filter chains, general filters, deformation |
-| `volume/` | The work-site signed distance field, its meshes and collision shapes, excavation tools and soil particles |
 | `procedural/` | Relief layers and their internal field helpers |
-| `geometry/` | Rock shape meshes, for rendering and collision |
+| `geometry/` | Rock shape meshes, for rendering and collision, and meshes of splatted spheres (`ChSparseSdfGrid`) |
 | `lod/` | The quadtree and tile mesh building; `ChPlanetQuadtree.h` and `ChTileMesh.h` are its public face |
 | `planets/` | Body presets, built only on the public API; the Moon's is split into terrain (`ChMoon.h`) and DEM resources (`ChMoonDem.h`) |
-| `visualization/` | The VSG plugins (terrain, site volume, soil particles), in their own library |
+| `visualization/` | The VSG plugins (terrain, and meshes that change from frame to frame), in their own library |
 
 The terrain model never includes rendering code: the surface knows zoom
 levels only through `ChLevelOfDetail`.
@@ -476,13 +452,9 @@ produced before bodies became configurable.
   rasters, the GeoTIFF default, therefore read half a pixel to the north-west.
 - A global raster is not bridged across its own wrap edge, so its last pixel
   column before that edge reads as no data (and takes the fallback).
-- A `ChSiteVolume` is meant for a work site of tens of meters: it is stored
-  sparsely, but its brick table covers the whole box. Surface nets can join two
-  blobs of soil that touch through a neck one voxel wide with an edge four faces
-  share; the mesh stays closed.
-- `vehicle::PlanetCRMTerrain` runs over a fixed window of the site; it does not
-  follow a rover. CRM soil compacts as it is worked, so the soil volume written
-  back shrinks while the particle count, and the mass, stays the same.
+- `vehicle::PlanetCRMWindow` reseeds its whole window when it moves: the soil
+  model restarts from the particles of the overlap, and the soil left behind
+  keeps only the ruts and berms written into the deformation filter.
 - The quadtree's tile skirt depths are fixed in meters and were tuned on the
   Moon. On a much larger body, cracks between tiles of different levels may
   show at coarse levels.

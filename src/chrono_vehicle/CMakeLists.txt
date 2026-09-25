@@ -297,6 +297,8 @@ set(CV_TERRAIN_FILES
     terrain/SCMTerrain.cpp
     terrain/GranularTerrain.h
     terrain/GranularTerrain.cpp
+    terrain/ChDustField.h
+    terrain/ChDustField.cpp
 )
 if(CH_ENABLE_MODULE_FEA)
     set(CV_TERRAIN_FILES ${CV_TERRAIN_FILES}

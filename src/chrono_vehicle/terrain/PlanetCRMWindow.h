@@ -37,7 +37,7 @@
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/ChSiteFrame.h"
 #include "chrono_planet/filters/ChDeformationFilter.h"
-#include "chrono_planet/dust/ChDustField.h"
+#include "chrono_vehicle/terrain/ChDustField.h"
 #include "chrono_planet/geometry/ChSdfMesher.h"
 
 namespace chrono {
@@ -114,7 +114,7 @@ class CH_VEHICLE_API PlanetCRMWindow {
 
     /// Measure the soil each wheel (AddWheel) throws up: particles in free flight, as EmitDust finds them, each counted
     /// once, attributed to the nearest wheel within reach. Call as often as EmitDust would be. A dust model can then
-    /// emit that mass smoothly (planet::ChDustField::EmitSource) instead of in particle-sized lumps.
+    /// emit that mass smoothly (ChDustField::EmitSource) instead of in particle-sized lumps.
     std::vector<Ejecta> MeasureEjecta(double time, double min_speed = 0.05);
 
     /// Hand soil thrown up to a dust field: particles in free flight (clear of the drawn ground, moving faster than
@@ -122,11 +122,11 @@ class CH_VEHICLE_API PlanetCRMWindow {
     /// the dust's grain sizes and among `splits` super-particles, released along its path since the previous call with
     /// a spread of speeds and directions. Call often enough to catch particles in flight (every 10 ms, say). Returns the
     /// particles handed over.
-    size_t EmitDust(planet::ChDustField& dust, double time, double min_speed = 0.05, int splits = 64);
+    size_t EmitDust(ChDustField& dust, double time, double min_speed = 0.05, int splits = 64);
 
     /// Mesh the loose soil: the particles whose centers rise above the drawn ground (the surface with the ruts the filter
     /// holds), such as soil thrown up or pushed aside by the wheels, as clods, spheres of about the particle spacing
-    /// barely blended, as planet::ChSoilParticles draws them. Call after Publish, and draw the mesh (site
+    /// barely blended (planet::ChSparseSdfGrid). Call after Publish, and draw the mesh (site
     /// coordinates) with planet::ChMeshVisualizationVSG. Returns the new mesh.
     std::shared_ptr<ChTriangleMeshConnected> UpdateLooseSoil();
 

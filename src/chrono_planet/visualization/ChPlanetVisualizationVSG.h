@@ -75,7 +75,7 @@ class CH_PLANET_API ChPlanetVisualizationVSG : public vsg3d::ChVisualSystemVSGPl
     bool HasDeformationColoring() const { return m_deformation != nullptr; }
 
     /// Leave the terrain out of a rectangle of site x/y, cutting the faces that cross its edges, where other ground
-    /// takes over, such as a ChSiteVolume's (see ChSiteVolume::GetHole). The tiles are rebuilt on the next frame.
+    /// takes over, such as a work site modeled on its own. The tiles are rebuilt on the next frame.
     void AddHole(const ChSiteRegion& hole) {
         m_holes.push_back(hole);
         m_holes_changed = true;

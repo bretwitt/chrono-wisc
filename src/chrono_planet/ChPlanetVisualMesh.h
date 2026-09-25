@@ -87,7 +87,7 @@ class CH_PLANET_API ChPlanetVisualMesh {
     void SetCompaction(std::shared_ptr<ChDeformationFilter> filter, std::vector<CompactionLevel> levels);
 
     /// Leave the terrain out of a rectangle of site x/y, cutting the faces that cross its edges, where other ground
-    /// takes over, such as a ChSiteVolume's (see ChSiteVolume::GetHole). The tiles are rebuilt on the next update.
+    /// takes over, such as a work site modeled on its own. The tiles are rebuilt on the next update.
     void AddHole(const ChSiteRegion& hole);
     /// Remove every hole. The tiles are rebuilt on the next update.
     void ClearHoles();

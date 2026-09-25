@@ -29,16 +29,16 @@
 
 #include "chrono/core/ChVector3.h"
 
-#include "chrono_planet/ChApiPlanet.h"
+#include "chrono_vehicle/ChApiVehicle.h"
 
 namespace chrono {
-namespace planet {
+namespace vehicle {
 
-/// @addtogroup planet_module
+/// @addtogroup vehicle_terrain
 /// @{
 
 /// Regolith grains in ballistic flight over the ground of an airless body, in a z-up Cartesian frame such as a
-/// ChSiteFrame. With no gas to drag them, each grain follows a parabola from its release until it lands, so the
+/// planet::ChSiteFrame. With no gas to drag them, each grain follows a parabola from its release until it lands, so the
 /// field holds only release states and evaluates positions in closed form at any time: emission can follow the
 /// physics step while positions are needed only when a sensor looks.
 ///
@@ -51,7 +51,7 @@ namespace planet {
 /// References: Hersh et al. 2012 (Am. J. Phys. 80, 452) for the ballistic dust trails of the Apollo Lunar Roving
 /// Vehicle; Hapke 2012 (Theory of Reflectance and Emittance Spectroscopy) for leaving diffraction in the direct
 /// beam, which makes Q about 1 for grains much larger than the wavelength.
-class CH_PLANET_API ChDustField {
+class CH_VEHICLE_API ChDustField {
   public:
     /// Ground height (m) at a point (x, y) of the frame. Called from the calling thread only.
     using HeightFunction = std::function<double(double x, double y)>;
@@ -268,7 +268,7 @@ class CH_PLANET_API ChDustField {
 
 /// @} planet_module
 
-}  // namespace planet
+}  // namespace vehicle
 }  // namespace chrono
 
 #endif

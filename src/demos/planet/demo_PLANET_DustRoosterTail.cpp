@@ -47,7 +47,7 @@
 #include "chrono/core/ChDataPath.h"
 #include "chrono/physics/ChSystemNSC.h"
 
-#include "chrono_planet/dust/ChDustField.h"
+#include "chrono_vehicle/terrain/ChDustField.h"
 #include "chrono_planet/planets/moon/ChMoon.h"
 
 #include "chrono_sensor/ChSensorManager.h"
@@ -60,6 +60,7 @@
 
 using namespace chrono;
 using namespace chrono::planet;
+using namespace chrono::vehicle;
 using namespace chrono::sensor;
 
 // Lunar Roving Vehicle wheel: 81.8 cm across, 23 cm wide

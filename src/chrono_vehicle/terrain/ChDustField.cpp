@@ -12,22 +12,59 @@
 // Authors: bgwitt
 // =============================================================================
 
-#include "chrono_planet/dust/ChDustField.h"
+#include "chrono_vehicle/terrain/ChDustField.h"
 
 #include "chrono/utils/ChConstants.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <set>
+#include <string>
+#include <utility>
+
+#ifdef _OPENMP
+    #include <omp.h>
+#endif
 
 #include "chrono/core/ChVector2.h"
 
-#include "chrono_planet/core/Parallel.h"
-
 namespace chrono {
-namespace planet {
+namespace vehicle {
 
 namespace {
+
+// Voxels from which a pass over the grid is split over a team
+constexpr size_t kParallelMinVoxels = 128 * 128;
+
+// Threads of a team: one per physical core, unless OMP_NUM_THREADS or a passive wait policy asks otherwise. Two
+// threads of a core share its caches, and a busy-waiting sibling slows the other.
+int TeamSize() {
+#ifdef _OPENMP
+    static const int team = [] {
+        const int want = std::max(1, omp_get_max_threads());
+        const char* wait = std::getenv("OMP_WAIT_POLICY");
+        if (std::getenv("OMP_NUM_THREADS") || (wait && std::string(wait) == "passive"))
+            return want;
+        // physical cores: distinct (package, core) pairs, or half the logical processors if the topology is unknown
+        const int logical = std::max(1, omp_get_num_procs());
+        std::set<std::pair<int, int>> cores;
+        for (int cpu = 0; cpu < logical; ++cpu) {
+            const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/";
+            std::ifstream pkg(base + "physical_package_id"), core(base + "core_id");
+            int p = 0, c = 0;
+            if (!(pkg >> p) || !(core >> c))
+                return std::max(1, std::min(want, logical / 2));
+            cores.insert({p, c});
+        }
+        return std::max(1, std::min(want, static_cast<int>(cores.size())));
+    }();
+    return team;
+#else
+    return 1;
+#endif
+}
 
 // Slots of the height cache along each axis, a power of two: the cache covers this many lattice points around any
 // point without collisions
@@ -489,7 +526,7 @@ void ChDustField::TraceTransmittance(Grid& g, const ChVector3d& sun_dir) {
             continue;
         }
 
-#pragma omp parallel for num_threads(util::parallelThreads()) schedule(static) if (par)
+#pragma omp parallel for num_threads(TeamSize()) schedule(static) if (par)
         for (int l = 0; l < wc; ++l) {
             for (int m = 0; m < wb; ++m) {
                 const size_t r = size_t(m) + size_t(wb) * l;
@@ -511,7 +548,7 @@ void ChDustField::TraceTransmittance(Grid& g, const ChVector3d& sun_dir) {
 
         // Each voxel of the slice lies between the rays stored at (ib - 1, ib) and (ic - 1, ic), offset by the
         // phases: indices ib and ib + 1 in the padded storage
-#pragma omp parallel for num_threads(util::parallelThreads()) schedule(static) if (par)
+#pragma omp parallel for num_threads(TeamSize()) schedule(static) if (par)
         for (int ic = 0; ic < nc; ++ic) {
             for (int ib = 0; ib < nb; ++ib) {
                 const size_t r00 = size_t(ib) + size_t(wb) * ic;  // ray (ib - 1, ic - 1)
@@ -587,7 +624,7 @@ void ChDustField::TraceVisibility(Grid& g, const ChVector3d& sun_dir, const Heig
         }
     }
 
-#pragma omp parallel for num_threads(util::parallelThreads()) schedule(static) if (util::parallelGrid(g.sun_visibility.size()))
+#pragma omp parallel for num_threads(TeamSize()) schedule(static) if (g.sun_visibility.size() >= kParallelMinVoxels)
     for (int k = 0; k < nz; ++k) {
         const double z = g.origin.z() + (k + 0.5) * h;
         for (int j = 0; j < ny; ++j)
@@ -620,5 +657,5 @@ bool ChDustField::WriteOpticalDepthImage(const std::string& filename) const {
     return static_cast<bool>(out);
 }
 
-}  // namespace planet
+}  // namespace vehicle
 }  // namespace chrono

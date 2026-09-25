@@ -13,7 +13,7 @@
 // =============================================================================
 //
 // Cutting rectangles of site x/y out of terrain meshes, where other ground,
-// such as a ChSiteVolume, takes over.
+// such as a work site modeled on its own, takes over.
 //
 // =============================================================================
 

@@ -26,19 +26,12 @@ namespace chrono {
 namespace vehicle {
 
 namespace {
-// Radius of a particle's sphere and width of their smooth union, in particle spacings. With this radius, particles
-// taken from the ground (ConstructFromVolume) give back the soil they came from to about 0.05%.
+// Radius of a particle's sphere, in particle spacings: the soil's top is the highest cap of a sphere over a column.
+// With this radius, particles seeded on a lattice give back the ground they came from to about 0.05%.
 constexpr double kRadius = 0.64;
-constexpr double kBlend = 0.5;
-
-float SmoothMin(float a, float b, float k) {
-    const float h = std::max(k - std::abs(a - b), 0.0f) / k;
-    return std::min(a, b) - h * h * k * 0.25f;
-}
 }  // namespace
 
-PlanetCRMTerrain::PlanetCRMTerrain(ChSystem& sys, double spacing, std::shared_ptr<planet::ChSiteVolume> volume)
-    : CRMTerrain(sys, spacing), m_volume(std::move(volume)) {}
+PlanetCRMTerrain::PlanetCRMTerrain(ChSystem& sys, double spacing) : CRMTerrain(sys, spacing) {}
 
 PlanetCRMTerrain::~PlanetCRMTerrain() {
     // Initialize added the soil model's ground body to the system; a window replaced by another must not leave it
@@ -49,15 +42,6 @@ PlanetCRMTerrain::~PlanetCRMTerrain() {
         for (const auto& fsi_body : m_sysFSI->GetBodies())
             fsi_body->body->EmptyAccumulator(fsi_body->fsi_accumulator);
     }
-}
-
-void PlanetCRMTerrain::ConstructFromVolume(const planet::ChSiteRegion& window, double depth, int side_flags) {
-    if (!m_volume)
-        throw std::invalid_argument("PlanetCRMTerrain::ConstructFromVolume: no volume");
-    m_shift.clear();
-    Build(
-        window, depth, side_flags, [&](double x, double y) { return m_volume->GetTopHeight(x, y); },
-        [&](const ChVector3d& p) { return m_volume->GetDistance(p) < 0; });
 }
 
 void PlanetCRMTerrain::ConstructFromHeight(const std::function<double(double x, double y)>& height,
@@ -333,108 +317,6 @@ size_t PlanetCRMTerrain::PublishToDeformation(planet::ChDeformationFilter& filte
             nodes.push_back({ChVector2i(i, j), m_base[n] + dz});
         }
     return filter.SetDeltas(nodes, tolerance);
-}
-
-double PlanetCRMTerrain::PublishToVolume() {
-    if (!m_volume)
-        throw std::invalid_argument("PlanetCRMTerrain::PublishToVolume: no volume");
-    // The soil's particles come first among the markers, ahead of the boundary and solid markers
-    std::vector<ChVector3d> positions = m_sysSPH->GetParticlePositions();
-    positions.resize(std::min(positions.size(), GetNumSPHParticles()));
-    const double s = m_spacing;
-    const double h = m_volume->GetVoxelSize();
-    const double r = kRadius * s, k = kBlend * s;
-    const float far = static_cast<float>(3 * h + r);
-
-    // The field over the window, on the volume's lattice, from the floor to above the soil and the ground there
-    double top = -1e300;
-    for (const auto& p : positions)
-        top = std::max(top, p.z());
-    for (double y = m_window.min_y; y <= m_window.max_y; y += h)
-        for (double x = m_window.min_x; x <= m_window.max_x; x += h)
-            top = std::max(top, m_volume->GetTopHeight(x, y));
-    const double reach = r + k + 3 * h;
-    const int i0 = static_cast<int>(std::ceil(m_window.min_x / h)), i1 = static_cast<int>(std::floor(m_window.max_x / h));
-    const int j0 = static_cast<int>(std::ceil(m_window.min_y / h)), j1 = static_cast<int>(std::floor(m_window.max_y / h));
-    // Above the floor by a particle, so the floor's markers do not show as ground
-    const int k0 = static_cast<int>(std::ceil((m_floor + s) / h)), k1 = static_cast<int>(std::ceil((top + reach) / h));
-    if (i0 > i1 || j0 > j1 || k0 > k1)
-        return 0;
-    const int nx = i1 - i0 + 1, ny = j1 - j0 + 1, nz = k1 - k0 + 1;
-    std::vector<float> field(size_t(nx) * ny * nz, far);
-    auto index = [&](int i, int j, int kk) { return size_t(i - i0) + size_t(nx) * (size_t(j - j0) + size_t(ny) * size_t(kk - k0)); };
-
-    const int span = static_cast<int>(std::ceil((r + k) / h)) + 1;
-    for (const auto& p : positions) {
-        if (!m_window.Inset(-reach).Contains(p.x(), p.y()))
-            continue;
-        const int ci = static_cast<int>(std::round(p.x() / h)), cj = static_cast<int>(std::round(p.y() / h)), ck = static_cast<int>(std::round(p.z() / h));
-        for (int kk = std::max(k0, ck - span); kk <= std::min(k1, ck + span); ++kk)
-            for (int j = std::max(j0, cj - span); j <= std::min(j1, cj + span); ++j)
-                for (int i = std::max(i0, ci - span); i <= std::min(i1, ci + span); ++i) {
-                    float& v = field[index(i, j, kk)];
-                    v = SmoothMin(v, static_cast<float>((ChVector3d(i * h, j * h, kk * h) - p).Length() - r), static_cast<float>(k));
-                }
-    }
-
-    // The smooth union is a distance only near the surface: between particles deep in the soil it stays just below
-    // zero. The volume counts soil by distance, so carry the surface values inward with a chamfer sweep, a voxel
-    // deeper each step, so the soil's inside reads as inside.
-    {
-        const float step = static_cast<float>(h);
-        std::vector<bool> surface(field.size(), false);
-        for (int kk = k0; kk <= k1; ++kk)
-            for (int j = j0; j <= j1; ++j)
-                for (int i = i0; i <= i1; ++i) {
-                    float& v = field[index(i, j, kk)];
-                    if (v >= 0)
-                        continue;
-                    // Inside points next to the outside keep their value; the others are found by the sweep
-                    bool edge = false;
-                    const int nb[6][3] = {{i - 1, j, kk}, {i + 1, j, kk}, {i, j - 1, kk}, {i, j + 1, kk}, {i, j, kk - 1}, {i, j, kk + 1}};
-                    for (const auto& q : nb)
-                        if (q[0] >= i0 && q[0] <= i1 && q[1] >= j0 && q[1] <= j1 && q[2] >= k0 && q[2] <= k1 && field[index(q[0], q[1], q[2])] >= 0)
-                            edge = true;
-                    surface[index(i, j, kk)] = edge;
-                }
-        for (size_t n = 0; n < field.size(); ++n)
-            if (field[n] < 0 && !surface[n])
-                field[n] = 0;  // to be found: the sweep takes the least of it and a neighbor's less a voxel
-        auto relax = [&](int i, int j, int kk, int di, int dj, int dk) {
-            const int a = i + di, b = j + dj, c = kk + dk;
-            if (a < i0 || a > i1 || b < j0 || b > j1 || c < k0 || c > k1)
-                return;
-            float& v = field[index(i, j, kk)];
-            const float q = field[index(a, b, c)];
-            if (q < 0)
-                v = std::min(v, q - step);
-        };
-        for (int kk = k0; kk <= k1; ++kk)
-            for (int j = j0; j <= j1; ++j)
-                for (int i = i0; i <= i1; ++i)
-                    if (field[index(i, j, kk)] <= 0 && !surface[index(i, j, kk)]) {
-                        relax(i, j, kk, -1, 0, 0), relax(i, j, kk, 0, -1, 0), relax(i, j, kk, 0, 0, -1);
-                    }
-        for (int kk = k1; kk >= k0; --kk)
-            for (int j = j1; j >= j0; --j)
-                for (int i = i1; i >= i0; --i)
-                    if (field[index(i, j, kk)] <= 0 && !surface[index(i, j, kk)]) {
-                        relax(i, j, kk, 1, 0, 0), relax(i, j, kk, 0, 1, 0), relax(i, j, kk, 0, 0, 1);
-                    }
-        // Inside points the sweep did not reach, such as the bottom of the box over solid soil, are deep inside
-        for (size_t n = 0; n < field.size(); ++n)
-            if (field[n] == 0 && !surface[n])
-                field[n] = -far;
-    }
-
-    // The window's ground above the floor becomes that field
-    const ChAABB box(ChVector3d(i0 * h, j0 * h, k0 * h), ChVector3d(i1 * h, j1 * h, k1 * h));
-    return m_volume->Assign(box, [&](const ChVector3d& p) {
-        const int i = static_cast<int>(std::lround(p.x() / h)), j = static_cast<int>(std::lround(p.y() / h)), kk = static_cast<int>(std::lround(p.z() / h));
-        if (i < i0 || i > i1 || j < j0 || j > j1 || kk < k0 || kk > k1)
-            return far;
-        return field[index(i, j, kk)];
-    });
 }
 
 }  // namespace vehicle

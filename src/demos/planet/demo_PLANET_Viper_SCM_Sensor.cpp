@@ -64,7 +64,7 @@
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/ChPlanetVisualMesh.h"
 #include "chrono_planet/ChSiteFrame.h"
-#include "chrono_planet/dust/ChDustField.h"
+#include "chrono_vehicle/terrain/ChDustField.h"
 #include "chrono_planet/filters/ChDeformationFilter.h"
 #include "chrono_planet/lod/ChPlanetQuadtree.h"
 #include "chrono_planet/planets/moon/ChMoon.h"

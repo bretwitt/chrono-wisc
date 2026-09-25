@@ -25,14 +25,14 @@
 #include "chrono/assets/ChColor.h"
 #include "chrono/physics/ChBodyAuxRef.h"
 
-#include "chrono_planet/dust/ChDustField.h"
+#include "chrono_vehicle/terrain/ChDustField.h"
 
 #include "chrono_sensor/ChConfigSensor.h"
 #include "chrono_sensor/ChSensorManager.h"
 
 /// State of a wheel body spinning about the y axis of its reference frame, as PlanetSCMTerrain has it, for
 /// ChDustField::EmitFromWheels. (The center of mass frame of a ChBodyAuxRef can be turned from it.)
-inline chrono::planet::ChDustField::WheelState DustWheelState(const std::shared_ptr<chrono::ChBody>& body, double radius, double width) {
+inline chrono::vehicle::ChDustField::WheelState DustWheelState(const std::shared_ptr<chrono::ChBody>& body, double radius, double width) {
     const auto& frame = body->GetFrameRefToAbs();
     const chrono::ChVector3d axle = frame.GetRot().GetAxisY();
     return {frame.GetPos(), axle, frame.GetPosDt(), body->GetAngVelParent().Dot(axle), radius, width};
@@ -41,7 +41,7 @@ inline chrono::planet::ChDustField::WheelState DustWheelState(const std::shared_
 /// Hand the dust grid to the manager's cameras, scattering light as grains of the given Hapke parameters and
 /// albedo tint do. Returns false if the render backend draws no participating medium (only Vulkan RT does).
 inline bool SetDustVolume(chrono::sensor::ChSensorManager& manager,
-                          const chrono::planet::ChDustField& dust,
+                          const chrono::vehicle::ChDustField& dust,
                           float hapke_w,
                           float hapke_b,
                           float hapke_c,

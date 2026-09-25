@@ -27,10 +27,10 @@
 
 #include "chrono/utils/ChConstants.h"
 
-#include "chrono_planet/dust/ChDustField.h"
+#include "chrono_vehicle/terrain/ChDustField.h"
 
 using namespace chrono;
-using namespace chrono::planet;
+using namespace chrono::vehicle;
 
 namespace {
 

@@ -73,13 +73,12 @@ class CH_VEHICLE_API PlanetTerrain : public ChTerrain {
     void UseTriangleSoup(bool val) { m_soup = val; }
 
     /// Leave a rectangle of site x/y out of the collision mesh, cutting the faces that cross its edges, where other
-    /// ground takes over, such as a planet::ChSiteVolume's (planet::ChSiteVolume::GetHole, with its collision meshes
-    /// from planet::ChSiteVolumeShapes). Height queries inside it go to `height` (site x/y to height, m), if given,
-    /// such as the volume's top height. Applies from the next patch rebuild; call before Initialize.
+    /// ground takes over, such as a work site modeled on its own with its own collision shapes. Height queries inside
+    /// it go to `height` (site x/y to height, m), if given, such as that ground's top height. Applies from the next patch rebuild; call before Initialize.
     void AddHole(const planet::ChSiteRegion& hole, std::function<double(double x, double y)> height = nullptr);
 
-    /// Keep the patch from colliding with a collision family, such as planet::ChSiteVolumeShapes', whose fixed
-    /// bodies it would otherwise be tested against. Applies from the next patch rebuild; call before Initialize.
+    /// Keep the patch from colliding with a collision family, such as the fixed bodies of other ground, which it would
+    /// otherwise be tested against. Applies from the next patch rebuild; call before Initialize.
     void DisallowCollisionsWith(int family) { m_disallowed_families.push_back(family); }
 
     /// Build the first patch, centered at the given site x/y.
