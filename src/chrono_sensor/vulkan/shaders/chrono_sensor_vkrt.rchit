@@ -29,7 +29,7 @@ struct GpuTriangle {
 };
 
 struct HitPayload {
-    vec4 hit_tuv;        // hit distance, interpolated uv, reserved
+    vec4 hit_tuv;        // hit distance, interpolated uv, distance from the instance's origin
     vec4 normal_object;  // normal xyz, object id
     vec4 tangent_flags;  // tangent xyz, has_uv
     uvec4 ids_hit;       // class id, instance id, hit flag, material index
@@ -91,7 +91,10 @@ void main() {
     // colors from ambient/background only but no direct illumination or shadows.
 
     GpuMaterial mat = materials[mat_id];
-    payload.hit_tuv = vec4(gl_HitTEXT, uv, 0.0);
+    // The hit's distance from its instance's origin: its world position carries the rounding of the instance
+    // transform applied to coordinates this large, which a shadow ray must start clear of
+    float extent = length(gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * gl_HitTEXT);
+    payload.hit_tuv = vec4(gl_HitTEXT, uv, extent);
     payload.normal_object = vec4(n, mat.sensor.z);
     payload.tangent_flags = vec4(t, has_uv);
     payload.ids_hit = uvec4(mat.ids.x, mat.ids.y, 1u, mat_id);

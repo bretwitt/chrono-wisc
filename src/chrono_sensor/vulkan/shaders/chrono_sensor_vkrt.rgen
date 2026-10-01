@@ -55,6 +55,7 @@ struct HitPayload {
 struct TraceResult {
     bool hit;
     float t;
+    float extent;  // the hit's distance from its instance's origin
     vec3 normal;
     vec3 tangent;
     vec2 uv;
@@ -182,7 +183,10 @@ const float TRACE_EPS = 1e-4;
 // that found it. The hit point carries a float rounding error that grows with its distance from the origin and
 // with t, and a ray started closer than that to the surface can hit the surface it leaves: a planet seen from
 // orbit is millions of meters out. The offset is taken along the normal too, since along a grazing `dir` alone
-// it barely leaves the surface. Scenes within a few hundred meters of the origin keep TRACE_EPS.
+// it barely leaves the surface. Scenes within a few hundred meters of the origin keep TRACE_EPS. Callers add to t
+// the hit's distance from its instance's origin: a mesh whose vertices lie kilometers from its body's origin, as a
+// terrain's tiles about a distant site, is placed with rounding of that size, and a shadow ray started closer than
+// it shades its own surface in patches that change as the body moves.
 vec3 shadow_origin(vec3 hit_pos, vec3 n, vec3 dir, float t) {
     vec3 a = abs(hit_pos);
     float eps = max(TRACE_EPS, 4.0 * 1.1920929e-7 * (max(max(a.x, a.y), a.z) + t));
@@ -338,6 +342,7 @@ TraceResult trace_scene(vec3 origin, vec3 direction, float max_t, float t_min) {
     TraceResult out_hit;
     out_hit.hit = payload.ids_hit.z != 0u;
     out_hit.t = payload.hit_tuv.x;
+    out_hit.extent = payload.hit_tuv.w;
     out_hit.normal = normalize(payload.normal_object.xyz);
     out_hit.tangent = normalize(payload.tangent_flags.xyz);
     out_hit.uv = payload.hit_tuv.yz;
@@ -1036,7 +1041,7 @@ vec3 shade_hapke(TraceResult hit, GpuMaterial gpu_mat, vec3 origin, vec3 dir, ui
         float ndl = dot(n, light_dir);
         if (ndl <= 0.0)
             continue;
-        if (visibility_occluded_optix(shadow_origin(hit_pos, n, light_dir, hit.t), light_dir, max_shadow_t))
+        if (visibility_occluded_optix(shadow_origin(hit_pos, n, light_dir, hit.t + hit.extent), light_dir, max_shadow_t))
             continue;
         irradiance *= volume_light_transmittance(hit_pos, light_dir, type, max_shadow_t);
         color += hapke_reflectance(gpu_mat, n, view_dir, light_dir) * ndl * irradiance * albedo;
@@ -1228,7 +1233,7 @@ vec3 shade_planet(TraceResult hit, GpuMaterial gpu_mat, vec3 origin, vec3 dir) {
             irradiance *= air_transmittance(c + n * (scene_data.planet_center.w + 20.0), l);
         if (max_component(irradiance) <= 1e-6)
             continue;
-        if (visibility_occluded_optix(shadow_origin(hit_pos, n, l, hit.t), l, max_shadow_t))
+        if (visibility_occluded_optix(shadow_origin(hit_pos, n, l, hit.t + hit.extent), l, max_shadow_t))
             continue;
         float cos_i = max(ndl, 0.0);
         // The clouds' shadow: the cloud over the place where the ray toward the light crosses their height
@@ -1308,7 +1313,7 @@ vec3 shade_direct(TraceResult hit, vec3 origin, vec3 dir, bool include_ambient, 
             float env_ndl = max(dot(n, env_dir), 0.0);
             if (env_ndl <= 0.0 || env_pdf <= 0.0)
                 continue;
-            vec3 env_origin = shadow_origin(hit_pos, n, env_dir, hit.t);
+            vec3 env_origin = shadow_origin(hit_pos, n, env_dir, hit.t + hit.extent);
             if (visibility_occluded_optix(env_origin, env_dir, 3.402823e38))
                 continue;
             // OptiX launches a material-aware SHADOW ray next, but it necessarily
@@ -1343,7 +1348,7 @@ vec3 shade_direct(TraceResult hit, vec3 origin, vec3 dir, bool include_ambient, 
         if (ndl <= 0.0)
             continue;
 
-        vec3 light_origin = shadow_origin(hit_pos, n, light_dir, hit.t);
+        vec3 light_origin = shadow_origin(hit_pos, n, light_dir, hit.t + hit.extent);
         if (visibility_occluded_optix(light_origin, light_dir, max_shadow_t))
             continue;
         vec3 shadow = vec3(volume_light_transmittance(hit_pos, light_dir, type, max_shadow_t));
