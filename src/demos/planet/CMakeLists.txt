@@ -81,7 +81,8 @@ endif()
 
 # Chrono::Sensor over CRM soil
 if(CH_ENABLE_MODULE_SENSOR AND CH_ENABLE_MODULE_FSI_SPH)
-    foreach(PROGRAM demo_PLANET_Viper_CRM_Sensor demo_PLANET_Viper_CRM_HillClimb demo_PLANET_Viper_CRM_CraterFording)
+    foreach(PROGRAM demo_PLANET_Viper_CRM_Sensor demo_PLANET_Viper_CRM_HillClimb demo_PLANET_Viper_CRM_CraterFording
+                    demo_PLANET_Viper_Hybrid_HillClimb)
         add_executable(${PROGRAM} ${PROGRAM}.cpp ${UTILS})
         source_group("" FILES ${PROGRAM}.cpp ${UTILS})
         if(MSVC)

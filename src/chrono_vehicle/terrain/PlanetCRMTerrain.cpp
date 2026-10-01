@@ -31,7 +31,50 @@ namespace {
 constexpr double kRadius = 0.64;
 }  // namespace
 
-PlanetCRMTerrain::PlanetCRMTerrain(ChSystem& sys, double spacing) : CRMTerrain(sys, spacing) {}
+PlanetCRMTerrain::PlanetCRMTerrain(ChSystem& sys, double spacing) : CRMTerrain(sys, spacing) {
+    m_sysFSI->RegisterMBDCallback(chrono_types::make_shared<ScaledAdvance>(*this));
+}
+
+void PlanetCRMTerrain::ScaledAdvance::Advance(double step, double threshold) {
+    // The soil's wrench on each body is held in the body's soil accumulator: force at the center of mass (absolute),
+    // torque in the body frame. Scaling both scales the wrench.
+    const double scale = m_terrain.m_force_scale;
+    for (const auto& fsi_body : m_terrain.m_sysFSI->GetBodies()) {
+        auto& body = fsi_body->body;
+        const unsigned int idx = fsi_body->fsi_accumulator;
+        const ChVector3d force = body->GetAccumulatedForce(idx);
+        const ChVector3d torque = body->GetAccumulatedTorque(idx);
+        m_terrain.m_wrenches[body.get()] = {force, body->GetRotMat() * torque};
+        if (scale != 1) {
+            body->EmptyAccumulator(idx);
+            body->AccumulateForce(idx, force * scale, body->GetFrameCOMToAbs().GetPos(), false);
+            body->AccumulateTorque(idx, torque * scale, true);
+        }
+    }
+    // then as ChFsiSystem advances the multibody system without a callback
+    ChSystem& sys = m_terrain.m_sysFSI->GetMultibodySystem();
+    const double h_mbd = m_terrain.m_sysFSI->GetStepSizeMBD();
+    double t = 0;
+    while (t < step) {
+        const double h = std::min(h_mbd, step - t);
+        if (h <= threshold)
+            break;
+        sys.DoStepDynamics(h);
+        t += h;
+    }
+}
+
+bool PlanetCRMTerrain::GetSoilWrench(const ChBody& body, ChVector3d& force, ChVector3d& torque) const {
+    auto itr = m_wrenches.find(&body);
+    if (itr == m_wrenches.end()) {
+        force = VNULL;
+        torque = VNULL;
+        return false;
+    }
+    force = itr->second.first;
+    torque = itr->second.second;
+    return true;
+}
 
 PlanetCRMTerrain::~PlanetCRMTerrain() {
     // Initialize added the soil model's ground body to the system; a window replaced by another must not leave it

@@ -100,6 +100,16 @@ class CH_VEHICLE_API PlanetCRMTerrain : public CRMTerrain {
     /// soil starts. Returns the nodes changed by more than `tolerance` (m).
     size_t PublishToDeformation(planet::ChDeformationFilter& filter, double tolerance = 5e-4);
 
+    /// Scale the soil forces applied to the bodies in contact (default: 1). The soil still moves as the bodies press
+    /// into it; only the forces it applies to them are scaled. Used to hand the bodies over to another soil model
+    /// gradually.
+    void SetForceScale(double scale) { m_force_scale = scale; }
+    double GetForceScale() const { return m_force_scale; }
+
+    /// The soil's wrench on a body in contact at the last exchange, before the force scale: force at the body's center
+    /// of mass and torque about it, both in the absolute frame. Returns false for a body not added to the soil.
+    bool GetSoilWrench(const ChBody& body, ChVector3d& force, ChVector3d& torque) const;
+
     const planet::ChSiteRegion& GetWindow() const { return m_window; }
     /// Height of the floor of the soil (m).
     double GetFloor() const { return m_floor; }
@@ -115,6 +125,16 @@ class CH_VEHICLE_API PlanetCRMTerrain : public CRMTerrain {
         const PlanetCRMTerrain& m_terrain;
     };
 
+    // Advances the multibody system over an exchange step with the soil forces on the bodies scaled
+    class ScaledAdvance : public fsi::ChFsiSystem::MBDCallback {
+      public:
+        explicit ScaledAdvance(PlanetCRMTerrain& terrain) : m_terrain(terrain) {}
+        virtual void Advance(double step, double threshold) override;
+
+      private:
+        PlanetCRMTerrain& m_terrain;
+    };
+
     virtual ChVector3d Grid2Point(const ChVector3i& p) override;
     static int64_t CarriedKey(const ChVector3d& pos);
 
@@ -124,6 +144,8 @@ class CH_VEHICLE_API PlanetCRMTerrain : public CRMTerrain {
                const std::function<double(double, double)>& top_at,
                const std::function<bool(const ChVector3d&)>& soil_at);
 
+    double m_force_scale = 1;         // scale of the soil forces on the bodies
+    std::unordered_map<const ChBody*, std::pair<ChVector3d, ChVector3d>> m_wrenches;  // unscaled, absolute
     int m_nx = 0, m_ny = 0;           // lattice columns over the window
     int m_k_floor = 0;                // lattice level of the floor
     std::vector<double> m_shift;      // height shift of each column's particles (ConstructFromHeight)

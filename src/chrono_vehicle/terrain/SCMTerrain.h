@@ -170,6 +170,14 @@ class CH_VEHICLE_API SCMTerrain : public ChTerrain {
     ///  Return the current test height level.
     double GetTestHeight() const;
 
+    /// Scale the soil forces applied to the bodies and nodes in contact (default: 1). The soil still deforms as the
+    /// bodies press into it; only the loads it applies are scaled. Used to hand the bodies over to another soil model
+    /// gradually. GetContactForceBody reports the unscaled forces.
+    void SetForceScale(double scale);
+
+    /// Return the scale of the soil forces applied to the bodies and nodes in contact.
+    double GetForceScale() const;
+
     /// Set the color plot type for the SCM mesh.
     /// Specify the minimum and maximum values for false coloring.
     void SetPlotType(DataPlotType plot_type, double min_val, double max_val);
@@ -237,6 +245,30 @@ class CH_VEHICLE_API SCMTerrain : public ChTerrain {
     /// Specify the callback object to set the soil parameters at given (x,y) locations.
     /// To use constant soil parameters throughout the entire patch, use SetSoilParameters.
     void RegisterSoilParametersCallback(std::shared_ptr<SoilParametersCallback> cb);
+
+    /// Class to be used as a callback interface for a correction to the soil forces SCM applies to a rigid body in
+    /// contact, such as a data-driven model of what SCM misses (see SCMSindyResidual).
+    class CH_VEHICLE_API ContactForceCorrection {
+      public:
+        virtual ~ContactForceCorrection() {}
+
+        /// Given SCM's wrench on `body` (absolute frame: force at the body's center of mass, torque about it), return
+        /// the wrench to add to it, in the same frames. Called once per step for each body in contact, and for each body
+        /// GetBodies names, in contact or not (with a zero wrench if not).
+        virtual void Correct(ChBody& body,
+                             const ChVector3d& force,
+                             const ChVector3d& torque,
+                             ChVector3d& dforce,
+                             ChVector3d& dtorque) = 0;
+
+        /// Bodies to correct even when SCM does not touch them (default: none).
+        virtual std::vector<ChBody*> GetBodies() const { return {}; }
+    };
+
+    /// Specify the callback object that corrects the soil forces on rigid bodies in contact (default: none). The
+    /// correction is added before the force scale (SetForceScale) and is not applied in co-simulation mode;
+    /// GetContactForceBody reports the uncorrected forces.
+    void RegisterContactForceCorrection(std::shared_ptr<ContactForceCorrection> cb);
 
     /// Get the initial (undeformed) terrain height below the specified location.
     double GetInitHeight(const ChVector3d& loc) const;
@@ -729,6 +761,7 @@ class CH_VEHICLE_API SCMLoader : public ChLoadContainer {
     ChColormap::Type m_colormap_type;                            ///< colormap type
 
     bool m_cosim_mode;  ///< co-simulation mode
+    double m_force_scale = 1;  ///< scale of the loads applied to bodies and nodes in contact
 
     // SCM parameters
     double m_Bekker_Kphi;    ///< frictional modulus in Bekker model
@@ -742,6 +775,7 @@ class CH_VEHICLE_API SCMLoader : public ChLoadContainer {
 
     // Callback object for position-dependent soil properties
     std::shared_ptr<SCMTerrain::SoilParametersCallback> m_soil_fun;
+    std::shared_ptr<SCMTerrain::ContactForceCorrection> m_force_correction;
 
     // Contact forces on contactable objects interacting with the SCM terrain
     std::unordered_map<ChBody*, std::pair<ChVector3d, ChVector3d>> m_body_forces;

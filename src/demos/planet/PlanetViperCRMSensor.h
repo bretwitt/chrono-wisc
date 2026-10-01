@@ -58,7 +58,7 @@
 // material instead of Hapke, --no-rocks skips the boulder field, --no-dust
 // and --no-berms leave those out, --no-gi leaves out the light the regolith
 // bounces into the shadows, --samples <n> rays per pixel, rounded to a square
-// (default 64), --speed
+// (default 4), --speed
 // <rad/s> wheel speed (default 0.4, about 0.1 m/s; faster wheels throw soil up),
 // --camera chase|mast|both|side (default both), --fine-roughness <x> slope growth per
 // octave of the ground's fine roughness (default 1.2; the Moon preset's is 1.4),
@@ -68,7 +68,17 @@
 // Sun keeps its azimuth relative to the start heading). --noise-tolerance <steps> lets the cameras stop
 // sampling a pixel once its noise is below that many 8-bit steps (default 0.5;
 // 0 takes every sample), --profile reports where the wall time goes each second, and
-// --gpu-checks turns on the CRM solver's checks for GPU errors.
+// --gpu-checks turns on the CRM solver's checks for GPU errors, --no-gi-cache traces
+// a GI ray per camera sample instead of taking the GI from a cache
+// (ChCameraSensor::SetGICache; with it, use --samples 64), --gi-rays <n>
+// sets the cache's GI rays per texel (default 128), and --soil
+// crm|hybrid|scm picks the soil model (see ViperCRMScenario::soil).
+//
+// SCM residual model (vehicle::SCMSindyResidual): with --soil hybrid,
+// --sindy-train <model.json> collects CRM-minus-SCM wheel forces while CRM
+// carries the rover, fits a sparse model of them at the end of the run, and
+// saves it (with the samples as <model.json>.csv). --sindy-model <model.json>
+// adds a saved model's correction to SCM's wheel forces (--soil scm or hybrid).
 //
 // =============================================================================
 
@@ -80,12 +90,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
 
 #include "chrono/core/ChDataPath.h"
 #include "chrono/physics/ChSystemNSC.h"
+#include "chrono/solver/ChIterativeSolver.h"
 #include "chrono/assets/ChVisualShapeTriangleMesh.h"
 #include "chrono/geometry/ChTriangleMeshConnected.h"
 #include "chrono/utils/ChBodyGeometry.h"
@@ -103,6 +115,9 @@
 #include "chrono_planet/planets/moon/ChMoon.h"
 
 #include "chrono_vehicle/terrain/PlanetCRMWindow.h"
+#include "chrono_vehicle/terrain/PlanetHybridTerrain.h"
+#include "chrono_vehicle/terrain/SCMSindyResidual.h"
+#include "chrono_vehicle/terrain/PlanetSCMTerrain.h"
 
 #include "chrono_sensor/ChSensorManager.h"
 #include "chrono_sensor/filters/ChFilterAccess.h"
@@ -134,6 +149,9 @@ struct ViperCRMScenario {
     double sun_elevation = 12;                      ///< Sun elevation (deg)
     double sun_azimuth = 140;                       ///< Sun azimuth relative to the start heading (deg)
     double friction = 0.5;                          ///< friction of the loose surface regolith
+    /// Soil model: "crm" (CRM throughout), "hybrid" (SCM, switching to CRM on steep ground and at high slip; see
+    /// vehicle::PlanetHybridTerrain) or "scm" (SCM throughout)
+    std::string soil = "crm";
 };
 
 namespace viper_crm_sensor {
@@ -168,8 +186,14 @@ double drive_speed;  // rad/s
 const double settle_time = 2.0;
 
 // Pixel noise (8-bit steps) at which a camera stops sampling a pixel (ChCameraSensor::SetNoiseTolerance), 0 for every
-// sample: sunlit ground stops after 16 of the 64 samples, and the cameras take about half the time
+// sample: at 64 samples per pixel, sunlit ground stops after 16 (below 16, as with the GI cache, it has no effect)
 float noise_tolerance = 0.5f;
+
+// Take the cameras' GI from a cache traced at a quarter of the resolution (ChCameraSensor::SetGICache): the samples
+// per pixel are then left for the edges, and 4 give shadows as smooth as 64 GI rays per pixel did, in about a
+// twentieth of the time
+bool gi_cache = true;
+unsigned int gi_cache_rays = 0;  // GI rays per cache texel (ChCameraSensor::SetGICacheRays), 0 for the default
 
 // Boulders around the rover
 const double rock_min_radius = 0.15;
@@ -231,6 +255,8 @@ inline void AddCamera(ChSensorManager& manager,
     cam->SetLag(0.f);
     cam->SetCollectionWindow(0.f);
     cam->SetNoiseTolerance(noise_tolerance);
+    cam->SetGICache(gi_cache);
+    cam->SetGICacheRays(gi_cache_rays);
     if (window)
         cam->PushFilter(chrono_types::make_shared<ChFilterVisualize>(640, 360, name));
     cam->PushFilter(chrono_types::make_shared<ChFilterRGBA8Access>());
@@ -297,9 +323,12 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
     bool use_rocks = true;
     bool use_dust = true;
     bool berms = true;
-    unsigned int samples = 64;
+    unsigned int samples = 4;
     bool gi = true;
     std::string cameras = scenario.camera;
+    std::string soil_model = scenario.soil;
+    std::string sindy_train;  // file to save a trained SCM residual model to
+    std::string sindy_model;  // file of an SCM residual model to apply
     double fine_boost = 1.2;
     double compaction_depth = 0.003;
     double rut_darkening = 0.5;  // albedo of compacted ground, relative to undisturbed
@@ -361,6 +390,12 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
             fine_boost = std::atof(argv[++i]);
         else if (!std::strcmp(argv[i], "--camera") && i + 1 < argc)
             cameras = argv[++i];
+        else if (!std::strcmp(argv[i], "--gi-rays") && i + 1 < argc)
+            gi_cache_rays = static_cast<unsigned int>(std::atoi(argv[++i]));
+        else if (!std::strcmp(argv[i], "--no-gi-cache"))
+            gi_cache = false;
+        else if (!std::strcmp(argv[i], "--soil") && i + 1 < argc)
+            soil_model = argv[++i];
         else if (!std::strcmp(argv[i], "--noise-tolerance") && i + 1 < argc)
             noise_tolerance = float(std::atof(argv[++i]));
         else if (!std::strcmp(argv[i], "--profile"))
@@ -369,6 +404,19 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
             gpu_checks = true;
         else if (!std::strcmp(argv[i], "--no-gi"))
             gi = false;
+        else if (!std::strcmp(argv[i], "--sindy-train") && i + 1 < argc)
+            sindy_train = argv[++i];
+        else if (!std::strcmp(argv[i], "--sindy-model") && i + 1 < argc)
+            sindy_model = argv[++i];
+    }
+
+    if (!sindy_train.empty() && soil_model != "hybrid") {
+        std::cerr << "--sindy-train needs --soil hybrid: it trains on CRM while CRM carries the rover" << std::endl;
+        return 1;
+    }
+    if (!sindy_model.empty() && soil_model == "crm") {
+        std::cerr << "--sindy-model corrects SCM: use --soil scm or hybrid" << std::endl;
+        return 1;
     }
 
     const std::string out_dir = GetChronoOutputPath() + scenario.name + "/";
@@ -411,6 +459,11 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
     ChSystemNSC sys;
     sys.SetGravitationalAcceleration(ChVector3d(0, 0, -gravity));
     sys.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
+    if (soil_model != "crm") {
+        // as demo_PLANET_Viper_SCM_Sensor, for the SCM soil
+        sys.SetSolverType(ChSolver::Type::BARZILAIBORWEIN);
+        sys.GetSolver()->AsIterative()->SetMaxIterations(50);
+    }
     auto rock_mat = chrono_types::make_shared<ChContactMaterialNSC>();
     rock_mat->SetFriction(0.8f);
     rock_mat->SetRestitution(0.01f);
@@ -464,13 +517,63 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
         crm.SetActiveDomain(ChVector3d(0.5, 0.5, 0.5));
         crm.GetFluidSystemSPH()->EnableGPUErrorCheck(gpu_checks);
     };
-    PlanetCRMWindow soil(sys, surface, site, ruts, spacing, setup);
-    soil.SetWindow(window_length, window_width, window_depth, window_margin);
-    for (int i = 0; i < 4; ++i)
-        soil.AddWheel(viper.GetWheels()[i]->GetBody(), wheel_radius, wheel_width);
-    soil.SetBerms(berms);
-    soil.Initialize(chassis);
-    std::cout << "CRM window: " << soil.GetTerrain().GetNumSPHParticles() << " particles" << std::endl;
+    std::unique_ptr<PlanetCRMWindow> crm_soil;
+    std::unique_ptr<PlanetHybridTerrain> hybrid;
+    std::shared_ptr<SCMSindyResidual> residual;
+    if (soil_model == "crm") {
+        crm_soil = chrono_types::make_unique<PlanetCRMWindow>(sys, surface, site, ruts, spacing, setup);
+        crm_soil->SetWindow(window_length, window_width, window_depth, window_margin);
+        for (int i = 0; i < 4; ++i)
+            crm_soil->AddWheel(viper.GetWheels()[i]->GetBody(), wheel_radius, wheel_width);
+        crm_soil->SetBerms(berms);
+        crm_soil->Initialize(chassis);
+        std::cout << "CRM window: " << crm_soil->GetTerrain().GetNumSPHParticles() << " particles" << std::endl;
+    } else {
+        // SCM soil over the whole site, with its ruts in the same filter the CRM windows seed from and stamp into.
+        // Soft, loose regolith, as demo_PLANET_Viper_SCM_Sensor.
+        std::vector<PlanetSCMTerrain::Wheel> scm_wheels;
+        for (int i = 0; i < 4; ++i)
+            scm_wheels.push_back({viper.GetWheels()[i]->GetBody(), wheel_radius, wheel_width});
+        auto scm = chrono_types::make_shared<PlanetSCMTerrain>(&sys, surface, site);
+        PlanetSCMTerrain::Params params;
+        params.delta = rut_spacing;
+        params.bekker_kphi = 0.1e6;
+        params.bekker_kc = 0;
+        params.bekker_n = 1.1;
+        params.mohr_cohesion = 1e3;
+        params.mohr_friction = 30;
+        params.janosi_shear = 0.01;
+        params.elastic_k = 2e7;
+        params.damping_r = 3e4;
+        scm->Initialize(params, scm_wheels);
+        scm->SetDeformationFilter(ruts);
+        hybrid = chrono_types::make_unique<PlanetHybridTerrain>(sys, scm, surface, site, ruts, spacing, setup);
+        PlanetHybridTerrain::Policy policy;
+        policy.enabled = soil_model == "hybrid";
+        hybrid->SetPolicy(policy);
+        hybrid->SetWindow(window_length, window_width, window_depth, window_margin);
+        hybrid->SetBerms(berms);
+        for (int i = 0; i < 4; ++i)
+            hybrid->AddWheel(viper.GetWheels()[i]->GetBody(), wheel_radius, wheel_width);
+        hybrid->Initialize(chassis);
+
+        // SCM residual model: trained on CRM here, or loaded and added to SCM's wheel forces
+        if (!sindy_train.empty() || !sindy_model.empty()) {
+            residual = sindy_model.empty() ? chrono_types::make_shared<SCMSindyResidual>() : SCMSindyResidual::FromFile(sindy_model);
+            residual->SetTerrain(scm.get());
+            for (int i = 0; i < 4; ++i)
+                residual->AddWheel(viper.GetWheels()[i]->GetBody(), wheel_radius);
+        }
+        if (!sindy_model.empty()) {
+            scm->RegisterContactForceCorrection(residual);
+            std::cout << "SCM residual model " << sindy_model << ":\n" << residual->GetEquations();
+        }
+        if (!sindy_train.empty())
+            hybrid->SetResidualRecorder(residual);
+    }
+    // The CRM window, while there is one
+    auto crm_window = [&]() -> PlanetCRMWindow* { return crm_soil ? crm_soil.get() : hybrid->GetCRMWindow(); };
+    auto soil_height = [&](double x, double y) { return crm_soil ? crm_soil->GetHeight(x, y) : hybrid->GetHeight(x, y); };
 
     // Terrain and rocks as the cameras see them. Compacting regolith breaks up its porous surface, so ruts look
     // darker than the ground around them.
@@ -515,7 +618,7 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
         // size distribution alone would give: a thinner, grainier spray
         dust_params.bins = {{5e-6, 0.05}, {25e-6, 0.35}, {100e-6, 0.60}};
         // Over the ground with the ruts, so a wheel riding in its rut is in contact with the soil
-        dust = chrono_types::make_unique<ChDustField>(dust_params, [&soil](double x, double y) { return soil.GetHeight(x, y); });
+        dust = chrono_types::make_unique<ChDustField>(dust_params, [&soil_height](double x, double y) { return soil_height(x, y); });
         // Soil carried on the tread and shed as the wheel turns: most right behind the contact, some riding up and over
         // the top of the wheel
         ChDustField::WheelEmission emission;
@@ -627,6 +730,10 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
     };
     std::vector<ThrownSoil> thrown_soil(4);
     size_t thrown = 0;
+    // The soil model at each camera frame: time, mode|CRM share|slope ahead (deg)|slip
+    std::ofstream mode_log;
+    if (save)
+        mode_log.open(out_dir + "soil_mode.txt");
     const auto wall_start = std::chrono::steady_clock::now();
     // Wall time spent per report period in each part of the loop (--profile)
     enum Part { kRuts, kTerrain, kDust, kEmission, kSensors, kSoil, kParts };
@@ -645,7 +752,11 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
         const double time = sys.GetChTime();
         const ChVector3d pos = chassis->GetPos();
         if (time >= next_frame) {
-            soil.Publish();
+            crm_soil ? crm_soil->Publish() : hybrid->Publish();
+            if (mode_log.is_open())
+                mode_log << time << " " << (hybrid ? PlanetHybridTerrain::GetModeName(hybrid->GetMode()) : "CRM") << "|"
+                         << (hybrid ? hybrid->GetCRMShare() : 1.0) << "|" << (hybrid ? hybrid->GetSlope() : 0.0) << "|"
+                         << (hybrid ? hybrid->GetSlip() : 0.0) << std::endl;
             clock(kRuts);
             visual_terrain.Update(pos, time);
             clock(kTerrain);
@@ -658,15 +769,15 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
             clock(kDust);
             next_frame += frame_period;
         }
-        if (dust && dust_model == "particles" && time >= next_dust) {
-            thrown += soil.EmitDust(*dust, time);
+        if (dust && dust_model == "particles" && time >= next_dust && crm_window()) {
+            thrown += crm_window()->EmitDust(*dust, time);
             next_dust += dust_period;
         }
-        if (dust && dust_model == "physics") {
+        if (dust && dust_model == "physics" && crm_window()) {
             // Soil the CRM soil throws into free flight at each wheel, measured every dust_period and emitted smoothly
             // at its rate, from where and at the velocities the soil had
             if (time >= next_dust) {
-                const auto ejecta = soil.MeasureEjecta(time);
+                const auto ejecta = crm_window()->MeasureEjecta(time);
                 const double follow = 1 - std::exp(-dust_period / 0.2);
                 for (size_t w = 0; w < ejecta.size(); ++w) {
                     ThrownSoil& t = thrown_soil[w];
@@ -707,14 +818,14 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
         clock(kSensors);
 
         viper.Update();
-        soil.Advance(exchange_step);
+        crm_soil ? crm_soil->Advance(exchange_step) : hybrid->Advance(exchange_step);
         clock(kSoil);
 
         if (sys.GetChTime() >= next_report) {
             next_report += 1.0;
             const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
             std::cout << "t = " << sys.GetChTime() << " s (" << sys.GetChTime() / wall << "x real time), at (" << pos.x() << ", "
-                      << pos.y() << "), speed " << chassis->GetPosDt().Length() << " m/s, window moves " << soil.GetNumMoves() << ", "
+                      << pos.y() << "), speed " << chassis->GetPosDt().Length() << " m/s, window moves " << (crm_window() ? crm_window()->GetNumMoves() : 0) << ", "
                       << ruts->GetNumNodes() << " rut nodes, " << thrown << " particles thrown up, " << visual_terrain.GetNumTiles()
                       << " tiles (" << visual_terrain.GetNumTriangles() << " triangles)";
             // slip: how much of the wheels' rim speed does not carry the rover forward
@@ -729,6 +840,9 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
                 std::cout << ", slip " << 1 - advance / rim;
             if (dust)
                 std::cout << ", dust " << dust->GetStats().aloft * 1e3 << " g aloft";
+            if (hybrid)
+                std::cout << ", soil " << PlanetHybridTerrain::GetModeName(hybrid->GetMode()) << " (CRM share " << hybrid->GetCRMShare()
+                          << ", slope ahead " << hybrid->GetSlope() << " deg, slip " << hybrid->GetSlip() << ")";
             std::cout << std::endl;
             if (profile) {
                 std::cout << "  wall s:";
@@ -742,6 +856,22 @@ inline int RunViperCRMSensor(int argc, char* argv[], const ViperCRMScenario& sce
     }
     if (save)
         std::cout << "Camera images in " << out_dir << std::endl;
+
+    if (!sindy_train.empty()) {
+        residual->WriteSamples(sindy_train + ".csv");
+        std::cout << residual->GetSamples().size() << " residual samples in " << sindy_train << ".csv" << std::endl;
+        try {
+            const auto report = residual->Fit();
+            for (int i = 0; i < SCMSindyResidual::kNumOutputs; ++i)
+                std::cout << "  " << SCMSindyResidual::GetOutputName(i) << ": " << report[i].num_terms << " terms, R2 " << report[i].r2
+                          << ", RMSE " << report[i].rmse << std::endl;
+            std::cout << residual->GetEquations();
+            residual->Save(sindy_train);
+            std::cout << "SCM residual model in " << sindy_train << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "No residual model fitted: " << e.what() << std::endl;
+        }
+    }
     return 0;
 }
 

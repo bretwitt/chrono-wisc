@@ -210,6 +210,7 @@ void PlanetCRMWindow::Seed(const ChVector2d& center) {
                                       center.y() + 0.5 * m_width);
     m_terrain = std::make_unique<PlanetCRMTerrain>(m_sys, m_spacing);
     m_setup(*m_terrain);
+    m_terrain->SetForceScale(m_force_scale);
     if (!carried.empty())
         m_terrain->SetCarriedParticles(std::move(carried), carried_region);
     m_terrain->ConstructFromHeight([this](double x, double y) { return GetSeedHeight(x, y); }, window, m_depth);
@@ -228,6 +229,12 @@ void PlanetCRMWindow::Seed(const ChVector2d& center) {
     m_terrain->Initialize();
     if (m_wheels.empty())
         m_terrain->PublishToDeformation(*m_ruts);  // records where the soil starts
+}
+
+void PlanetCRMWindow::SetForceScale(double scale) {
+    m_force_scale = scale;
+    if (m_terrain)
+        m_terrain->SetForceScale(scale);
 }
 
 void PlanetCRMWindow::Initialize(std::shared_ptr<ChBody> follow) {

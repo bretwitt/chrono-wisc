@@ -262,6 +262,39 @@ while (...) {
 }
 ~~~
 
+`vehicle::PlanetHybridTerrain` runs SCM soil (`vehicle::PlanetSCMTerrain`)
+where it holds and brings a CRM window in where it does not. SCM has no soil
+flow, so it cannot capture a wheel digging in: when the ground ahead of the
+rover rises past a slope, or its wheels slip, for longer than a dwell time, a
+window is seeded from the ruts SCM left (the two share the deformation filter),
+runs without loading the wheels while it settles, and then takes their load
+over a blend time, each model's forces scaled by its share
+(`SCMTerrain::SetForceScale`, `PlanetCRMWindow::SetForceScale`). On gentle
+ground at low slip the window's ruts go back to SCM as its ground
+(`SCMTerrain::SetModifiedNodes`) and the load moves back. On SCM the soil runs
+about as fast as real time (1.2x with a single low-quality camera), and in the
+window at CRM's pace. See
+`demo_PLANET_Viper_Hybrid_HillClimb`.
+
+`vehicle::SCMSindyResidual` carries what CRM teaches back into SCM. SCM keeps
+computing its wheel forces while CRM carries the rover, so
+`PlanetHybridTerrain::SetResidualRecorder` can collect, for each wheel, CRM's
+wrench less SCM's with the wheel in the same state. `Fit` then finds a
+sparse model of that residual (SINDy, sequentially thresholded least squares)
+over polynomial terms in the wheel's slip, lateral slip, slope, and sinkage.
+The residual is a function of the wheel's state alone, in a wheel-ground frame
+and in units of a constant force scale (the nominal wheel load); it is not
+divided by SCM's load, which in training is taken at CRM's sinkage and can be
+far from the wheel's. Registered with SCM
+(`SCMTerrain::RegisterContactForceCorrection`), the model adds its correction to
+SCM's forces while SCM touches the wheel, scaled by SCM's force share. A
+single-wheel rig sweeping slip, slope and load gives cleaner training data than
+a rover run, whose samples cover a narrow range of states.
+Features are clamped to the range seen in training, and outputs to the largest
+magnitude seen, so the model is not trusted beyond its data. In the demos,
+`--sindy-train <model.json>` (hybrid soil) trains and saves a model, and
+`--sindy-model <model.json>` applies one.
+
 Where other ground takes over part of the site, `ChPlanetVisualMesh::AddHole`,
 `ChPlanetVisualizationVSG::AddHole` and `vehicle::PlanetTerrain::AddHole` leave
 a rectangle out of the drawn tiles and the collision patch, cutting the faces

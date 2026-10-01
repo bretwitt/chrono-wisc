@@ -25,7 +25,7 @@ struct GpuLight {
     vec4 pos_range;    // pos xyz, range
     vec4 dir_type;     // dir xyz, LightType as float
     vec4 color_atten;  // color rgb, attenuation scale; negative means constant color
-    vec4 params;       // angle, angle falloff start, angle attenuation rate, spot cos-half-angle or area/radius
+    vec4 params;       // angle, angle falloff start, angle attenuation rate, spot cos-half-angle, area/radius or directional disk radius
 };
 
 struct GpuSceneData {
@@ -33,6 +33,16 @@ struct GpuSceneData {
     vec4 background0;
     vec4 background1;
     uvec4 counts;      // light count, background mode, environment texture id, texture count
+    // The planet's atmosphere and frame (ChVulkanRTAtmosphere on the host)
+    vec4 planet_center;  // center xyz, ground radius
+    vec4 planet_x;       // its x axis, top of the air's radius
+    vec4 planet_y;       // its y axis, 1 if there is an atmosphere
+    vec4 planet_z;       // its z axis, clouds' height
+    vec4 rayleigh;       // scattering rgb, scale height
+    vec4 mie;            // scattering, extinction, scale height, g
+    vec4 ozone;          // absorption rgb, center height
+    vec4 ozone_width;    // half width, reserved
+    vec4 stars;          // the stars' map's texture id (bits), the scale its texels are taken at, reserved
 };
 
 struct HitPayload {
@@ -89,6 +99,13 @@ layout(std430, set = 0, binding = 9) readonly buffer Volume {
     uint volume_data[];
 };
 
+// The GI cache: per texel of a quarter-resolution grid over the image, the first surface its center ray hits
+// (position, 1 if there is one), the surface's normal and distance, and the light bounced onto it, E = mean of
+// cos * L over the GI cap (see bake_gi_cache)
+layout(std430, set = 0, binding = 10) buffer GiCache {
+    vec4 gi_cache[];
+};
+
 layout(location = 0) rayPayloadEXT HitPayload payload;
 
 struct ShadowPayload {
@@ -140,8 +157,15 @@ const uint INVALID_TEXTURE = 0xffffffffu;
 // Camera BSDF selector in GpuMaterial.ids.z; must match CH_VKRT_BSDF_* on the host.
 const uint BSDF_LEGACY = 0u;
 const uint BSDF_HAPKE = 1u;
+const uint BSDF_PLANET = 2u;
 const uint FLAG_USE_GI = 1u;
 const uint FLAG_VOLUME = 2u;
+const uint FLAG_TONE_MAP = 4u;
+const uint FLAG_FISHEYE = 8u;  // an equidistant fisheye: the image's width spans the horizontal FOV in angle
+const uint FLAG_GI_CACHE = 1u << 24;  // camera samples take their GI from the cache where it matches
+const uint PIPE_GI_CACHE = 8u;        // launch that fills the GI cache
+const uint GI_CACHE_BLOCK = 4u;       // image pixels per GI cache texel, along each axis
+const uint GI_CACHE_RAYS = 128u;      // default GI rays per cache texel (flags bits 25-31 give it in 16s)
 
 uint max_trace_depth() {
     // OptiX camera PRDs start at depth 2 and launch a child only while
@@ -378,6 +402,44 @@ vec3 shading_normal(TraceResult hit) {
     return normalize(mapped.x * t + mapped.y * b + mapped.z * n);
 }
 
+// The stars' light from a direction (ChVulkanRTStarField): their map, bilinear, as it is baked (linear, no gamma)
+vec3 star_light(vec3 dir) {
+    uint tex = floatBitsToUint(scene_data.stars.x);
+    if (tex == INVALID_TEXTURE || tex >= scene_data.counts.w)
+        return vec3(0.0);
+    vec3 d = normalize(dir);
+    vec2 uv = vec2(atan(d.y, d.x) / (2.0 * PI) + 0.5, asin(clamp(d.z, -1.0, 1.0)) / PI + 0.5);
+    return sample_texture(tex, uv, vec2(1.0)).rgb * scene_data.stars.y;
+}
+
+// The directional lights' disks (ChVulkanRTLight::disk_radius, in params.w) seen along dir: each light's irradiance
+// over its disk's solid angle times pi, in the units the renderer shades in, darkened toward the limb as the Sun's
+// photosphere is in visible light (I(mu) = 1 - 0.6 (1 - mu); Neckel & Labs 1994), and divided by the mean of that
+// over the disk (1 - 0.6 / 3) so that the disk gives the light's irradiance. The angle from the light is taken from
+// the cross product's length, which keeps it to a small fraction of the disk where a dot product near 1 would not.
+vec3 light_disks(vec3 dir) {
+    const float LIMB = 0.6;
+    vec3 d = normalize(dir);
+    vec3 light = vec3(0.0);
+    for (uint k = 0u; k < scene_data.counts.x; ++k) {
+        GpuLight light_k = lights[k];
+        float radius = light_k.params.w;
+        if (int(light_k.dir_type.w + 0.5) != LIGHT_DIRECTIONAL || radius <= 0.0)
+            continue;
+        vec3 l = normalize(light_k.dir_type.xyz);
+        float sin_r = sin(radius);
+        float sin_a = length(cross(d, l));
+        if (dot(d, l) <= 0.0 || sin_a >= sin_r)
+            continue;
+        float half_r = sin(0.5 * radius);
+        float solid_angle = 4.0 * PI * half_r * half_r;  // 2 pi (1 - cos r), without the cancellation
+        float q = sin_a / sin_r;
+        float mu = sqrt(max(0.0, 1.0 - q * q));
+        light += light_k.color_atten.rgb * (PI / solid_angle) * (1.0 - LIMB * (1.0 - mu)) / (1.0 - LIMB / 3.0);
+    }
+    return light;
+}
+
 vec3 background_color(vec3 dir) {
     uint mode = scene_data.counts.y;
     if (mode == BACKGROUND_ENVIRONMENT && scene_data.counts.z != INVALID_TEXTURE) {
@@ -609,27 +671,57 @@ struct VolumeInfo {
     vec3 color;
     float phase_b;
     float phase_c;
+    vec4 rot;  // the grid's axes in the scene, a unit quaternion (w, x, y, z)
 };
 
 bool volume_enabled() {
     return (pc.flags & FLAG_VOLUME) != 0u;
 }
 
-VolumeInfo load_volume() {
+// The buffer holds up to VOLUME_MAX media: their count, then where each one's header starts. Its brick and voxel
+// offsets are from the buffer's start
+const uint VOLUME_MAX = 4u;
+
+uint volume_count() {
+    return min(volume_data[0], VOLUME_MAX);
+}
+
+VolumeInfo load_volume(uint m) {
+    uint b = volume_data[1u + m];
     VolumeInfo v;
-    v.origin = vec3(uintBitsToFloat(volume_data[0]), uintBitsToFloat(volume_data[1]), uintBitsToFloat(volume_data[2]));
-    v.voxel = uintBitsToFloat(volume_data[3]);
-    v.dims = ivec3(volume_data[4], volume_data[5], volume_data[6]);
-    v.brick_size = volume_data[7];
-    v.bricks = ivec3(volume_data[8], volume_data[9], volume_data[10]);
-    v.brick_offset = volume_data[11];
-    v.voxel_offset = volume_data[12];
-    v.sun_dir = vec3(uintBitsToFloat(volume_data[16]), uintBitsToFloat(volume_data[17]), uintBitsToFloat(volume_data[18]));
-    v.albedo = uintBitsToFloat(volume_data[19]);
-    v.color = vec3(uintBitsToFloat(volume_data[20]), uintBitsToFloat(volume_data[21]), uintBitsToFloat(volume_data[22]));
-    v.phase_b = uintBitsToFloat(volume_data[23]);
-    v.phase_c = uintBitsToFloat(volume_data[24]);
+    v.origin = vec3(uintBitsToFloat(volume_data[b + 0u]), uintBitsToFloat(volume_data[b + 1u]), uintBitsToFloat(volume_data[b + 2u]));
+    v.voxel = uintBitsToFloat(volume_data[b + 3u]);
+    v.dims = ivec3(volume_data[b + 4u], volume_data[b + 5u], volume_data[b + 6u]);
+    v.brick_size = volume_data[b + 7u];
+    v.bricks = ivec3(volume_data[b + 8u], volume_data[b + 9u], volume_data[b + 10u]);
+    v.brick_offset = volume_data[b + 11u];
+    v.voxel_offset = volume_data[b + 12u];
+    v.sun_dir = vec3(uintBitsToFloat(volume_data[b + 16u]), uintBitsToFloat(volume_data[b + 17u]), uintBitsToFloat(volume_data[b + 18u]));
+    v.albedo = uintBitsToFloat(volume_data[b + 19u]);
+    v.color = vec3(uintBitsToFloat(volume_data[b + 20u]), uintBitsToFloat(volume_data[b + 21u]), uintBitsToFloat(volume_data[b + 22u]));
+    v.phase_b = uintBitsToFloat(volume_data[b + 23u]);
+    v.phase_c = uintBitsToFloat(volume_data[b + 24u]);
+    v.rot = vec4(uintBitsToFloat(volume_data[b + 25u]), uintBitsToFloat(volume_data[b + 26u]), uintBitsToFloat(volume_data[b + 27u]),
+                 uintBitsToFloat(volume_data[b + 28u]));
     return v;
+}
+
+// A direction in the scene, in the grid's axes
+vec3 volume_dir(VolumeInfo v, vec3 d) {
+    vec3 u = -v.rot.yzw;
+    return d + 2.0 * v.rot.x * cross(u, d) + 2.0 * cross(u, cross(u, d));
+}
+
+// A point in the scene, from the grid's corner in its axes
+vec3 volume_point(VolumeInfo v, vec3 p) {
+    return volume_dir(v, p - v.origin);
+}
+
+// The grid as its own frame sees it: its corner at the origin, the helpers below working in its axes
+VolumeInfo volume_local(VolumeInfo v) {
+    VolumeInfo l = v;
+    l.origin = vec3(0.0);
+    return l;
 }
 
 // 1 / d per component, finite where d is zero
@@ -704,13 +796,21 @@ float volume_optical_depth(VolumeInfo v, vec3 ro, vec3 rd, float t_max) {
 float volume_light_transmittance(vec3 hit_pos, vec3 light_dir, int type, float max_t) {
     if (!volume_enabled())
         return 1.0;
-    VolumeInfo v = load_volume();
-    if (type == LIGHT_DIRECTIONAL && dot(light_dir, v.sun_dir) > 0.99999) {
-        vec3 q = (hit_pos - v.origin) / (v.voxel * vec3(v.dims));
-        if (all(greaterThanEqual(q, vec3(0.0))) && all(lessThanEqual(q, vec3(1.0))))
-            return volume_sample(v, hit_pos).y;
+    float through = 1.0;
+    for (uint m = 0u; m < volume_count(); ++m) {
+        VolumeInfo v = load_volume(m);
+        VolumeInfo l = volume_local(v);
+        vec3 p = volume_point(v, hit_pos);
+        if (type == LIGHT_DIRECTIONAL && dot(light_dir, v.sun_dir) > 0.99999) {
+            vec3 q = p / (v.voxel * vec3(v.dims));
+            if (all(greaterThanEqual(q, vec3(0.0))) && all(lessThanEqual(q, vec3(1.0)))) {
+                through *= volume_sample(l, p).y;
+                continue;
+            }
+        }
+        through *= exp(-volume_optical_depth(l, p, volume_dir(v, light_dir), max_t));
     }
-    return exp(-volume_optical_depth(v, hit_pos, light_dir, max_t));
+    return through;
 }
 
 // Light scattered toward the viewer per unit extinction at p: w * color * sum over lights of irradiance * phase / 4 pi.
@@ -764,10 +864,13 @@ vec3 volume_source(VolumeInfo v, vec3 p, vec3 view_dir, vec2 sun_tv) {
 // Single scattering along a camera ray up to t_max: rgb light added, a transmittance of what lies behind. Samples
 // sit a voxel apart from a random start, and each step integrates exactly for constant extinction and light over it.
 // Bricks holding no medium are skipped.
-vec4 volume_march(vec3 ro, vec3 rd, float t_max, uint seed) {
-    VolumeInfo v = load_volume();
+vec4 volume_march_one(VolumeInfo v, vec3 ro, vec3 rd, float t_max, uint seed) {
+    // Sampled in the grid's axes, lit in the scene's: a rotation keeps distances along the ray
+    VolumeInfo l = volume_local(v);
+    vec3 lo = volume_point(v, ro);
+    vec3 ld = volume_dir(v, rd);
     float t0, t1;
-    if (!volume_clip(v, ro, rd, t_max, t0, t1))
+    if (!volume_clip(l, lo, ld, t_max, t0, t1))
         return vec4(0.0, 0.0, 0.0, 1.0);
     vec3 view_dir = -rd;
     float dt = v.voxel;
@@ -777,12 +880,13 @@ vec4 volume_march(vec3 ro, vec3 rd, float t_max, uint seed) {
     float T = 1.0;
     for (int n = 0; n < 4096 && t < t1; ++n) {
         vec3 p = ro + rd * t;
+        vec3 q = lo + ld * t;
         float t_exit;
-        if (volume_brick(v, p, rd, t_exit) <= 0.0) {
+        if (volume_brick(l, q, ld, t_exit) <= 0.0) {
             t += max(t_exit, 0.0) + max(jitter, 0.01) * dt;
             continue;
         }
-        vec3 s = volume_sample(v, p);
+        vec3 s = volume_sample(l, q);
         if (s.x > 0.0) {
             float step_len = min(dt, t1 - t + jitter * dt);
             float transmit = exp(-s.x * step_len);
@@ -792,6 +896,19 @@ vec4 volume_march(vec3 ro, vec3 rd, float t_max, uint seed) {
                 break;
         }
         t += dt;
+    }
+    return vec4(light, T);
+}
+
+// Every medium along a camera ray, each marched on its own and laid over the ones before it: exact where they do not
+// overlap, and near enough where thin media do
+vec4 volume_march(vec3 ro, vec3 rd, float t_max, uint seed) {
+    vec3 light = vec3(0.0);
+    float T = 1.0;
+    for (uint m = 0u; m < volume_count(); ++m) {
+        vec4 one = volume_march_one(load_volume(m), ro, rd, t_max, seed ^ (m * 0x9e3779b9u));
+        light += T * one.rgb;
+        T *= one.a;
     }
     return vec4(light, T);
 }
@@ -927,8 +1044,237 @@ vec3 shade_hapke(TraceResult hit, GpuMaterial gpu_mat, vec3 origin, vec3 dir, ui
     return color;
 }
 
+// ---- A planet's atmosphere and its surface (scene_data.planet_*) ----
+//
+// Single scattering by the air (Rayleigh), aerosols (Mie) and ozone's absorption, along a camera ray through the
+// shell between the ground and the top of the air, lit by the scene's directional lights through the air (so the
+// light reddens toward the terminator and the planet's shadow falls across its own air). The light a ray gathers is
+// the radiance times pi, in the units the renderer shades in (a white Lambertian surface facing a light returns the
+// light's color).
+
+bool atmosphere_enabled() {
+    return scene_data.planet_y.w > 0.5;
+}
+
+// The part of the ray ro + t rd (rd unit) inside a sphere of radius r about c: [t0, t1], false for none. The
+// closest approach is found first, so that a ray from millions of meters away keeps the sphere's edge to meters
+// (Haines et al., "Precision improvements for ray/sphere intersection", Ray Tracing Gems, 2019).
+bool sphere_span(vec3 ro, vec3 rd, vec3 c, float r, out float t0, out float t1) {
+    vec3 f = ro - c;
+    float b = -dot(f, rd);
+    vec3 d = f + b * rd;  // from the center to the closest approach
+    float h = r * r - dot(d, d);
+    if (h < 0.0)
+        return false;
+    h = sqrt(h);
+    t0 = b - h;
+    t1 = b + h;
+    return t1 > 0.0;
+}
+
+// Height over the ground at p
+float air_height(vec3 p) {
+    return length(p - scene_data.planet_center.xyz) - scene_data.planet_center.w;
+}
+
+// Scattering (Rayleigh rgb, Mie) and extinction rgb per meter at height h
+void air_density(float h, out vec3 rayleigh, out float mie, out vec3 extinction) {
+    float dr = exp(-max(h, 0.0) / scene_data.rayleigh.w);
+    float dm = exp(-max(h, 0.0) / scene_data.mie.z);
+    float dz = max(0.0, 1.0 - abs(h - scene_data.ozone.w) / scene_data.ozone_width.x);
+    rayleigh = scene_data.rayleigh.rgb * dr;
+    mie = scene_data.mie.x * dm;
+    extinction = rayleigh + scene_data.mie.y * dm + scene_data.ozone.rgb * dz;
+}
+
+// Transmittance of the air from p toward a light along l (unit): 0 where the ground is in the way
+vec3 air_transmittance(vec3 p, vec3 l) {
+    vec3 c = scene_data.planet_center.xyz;
+    float t0, t1;
+    if (sphere_span(p, l, c, scene_data.planet_center.w, t0, t1) && t0 > 0.0)
+        return vec3(0.0);
+    if (!sphere_span(p, l, c, scene_data.planet_x.w, t0, t1))
+        return vec3(1.0);
+    float len = t1 - max(t0, 0.0);
+    const int N = 12;
+    vec3 depth = vec3(0.0);
+    // Steps crowded toward the start, where the air is densest
+    float prev = 0.0;
+    for (int i = 1; i <= N; ++i) {
+        float s = float(i) / float(N);
+        float t = s * s * len;
+        float tm = 0.5 * (t + prev);
+        vec3 r, e;
+        float m;
+        air_density(air_height(p + l * (max(t0, 0.0) + tm)), r, m, e);
+        depth += e * (t - prev);
+        prev = t;
+    }
+    return exp(-depth);
+}
+
+float rayleigh_phase(float mu) {
+    return 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+}
+
+// Cornette-Shanks, a Henyey-Greenstein that keeps Mie's backscatter
+float mie_phase(float mu, float g) {
+    float g2 = g * g;
+    return 3.0 / (8.0 * PI) * (1.0 - g2) * (1.0 + mu * mu) / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
+}
+
+// The light the air scatters toward ro along the ray up to t_max (rgb) and the transmittance of what lies behind
+// (the second). jitter in [0, 1) offsets the samples, so that a pixel's samples between them cover every depth.
+vec3 air_scatter(vec3 ro, vec3 rd, float t_max, float jitter, out vec3 transmittance) {
+    transmittance = vec3(1.0);
+    float t0, t1;
+    if (!sphere_span(ro, rd, scene_data.planet_center.xyz, scene_data.planet_x.w, t0, t1))
+        return vec3(0.0);
+    t0 = max(t0, 0.0);
+    t1 = min(t1, t_max);
+    if (t1 <= t0)
+        return vec3(0.0);
+    const int N = 32;
+    float dt = (t1 - t0) / float(N);
+    vec3 light = vec3(0.0);
+    for (int i = 0; i < N; ++i) {
+        float t = t0 + (float(i) + jitter) * dt;
+        vec3 p = ro + rd * t;
+        vec3 r, e;
+        float m;
+        air_density(air_height(p), r, m, e);
+        vec3 step_t = exp(-e * dt);
+        vec3 source = vec3(0.0);
+        for (uint k = 0u; k < scene_data.counts.x; ++k) {
+            GpuLight light_k = lights[k];
+            if (int(light_k.dir_type.w + 0.5) != LIGHT_DIRECTIONAL)
+                continue;
+            vec3 l = normalize(light_k.dir_type.xyz);
+            vec3 sun_t = air_transmittance(p, l);
+            if (max_component(sun_t) <= 1e-6)
+                continue;
+            float mu = dot(rd, l);
+            source += light_k.color_atten.rgb * sun_t * (r * rayleigh_phase(mu) + m * mie_phase(mu, scene_data.mie.w));
+        }
+        // The light scattered over the step, as it is dimmed within it: source * (1 - T) / extinction
+        vec3 safe_e = max(e, vec3(1e-12));
+        light += transmittance * PI * source * (vec3(1.0) - step_t) / safe_e;
+        transmittance *= step_t;
+    }
+    return light;
+}
+
+// A direction in the scene in the planet's own axes
+vec3 planet_local(vec3 v) {
+    return vec3(dot(v, scene_data.planet_x.xyz), dot(v, scene_data.planet_y.xyz), dot(v, scene_data.planet_z.xyz));
+}
+
+// A planet seen from space (BSDF_PLANET): its day map (Kd), its water (the specular map's red: 1 water, 0 land),
+// its clouds (the specular map's green: their cover), its night lights (the emissive map, times the emissive power),
+// each on the planet's own sphere. Land is Lambertian, water a rough mirror (GGX, its slopes the wind's, Fresnel's
+// 2 %) that glints about the Sun's reflection, clouds a bright Lambertian layer that casts its shadow from
+// planet_z.w over the ground; the Sun's light reaches them through the air. The night lights show where the Sun is
+// down, dimmed under the clouds.
+vec3 shade_planet(TraceResult hit, GpuMaterial gpu_mat, vec3 origin, vec3 dir) {
+    vec3 hit_pos = origin + dir * hit.t;
+    vec3 view_dir = normalize(-dir);
+    vec3 c = scene_data.planet_center.xyz;
+    bool air = atmosphere_enabled();
+    vec3 n = air ? normalize(hit_pos - c) : normalize(hit.normal);
+    vec2 scale = gpu_mat.tex_scale.xy;
+    vec3 albedo = gpu_mat.diffuse.rgb;
+    if (hit.has_uv && gpu_mat.texture0.x != INVALID_TEXTURE)
+        albedo = pow(clamp(sample_texture(gpu_mat.texture0.x, hit.uv, scale).rgb, vec3(0.0), vec3(1.0)), vec3(2.2));
+    vec2 water_cloud = vec2(0.0);
+    if (hit.has_uv && gpu_mat.texture0.y != INVALID_TEXTURE)
+        water_cloud = sample_texture(gpu_mat.texture0.y, hit.uv, scale).rg;
+    float water = water_cloud.x;
+    // Under the air the sea's own color is dark (an albedo of some 0.06): the blue a planet's sea shows from space is
+    // the air's. A day map made to be seen without air has it lifted, so it is taken down where the air is drawn
+    if (air)
+        albedo *= mix(1.0, 0.35, water);
+    float cloud = smoothstep(0.05, 0.95, water_cloud.y);
+    vec3 night = vec3(0.0);
+    if (hit.has_uv && gpu_mat.texture0.z != INVALID_TEXTURE)
+        night = pow(clamp(sample_texture(gpu_mat.texture0.z, hit.uv, scale).rgb, vec3(0.0), vec3(1.0)), vec3(2.2));
+
+    // The ground's lat/long in the planet's axes, from which a place the clouds' shadow comes from is looked up
+    vec3 local = planet_local(n);
+    float lon = atan(local.y, local.x);
+    float lat = asin(clamp(local.z, -1.0, 1.0));
+
+    const float WATER_ALPHA = 0.25;  // GGX roughness: a sea some 7 m/s of wind has roughened (Cox & Munk)
+    const float WATER_F0 = 0.02;
+    const vec3 CLOUD_ALBEDO = vec3(0.85);
+    float ndv = max(dot(n, view_dir), 1e-3);
+    vec3 color = vec3(0.0);
+    float daylight = 0.0;  // the Sun's height, for the night lights
+    for (uint i = 0u; i < scene_data.counts.x; ++i) {
+        GpuLight light = lights[i];
+        int type = int(light.dir_type.w + 0.5);
+        if (type == LIGHT_ENVIRONMENT || type == LIGHT_AREA)
+            continue;
+        vec3 l;
+        float max_shadow_t;
+        float attenuation = sample_local_light(light, type, hit_pos, l, max_shadow_t);
+        if (attenuation <= 0.0)
+            continue;
+        float ndl = dot(n, l);
+        daylight = max(daylight, ndl);
+        if (ndl <= -0.02)
+            continue;
+        vec3 irradiance = attenuation * light.color_atten.rgb;
+        if (air)
+            irradiance *= air_transmittance(c + n * (scene_data.planet_center.w + 20.0), l);
+        if (max_component(irradiance) <= 1e-6)
+            continue;
+        if (visibility_occluded_optix(shadow_origin(hit_pos, n, l, hit.t), l, max_shadow_t))
+            continue;
+        float cos_i = max(ndl, 0.0);
+        // The clouds' shadow: the cloud over the place where the ray toward the light crosses their height
+        float shade = 1.0;
+        if (air && hit.has_uv && gpu_mat.texture0.y != INVALID_TEXTURE && cos_i > 0.0) {
+            vec3 q = planet_local(normalize(n * scene_data.planet_center.w + l * (scene_data.planet_z.w / max(cos_i, 0.08))));
+            float dlon = atan(q.y, q.x) - lon;
+            dlon -= 2.0 * PI * floor(dlon / (2.0 * PI) + 0.5);
+            float dlat = asin(clamp(q.z, -1.0, 1.0)) - lat;
+            vec2 uv_q = hit.uv + vec2(dlon / (2.0 * PI), dlat / PI) / max(scale, vec2(1e-6));
+            float over = smoothstep(0.05, 0.95, sample_texture(gpu_mat.texture0.y, uv_q, scale).g);
+            shade = 1.0 - 0.75 * over;
+        }
+        // The ground: land Lambertian, water a rough mirror over its own dark body
+        vec3 ground = albedo * cos_i;
+        if (water > 0.0 && cos_i > 0.0) {
+            vec3 h = normalize(l + view_dir);
+            float ndh = max(dot(n, h), 0.0);
+            float a2 = WATER_ALPHA * WATER_ALPHA;
+            float den = ndh * ndh * (a2 - 1.0) + 1.0;
+            float D = a2 / (PI * den * den);
+            float k = WATER_ALPHA * 0.5;
+            float G = (ndv / (ndv * (1.0 - k) + k)) * (cos_i / (cos_i * (1.0 - k) + k));
+            float F = fresnel_schlick_scalar(max(dot(view_dir, h), 0.0), WATER_F0);
+            float glint = PI * D * G * F / (4.0 * ndv * cos_i) * cos_i;
+            ground += water * (glint - F * albedo * cos_i);
+        }
+        vec3 lit = mix(ground * shade, CLOUD_ALBEDO * cos_i, cloud);
+        color += lit * irradiance;
+    }
+    // The night lights, where the Sun is down, faded over the twilight and dimmed under the clouds
+    float dark = 1.0 - smoothstep(-0.12, 0.02, daylight);
+    color += gpu_mat.emissive.w * night * dark * (1.0 - 0.8 * cloud);
+    return color;
+}
+
+// A filmic curve (ACES, Narkowicz 2015's fit) with its white at about 11
+vec3 tone_map(vec3 x) {
+    x = max(x, vec3(0.0));
+    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
 vec3 shade_direct(TraceResult hit, vec3 origin, vec3 dir, bool include_ambient, uint sample_seed) {
     GpuMaterial gpu_mat = materials[hit.mat_id];
+    if (gpu_mat.ids.z == BSDF_PLANET)
+        return shade_planet(hit, gpu_mat, origin, dir);
     if (gpu_mat.ids.z == BSDF_HAPKE)
         return shade_hapke(hit, gpu_mat, origin, dir, sample_seed);
 
@@ -1056,7 +1402,48 @@ vec3 gi_direction(vec3 n, uint seed, uint sample_index, out float z) {
 // The light of a camera ray's path, and the depth of its first hit (0 for none). With march_volume the medium between
 // the camera and the first surface is marched along it; trace_camera_samples leaves that out and marches the medium
 // once for the whole pixel.
-vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index, bool march_volume) {
+uint gi_cache_width() {
+    return (pc.width + GI_CACHE_BLOCK - 1u) / GI_CACHE_BLOCK;
+}
+
+// The light bounced onto a camera sample's first hit (q, normal n, t from the camera), E as the cache holds it,
+// filtered from the 4 x 4 cache texels around the sample's image position with a tent two texels wide, over those
+// whose surface is the sample's (q near its plane, normals alike). A texel's E carries the noise of one pixel's GI
+// rays, spread over its block; the filter averages about ten of them. False if no texel is on the sample's surface.
+bool gi_cache_lookup(vec2 pixel, vec3 q, vec3 n, float t, out vec3 E) {
+    E = vec3(0.0);
+    uint cw = gi_cache_width();
+    uint ch = (pc.height + GI_CACHE_BLOCK - 1u) / GI_CACHE_BLOCK;
+    float u = pixel.x / float(GI_CACHE_BLOCK) - 0.5;
+    float v = pixel.y / float(GI_CACHE_BLOCK) - 0.5;
+    int i0 = int(floor(u)), j0 = int(floor(v));
+    float tolerance = 0.02 * t + 0.005;
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int dj = -1; dj <= 2; ++dj) {
+        for (int di = -1; di <= 2; ++di) {
+            int i = i0 + di, j = j0 + dj;
+            if (i < 0 || j < 0 || i >= int(cw) || j >= int(ch))
+                continue;
+            uint base = (uint(j) * cw + uint(i)) * 3u;
+            vec4 a = gi_cache[base];
+            if (a.w < 0.5)
+                continue;
+            vec4 b = gi_cache[base + 1u];
+            float off_plane = abs(dot(b.xyz, q - a.xyz)) / tolerance;
+            float w = max(0.0, 1.0 - 0.5 * abs(float(i) - u)) * max(0.0, 1.0 - 0.5 * abs(float(j) - v)) *
+                      exp(-off_plane * off_plane) * pow(max(dot(n, b.xyz), 0.0), 8.0);
+            sum += w * gi_cache[base + 2u].xyz;
+            weight += w;
+        }
+    }
+    if (weight < 1e-3)
+        return false;
+    E = sum / weight;
+    return true;
+}
+
+vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index, bool march_volume, vec2 pixel) {
     vec3 accum = vec3(0.0);
     uint path_seed = (gl_LaunchIDEXT.x + 1u) * 73856093u ^
                      (gl_LaunchIDEXT.y + 1u) * 19349663u ^
@@ -1077,8 +1464,16 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index, bool march_vo
             accum += throughput * medium.rgb;
             throughput *= medium.a;
         }
+        // The air between the camera and the first surface, or the sky
+        if (depth == 0 && atmosphere_enabled()) {
+            vec3 air_t;
+            vec3 air_light = air_scatter(ro, rd, h.hit ? h.t : 3.402823e38, hash_unit(path_seed ^ 0x1b873593u), air_t);
+            accum += throughput * air_light;
+            throughput *= air_t;
+        }
         if (!h.hit) {
-            accum += throughput * background_color(rd);
+            // The sky: past everything, and along the camera's own ray (rd is unchanged through transparent surfaces)
+            accum += throughput * (background_color(rd) + star_light(rd) + light_disks(rd));
             break;
         }
         if (depth == 0)
@@ -1099,16 +1494,25 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index, bool march_vo
         // shadow is lit by the sunlit regolith around it: the light from one direction over the hemisphere (0.35 < cos
         // < 1, uniform in solid angle), reflected with the surface's diffusive reflectance r0 = (1 - g) / (1 + g),
         // g = sqrt(1 - w) (Hapke 2012, eq. 8.25), tinted by its albedo color.
+        if (materials[h.mat_id].ids.z == BSDF_PLANET) {
+            accum += throughput * direct;
+            break;
+        }
         if (materials[h.mat_id].ids.z == BSDF_HAPKE) {
             if ((pc.flags & FLAG_USE_GI) != 0u && depth == 0) {
-                uint gi_seed = bounce_seed ^ 0x7f4a7c15u;
-                float z;
-                vec3 gi_dir = gi_direction(n, gi_seed, camera_sample_index, z);
-                vec3 gi = trace_lit_once(hit_pos + gi_dir * TRACE_EPS, gi_dir, false, gi_seed ^ 0xc2b2ae35u);
                 float g = sqrt(max(0.0, 1.0 - materials[h.mat_id].hapke0.x));
                 float r0 = (1.0 - g) / (1.0 + g);
-                // Monte Carlo estimate of (r0 / pi) * integral of L cos over the sampled cap: r0 * L * cos * 2 * 0.65
-                direct += r0 * 1.3 * z * mat.diffuse * gi;
+                vec3 E;
+                if ((pc.flags & FLAG_GI_CACHE) != 0u && gi_cache_lookup(pixel, hit_pos, n, h.t, E)) {
+                    direct += r0 * 1.3 * mat.diffuse * E;
+                } else {
+                    uint gi_seed = bounce_seed ^ 0x7f4a7c15u;
+                    float z;
+                    vec3 gi_dir = gi_direction(n, gi_seed, camera_sample_index, z);
+                    vec3 gi = trace_lit_once(hit_pos + gi_dir * TRACE_EPS, gi_dir, false, gi_seed ^ 0xc2b2ae35u);
+                    // Monte Carlo estimate of (r0 / pi) * integral of L cos over the sampled cap: r0 * L * cos * 2 * 0.65
+                    direct += r0 * 1.3 * z * mat.diffuse * gi;
+                }
             }
             accum += throughput * direct;
             break;
@@ -1141,13 +1545,18 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index, bool march_vo
         }
 
         if ((pc.flags & FLAG_USE_GI) != 0u && depth == 0) {
-            uint gi_seed = bounce_seed ^ 0x7f4a7c15u;
-            float z;
-            vec3 gi_dir = gi_direction(n, gi_seed, camera_sample_index, z);
-            float gi_ndl = max(dot(n, gi_dir), 0.0);
-            vec3 gi = trace_lit_once(hit_pos + gi_dir * TRACE_EPS, gi_dir, false,
-                                     gi_seed ^ 0xc2b2ae35u);
-            direct += 0.35 * mat.opacity * gi_ndl * mat.diffuse * gi;
+            vec3 E;
+            if ((pc.flags & FLAG_GI_CACHE) != 0u && gi_cache_lookup(pixel, hit_pos, n, h.t, E)) {
+                direct += 0.35 * mat.opacity * mat.diffuse * E;
+            } else {
+                uint gi_seed = bounce_seed ^ 0x7f4a7c15u;
+                float z;
+                vec3 gi_dir = gi_direction(n, gi_seed, camera_sample_index, z);
+                float gi_ndl = max(dot(n, gi_dir), 0.0);
+                vec3 gi = trace_lit_once(hit_pos + gi_dir * TRACE_EPS, gi_dir, false,
+                                         gi_seed ^ 0xc2b2ae35u);
+                direct += 0.35 * mat.opacity * gi_ndl * mat.diffuse * gi;
+            }
         }
 
         accum += throughput * direct;
@@ -1161,6 +1570,11 @@ vec4 trace_camera(vec3 origin, vec3 dir, uint camera_sample_index, bool march_vo
     }
 
     return vec4(accum, first_depth);
+}
+
+// A camera's exposure: the light it takes, times this (in aux1.x, which only lidars use otherwise)
+float camera_exposure() {
+    return pc.aux1.x > 0.0 ? pc.aux1.x : 1.0;
 }
 
 uint camera_sample_factor() {
@@ -1182,6 +1596,14 @@ vec3 camera_ray_sample(uint x, uint y, float jitter_x, float jitter_y, bool aux_
     float uvx = 2.0 * fx / max(1.0, float(pc.width)) - 1.0;
     float uvy = 2.0 * fy / max(1.0, float(pc.height)) - 1.0;
     uvy /= max(1e-6, pc.right_aspect.w);
+
+    // An equidistant fisheye: the angle off the boresight is the distance from the center, hfov/2 at the width's edge.
+    // Past 180 degrees off it the ray looks back along it
+    float r = length(vec2(uvx, uvy));
+    if ((pc.flags & FLAG_FISHEYE) != 0u && r > 1e-6) {
+        float theta = r * pc.forward_hfov.w * 0.5;
+        return normalize(pc.forward_hfov.xyz * cos(theta) + (pc.right_aspect.xyz * uvx + pc.up_gamma.xyz * uvy) * (sin(theta) / r));
+    }
 
     float ray_factor = aux_projection ? pc.aux0.w : pc.aux0.z;
     return normalize(pc.forward_hfov.xyz + pc.right_aspect.xyz * (uvx * ray_factor) +
@@ -1222,7 +1644,7 @@ vec4 trace_camera_samples(vec3 origin, uint x, uint y) {
         float jitter_x = (factor == 1u || center_sample) ? 0.5 : camera_sample_jitter(x, y, sample_index, 0u);
         float jitter_y = (factor == 1u || center_sample) ? 0.5 : camera_sample_jitter(x, y, sample_index, 1u);
         vec3 sample_dir = camera_ray_sample(x, y, jitter_x, jitter_y, false);
-        vec4 traced = trace_camera(origin, sample_dir, sample_index, factor == 1u);
+        vec4 traced = trace_camera(origin, sample_dir, sample_index, factor == 1u, vec2(float(x) + jitter_x, float(y) + jitter_y));
         if (center_sample || factor == 1u)
             center_depth = traced.a;
         if (i >= pilot_count) {
@@ -1287,9 +1709,52 @@ vec3 radar_ray(uint x, uint y) {
     return normalize(pc.forward_hfov.xyz * (xy * cos(theta)) + left * (xy * sin(theta)) + pc.up_gamma.xyz * sin(phi));
 }
 
+// Fill the GI cache texel (bx, by): the first surface the ray through the center of its block of pixels hits, and
+// the light bounced onto it over the GI cap, from as many directions as the camera asks (GI_CACHE_RAYS unless it
+// sets them), stratified as the camera's own GI rays. The directions are drawn from the cell of the scene,
+// about a texel across, that the texel sees, not from the frame: a texel that sees the same ground from one frame to
+// the next gets the same light, so what noise the estimate keeps stays on the ground instead of rippling over it.
+void bake_gi_cache(uint bx, uint by) {
+    uint base = (by * gi_cache_width() + bx) * 3u;
+    uint px = min(bx * GI_CACHE_BLOCK + GI_CACHE_BLOCK / 2u, pc.width - 1u);
+    uint py = min(by * GI_CACHE_BLOCK + GI_CACHE_BLOCK / 2u, pc.height - 1u);
+    vec3 origin = pc.origin_max_t.xyz;
+    vec3 dir = camera_ray_sample(px, py, 0.5, 0.5, false);
+    TraceResult h = trace_scene(origin, dir, pc.origin_max_t.w, pc.aux0.y);
+    gi_cache[base] = vec4(0.0);
+    if (!h.hit)
+        return;
+    EvalMaterial mat = eval_material(h);
+    if (mat.opacity <= 1e-6)
+        return;
+    vec3 n = shading_normal(h);
+    vec3 p = origin + dir * h.t;
+    uint rays16 = (pc.flags >> 25) & 127u;
+    uint count = rays16 > 0u ? rays16 * 16u : GI_CACHE_RAYS;
+    vec3 E = vec3(0.0);
+    // A texel's width on the surface: a pinhole's pixel at the center, or a fisheye's, which is the same angle everywhere
+    float pixel_angle = (pc.flags & FLAG_FISHEYE) != 0u ? pc.forward_hfov.w : 2.0 * pc.aux0.z;
+    float footprint = h.t * pixel_angle / float(pc.width) * float(GI_CACHE_BLOCK);
+    ivec3 cell = ivec3(floor(p / max(footprint, 1e-3)));
+    uint cell_key = hash_u32(uint(cell.x) * 73856093u ^ uint(cell.y) * 19349663u ^ uint(cell.z) * 83492791u ^ camera_rng_key());
+    for (uint i = 0u; i < count; ++i) {
+        uint seed = hash_u32(cell_key ^ (i + 1u) * 2654435761u) ^ 0x7f4a7c15u;
+        float z;
+        vec3 d = gi_direction(n, seed, i, z);
+        E += z * trace_lit_once(p + d * TRACE_EPS, d, false, seed ^ 0xc2b2ae35u);
+    }
+    gi_cache[base] = vec4(p, 1.0);
+    gi_cache[base + 1u] = vec4(n, h.t);
+    gi_cache[base + 2u] = vec4(E / float(count), 0.0);
+}
+
 void main() {
     uint x = gl_LaunchIDEXT.x;
     uint y = gl_LaunchIDEXT.y;
+    if (pc.pipeline == PIPE_GI_CACHE) {
+        bake_gi_cache(x, y);
+        return;
+    }
     uint idx = y * pc.width + x;
     uint o = idx * output_word_stride();
 
@@ -1342,14 +1807,15 @@ void main() {
 
     if (pc.pipeline == PIPE_CAMERA) {
         vec4 traced = trace_camera_samples(origin, x, y);
-        vec3 color = gamma_correct(traced.rgb, pc.up_gamma.w);
+        vec3 light = traced.rgb * camera_exposure();
+        vec3 color = gamma_correct((pc.flags & FLAG_TONE_MAP) != 0u ? tone_map(light) : light, pc.up_gamma.w);
         out_data[o + 0u] = pack_rgba8(color);
         return;
     }
 
     if (pc.pipeline == PIPE_PHYS_CAMERA) {
         vec4 traced = trace_camera_samples(origin, x, y);
-        vec3 color = gamma_correct(traced.rgb, pc.up_gamma.w);
+        vec3 color = gamma_correct(traced.rgb * camera_exposure(), pc.up_gamma.w);
         out_data[o + 0u] = floatBitsToUint(color.r);
         out_data[o + 1u] = floatBitsToUint(color.g);
         out_data[o + 2u] = floatBitsToUint(color.b);

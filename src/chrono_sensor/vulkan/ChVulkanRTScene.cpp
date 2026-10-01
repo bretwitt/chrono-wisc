@@ -145,7 +145,8 @@ ChVulkanRTMaterial MaterialFromVisual(const std::shared_ptr<ChVisualMaterial>& v
     mat.tex_scale_v = visual_mat->GetTextureScale().y();
     mat.diffuse_texture = visual_mat->GetKdTexture();
     mat.specular_texture = visual_mat->GetKsTexture();
-    mat.emissive_texture.clear();
+    // Emissive maps are left out, as OptiX leaves them, but for a planet's night lights
+    mat.emissive_texture = visual_mat->GetBSDF() == BSDFType::PLANET ? visual_mat->GetKeTexture() : std::string();
     mat.normal_texture = visual_mat->GetNormalMapTexture();
     mat.roughness_texture = visual_mat->GetRoughnessTexture();
     mat.metallic_texture = visual_mat->GetMetallicTexture();
@@ -1026,8 +1027,10 @@ unsigned int ChVulkanRTScene::AddDirectionalLight(const ChVector3f& dir, const C
     return Append(MakeDirectionalLight(dir, color));
 }
 
-unsigned int ChVulkanRTScene::AddDirectionalLight(ChColor color, float elevation, float azimuth) {
-    return AddDirectionalLight(DirectionFromAngles(elevation, azimuth), ChVector3f(color.R, color.G, color.B));
+unsigned int ChVulkanRTScene::AddDirectionalLight(ChColor color, float elevation, float azimuth, float disk_radius) {
+    ChVulkanRTLight light = MakeDirectionalLight(DirectionFromAngles(elevation, azimuth), ChVector3f(color.R, color.G, color.B));
+    light.disk_radius = disk_radius;
+    return Append(light);
 }
 
 unsigned int ChVulkanRTScene::AddSpotLight(const ChVector3f& pos,
@@ -1082,8 +1085,10 @@ void ChVulkanRTScene::ModifyPointLight(unsigned int light_ID, ChVector3f pos, Ch
     Replace(light_ID, MakePointLight(pos, color, max_range, const_color));
 }
 
-void ChVulkanRTScene::ModifyDirectionalLight(unsigned int light_ID, ChColor color, float elevation, float azimuth) {
-    Replace(light_ID, MakeDirectionalLight(DirectionFromAngles(elevation, azimuth), ChVector3f(color.R, color.G, color.B)));
+void ChVulkanRTScene::ModifyDirectionalLight(unsigned int light_ID, ChColor color, float elevation, float azimuth, float disk_radius) {
+    ChVulkanRTLight light = MakeDirectionalLight(DirectionFromAngles(elevation, azimuth), ChVector3f(color.R, color.G, color.B));
+    light.disk_radius = disk_radius;
+    Replace(light_ID, light);
 }
 
 void ChVulkanRTScene::ModifySpotLight(unsigned int light_ID,

@@ -29,6 +29,8 @@
 #include <fstream>
 #include <cstring>
 #include <functional>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -1739,6 +1741,30 @@ float CameraGamma(const std::shared_ptr<ChVulkanSensor>& sensor) {
     return 1.f;
 }
 
+unsigned int CameraGICacheRays(const std::shared_ptr<ChVulkanSensor>& sensor) {
+    if (auto camera = std::dynamic_pointer_cast<ChCameraSensor>(sensor))
+        return camera->GetGICacheRays();
+    return 0;
+}
+
+bool CameraGICache(const std::shared_ptr<ChVulkanSensor>& sensor) {
+    if (auto camera = std::dynamic_pointer_cast<ChCameraSensor>(sensor))
+        return camera->GetGICache();
+    return false;
+}
+
+float CameraExposure(const std::shared_ptr<ChVulkanSensor>& sensor) {
+    if (auto camera = std::dynamic_pointer_cast<ChCameraSensor>(sensor))
+        return camera->GetExposure();
+    return 1.f;
+}
+
+bool CameraToneMap(const std::shared_ptr<ChVulkanSensor>& sensor) {
+    if (auto camera = std::dynamic_pointer_cast<ChCameraSensor>(sensor))
+        return camera->GetToneMap();
+    return false;
+}
+
 float CameraNoiseTolerance(const std::shared_ptr<ChVulkanSensor>& sensor) {
     if (auto camera = std::dynamic_pointer_cast<ChCameraSensor>(sensor))
         return std::max(0.f, camera->GetNoiseTolerance());
@@ -1931,6 +1957,14 @@ void ApplyOptixLensModel(double& uv_x,
             uv_x = x_norm * (ru / rd) * focal;
             uv_y = y_norm * (ru / rd) * focal;
         }
+    } else if (lens_model == CameraLensModelType::FISHEYE && (std::abs(uv_x) > 1e-5 || std::abs(uv_y) > 1e-5)) {
+        // Equidistant: the angle off the axis grows with the distance from the center, hfov/2 at the width's edge.
+        // Mapped back to the pinhole plane the caller spans with tan(hfov/2); good to under 90 degrees off the axis
+        const double r = std::sqrt(uv_x * uv_x + uv_y * uv_y);
+        const double theta = std::min(r * hfov / 2.0, 0.5 * CH_PI - 1e-3);
+        const double scale = std::tan(theta) / (r * std::tan(hfov / 2.0));
+        uv_x *= scale;
+        uv_y *= scale;
     } else if (lens_model == CameraLensModelType::RADIAL) {
         const double recip_focal = std::tan(hfov / 2.0);
         const double x_norm = uv_x * recip_focal;
@@ -2019,16 +2053,49 @@ struct ChVulkanRTGpuMaterial {
 // Camera BSDF selector in ChVulkanRTGpuMaterial::ids[2]; must match the shaders.
 constexpr uint32_t CH_VKRT_BSDF_LEGACY = 0u;
 constexpr uint32_t CH_VKRT_BSDF_HAPKE = 1u;
+constexpr uint32_t CH_VKRT_BSDF_PLANET = 2u;
 
 // Push constant flags; must match FLAG_* in the ray generation shader.
 constexpr uint32_t CH_VKRT_FLAG_USE_GI = 1u;
 constexpr uint32_t CH_VKRT_FLAG_VOLUME = 2u;
+constexpr uint32_t CH_VKRT_FLAG_TONE_MAP = 4u;  // a filmic curve instead of clipping at white
+constexpr uint32_t CH_VKRT_FLAG_FISHEYE = 8u;   // an equidistant fisheye: the image's width spans the horizontal FOV in angle
+
+// Wall time of the stages of GPU camera frames, printed every 20 frames when CH_VKRT_PROFILE is set. The submits wait
+// on the GPU, so a stage's wall time is its GPU time.
+struct ChVulkanRTStageTimes {
+    bool enabled = std::getenv("CH_VKRT_PROFILE") != nullptr;
+    int frames = 0;
+    size_t chunks = 0, chunk_faces = 0;
+    double build = 0, volume = 0, trace = 0, readback = 0;
+    void Report() {
+        if (++frames < 20)
+            return;
+        std::cout << "[vkrt] per frame over " << frames << ": build scene " << 1e3 * build / frames << " ms (" << double(chunks) / frames
+                  << " new meshes, " << double(chunk_faces) / frames << " faces), volume " << 1e3 * volume / frames << " ms, trace " << 1e3 * trace / frames
+                  << " ms, readback " << 1e3 * readback / frames << " ms" << std::endl;
+        *this = ChVulkanRTStageTimes();
+    }
+};
+ChVulkanRTStageTimes& StageTimes() {
+    static ChVulkanRTStageTimes times;
+    return times;
+}
+double SecondsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+constexpr uint32_t CH_VKRT_FLAG_GI_CACHE = 1u << 24;  // camera samples take their GI from the GI cache
+constexpr uint32_t CH_VKRT_PIPE_GI_CACHE = 8u;        // launch that fills the GI cache
+constexpr uint32_t CH_VKRT_GI_CACHE_BLOCK = 4u;       // image pixels per GI cache texel, along each axis
 
 // Layout of the volume buffer (binding 9); must match the VOLUME_* offsets in the ray generation shader. A header,
 // the largest extinction in each brick of CH_VKRT_VOLUME_BRICK^3 voxels and its one-voxel border (so a ray may skip
 // a brick of zeros whatever it interpolates), then two words per voxel: its extinction, and its Sun transmittance
-// and visibility as two 16-bit unorms.
+// and visibility as two 16-bit unorms. Up to CH_VKRT_VOLUME_MAX media follow a directory: their count, then each
+// one's start. Each medium's brick and voxel offsets are from the buffer's start.
 constexpr uint32_t CH_VKRT_VOLUME_HEADER_WORDS = 32;
+constexpr uint32_t CH_VKRT_VOLUME_DIRECTORY_WORDS = 8;
+constexpr uint32_t CH_VKRT_VOLUME_MAX = 4;
 constexpr uint32_t CH_VKRT_VOLUME_BRICK = 8;
 
 struct ChVulkanRTGpuTexture {
@@ -2039,7 +2106,7 @@ struct ChVulkanRTGpuLight {
     float pos_range[4];    // pos xyz, range
     float dir_type[4];     // dir xyz, LightType as float
     float color_atten[4];  // color rgb, attenuation scale
-    float params[4];       // angle, angle_falloff_start, angle_atten_rate, spot cos-half-angle or area/radius
+    float params[4];       // angle, angle_falloff_start, angle_atten_rate, spot cos-half-angle, area/radius or directional disk radius
 };
 
 struct ChVulkanRTGpuSceneData {
@@ -2047,6 +2114,16 @@ struct ChVulkanRTGpuSceneData {
     float background0[4];  // zenith rgb, reserved
     float background1[4];  // horizon rgb, reserved
     uint32_t counts[4];    // light count, background mode, environment texture id, texture count
+    // The planet's atmosphere and frame (ChVulkanRTAtmosphere); planet_y[3] is 1 where there is one
+    float planet_center[4];  // center xyz, ground radius
+    float planet_x[4];       // its x axis, top of the air's radius
+    float planet_y[4];       // its y axis, 1 if there is an atmosphere
+    float planet_z[4];       // its z axis, clouds' height
+    float rayleigh[4];       // scattering rgb, scale height
+    float mie[4];            // scattering, extinction, scale height, g
+    float ozone[4];          // absorption rgb, center height
+    float ozone_width[4];    // half width, reserved
+    float stars[4];          // the stars' map's texture id (bits; invalid for none), the scale its texels are taken at, reserved
 };
 
 struct ChVulkanRTGpuPushConstants {
@@ -2089,6 +2166,11 @@ struct ChVulkanRTGpuFrame {
     float tan_half_hfov = 1.f;
     float aux_ray_factor = 1.f;
     bool use_gi = false;
+    bool gi_cache = false;
+    bool tone_map = false;
+    bool fisheye = false;
+    float exposure = 1.f;
+    unsigned int gi_cache_rays = 0;  // 0 for the shader's default
     float noise_tolerance = 0.f;
     uint32_t ray_recursions = 1;
     uint32_t sample_factor = 1;
@@ -2151,7 +2233,9 @@ ChVulkanRTGpuMaterial MakeGpuMaterial(const ChVulkanRTMaterial& mat, float objec
     out.params[3] = mat.use_specular_workflow ? 1.f : 0.f;
     out.ids[0] = static_cast<uint32_t>(mat.class_id);
     out.ids[1] = static_cast<uint32_t>(mat.instance_id);
-    out.ids[2] = mat.bsdf_type == BSDFType::HAPKE ? CH_VKRT_BSDF_HAPKE : CH_VKRT_BSDF_LEGACY;
+    out.ids[2] = mat.bsdf_type == BSDFType::HAPKE    ? CH_VKRT_BSDF_HAPKE
+                 : mat.bsdf_type == BSDFType::PLANET ? CH_VKRT_BSDF_PLANET
+                                                     : CH_VKRT_BSDF_LEGACY;
     out.ids[3] = 0u;
     out.sensor[0] = mat.lidar_intensity;
     out.sensor[1] = mat.radar_backscatter;
@@ -2197,9 +2281,9 @@ ChVulkanRTGpuLight MakeGpuLight(const ChVulkanRTLight& light) {
     out.params[0] = light.angle;
     out.params[1] = light.angle_falloff_start;
     out.params[2] = light.angle_atten_rate;
-    out.params[3] = (light.type == LightType::SPOT_LIGHT)
-                        ? static_cast<float>(std::cos(0.5 * static_cast<double>(light.angle)))
-                        : (light.radius > 0.f ? light.radius : light.area);
+    out.params[3] = (light.type == LightType::SPOT_LIGHT)          ? static_cast<float>(std::cos(0.5 * static_cast<double>(light.angle)))
+                    : (light.type == LightType::DIRECTIONAL_LIGHT) ? light.disk_radius
+                                                                   : (light.radius > 0.f ? light.radius : light.area);
     return out;
 }
 
@@ -2244,15 +2328,20 @@ struct ChVulkanRTGpuRenderer {
         if (frame.width == 0 || frame.height == 0)
             return true;
 
+        auto& times = StageTimes();
+        auto t0 = std::chrono::steady_clock::now();
         if (m_scene_revision != scene->GetRevision()) {
             BuildScene(scene);
             m_scene_revision = scene->GetRevision();
             m_descriptors_dirty = true;
         }
+        times.build += SecondsSince(t0);
+        t0 = std::chrono::steady_clock::now();
         if (m_volume_revision != scene->GetVolumeRevision()) {
-            UploadVolume(scene->GetVolume().get());
+            UploadVolumes(scene->GetVolumes());
             m_volume_revision = scene->GetVolumeRevision();
         }
+        times.volume += SecondsSince(t0);
 
         if (!m_tlas)
             return false;
@@ -2282,7 +2371,9 @@ struct ChVulkanRTGpuRenderer {
         pc.aux0[1] = frame.clip_near;
         pc.aux0[2] = frame.tan_half_hfov;
         pc.aux0[3] = frame.aux_ray_factor;
-        pc.aux1[0] = frame.min_vert_angle;
+        // A camera has no vertical angles: its exposure goes there
+        pc.aux1[0] = (frame.pipeline == VulkanPipelineType::CAMERA || frame.pipeline == VulkanPipelineType::PHYS_CAMERA) ? frame.exposure
+                                                                                                                       : frame.min_vert_angle;
         pc.aux1[1] = frame.max_vert_angle;
         pc.aux1[2] = frame.vfov;
         pc.aux1[3] = frame.max_distance;
@@ -2297,9 +2388,21 @@ struct ChVulkanRTGpuRenderer {
         pc.rng_seed_lo = static_cast<uint32_t>(frame.rng_seed);
         pc.rng_seed_hi = static_cast<uint32_t>(frame.rng_seed >> 32);
         pc.noise_tolerance = frame.noise_tolerance;
+        if (frame.tone_map)
+            pc.flags |= CH_VKRT_FLAG_TONE_MAP;
+        if (frame.fisheye)
+            pc.flags |= CH_VKRT_FLAG_FISHEYE;
+        if (frame.gi_cache)
+            pc.flags |= CH_VKRT_FLAG_GI_CACHE | (std::min((frame.gi_cache_rays + 15u) / 16u, 127u) << 25);
 
-        RecordAndSubmitRender(pc, frame.width, frame.height, frame.pipeline);
+        t0 = std::chrono::steady_clock::now();
+        RecordAndSubmitRender(pc, frame.width, frame.height, frame.pipeline, frame.gi_cache);
+        times.trace += SecondsSince(t0);
+        t0 = std::chrono::steady_clock::now();
         CopyOutputToHost(frame);
+        times.readback += SecondsSince(t0);
+        if (times.enabled)
+            times.Report();
         return true;
     }
 
@@ -2375,7 +2478,7 @@ struct ChVulkanRTGpuRenderer {
     }
 
     void CreatePipeline() {
-        std::array<VkDescriptorSetLayoutBinding, 9> bindings = {};
+        std::array<VkDescriptorSetLayoutBinding, 10> bindings = {};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         bindings[0].descriptorCount = 1;
@@ -2412,6 +2515,10 @@ struct ChVulkanRTGpuRenderer {
         bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[8].descriptorCount = 1;
         bindings[8].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+        bindings[9].binding = 10;
+        bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[9].descriptorCount = 1;
+        bindings[9].stageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
 
         VkDescriptorSetLayoutCreateInfo layout_info = {};
         layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -2508,7 +2615,7 @@ struct ChVulkanRTGpuRenderer {
         pool_sizes[0].type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         pool_sizes[0].descriptorCount = 1;
         pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        pool_sizes[1].descriptorCount = 8;
+        pool_sizes[1].descriptorCount = 9;
         VkDescriptorPoolCreateInfo pool_info = {};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 1;
@@ -2659,6 +2766,49 @@ struct ChVulkanRTGpuRenderer {
             }
         }
         m_texture_ids.emplace(cache_key, texture_id);
+        return texture_id;
+    }
+
+    // The stars' map (ChVulkanRTStarField), baked once for each star field: each star's radiance, its irradiance over
+    // a texel's solid angle times pi (the units the renderer shades in: a white Lambertian surface facing a light
+    // returns the light's color), spread bilinearly over the four texels about its direction, times kStarMapGain so
+    // that the faintest stars stay within RGB9E5's range
+    static constexpr float kStarMapGain = 1e8f;
+    uint32_t RegisterStars(const std::shared_ptr<const ChVulkanRTStarField>& stars) {
+        if (stars == m_star_field)
+            return m_star_texture;
+        const uint32_t width = std::max(64u, stars->width), height = width / 2;
+        std::vector<float> rgb(size_t(width) * height * 3, 0.f);
+        const double texel = (2 * CH_PI / width) * (CH_PI / height);  // sr at the equator
+        for (size_t i = 0; i < stars->directions.size() && i < stars->irradiance.size(); ++i) {
+            const ChVector3f d = stars->directions[i].GetNormalized();
+            // As the shaders look the map up: u from the azimuth, v from the elevation, texel centers at half steps
+            const double u = (std::atan2(double(d.y()), double(d.x())) / (2 * CH_PI) + 0.5) * width - 0.5;
+            const double v = (std::asin(std::clamp(double(d.z()), -1.0, 1.0)) / CH_PI + 0.5) * height - 0.5;
+            const double omega = texel * std::max(std::cos(std::asin(std::clamp(double(d.z()), -1.0, 1.0))), 1e-3);
+            const int u0 = int(std::floor(u)), v0 = int(std::floor(v));
+            const double fu = u - u0, fv = v - v0;
+            for (int k = 0; k < 4; ++k) {
+                const int du = k & 1, dv = k >> 1;
+                const double w = (du ? fu : 1 - fu) * (dv ? fv : 1 - fv);
+                const int x = ((u0 + du) % int(width) + int(width)) % int(width), y = std::clamp(v0 + dv, 0, int(height) - 1);
+                const double radiance = w * CH_PI / omega * kStarMapGain;
+                for (int c = 0; c < 3; ++c)
+                    rgb[(size_t(y) * width + x) * 3 + c] += float(radiance * stars->irradiance[i][c]);
+            }
+        }
+        const uint32_t texture_id = static_cast<uint32_t>(m_textures.size());
+        ChVulkanRTGpuTexture gpu_texture{};
+        gpu_texture.info[0] = static_cast<uint32_t>(m_texture_pixels.size());
+        gpu_texture.info[1] = width;
+        gpu_texture.info[2] = height;
+        gpu_texture.info[3] = 1u;  // RGB9E5
+        m_textures.push_back(gpu_texture);
+        m_texture_pixels.reserve(m_texture_pixels.size() + size_t(width) * height);
+        for (size_t i = 0; i < size_t(width) * height; ++i)
+            m_texture_pixels.push_back(PackRGB9E5(rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]));
+        m_star_field = stars;
+        m_star_texture = texture_id;
         return texture_id;
     }
 
@@ -3177,6 +3327,26 @@ struct ChVulkanRTGpuRenderer {
         m_scene_data.background1[2] = background.color_horizon.z();
         m_scene_data.counts[1] = static_cast<uint32_t>(background.mode);
         m_scene_data.counts[2] = env_texture_id;
+        if (const auto& air = scene->GetAtmosphere()) {
+            const ChMatrix33d axes(air->rotation);
+            const auto put = [](float* out, const ChVector3d& v, double w) {
+                out[0] = float(v.x()), out[1] = float(v.y()), out[2] = float(v.z()), out[3] = float(w);
+            };
+            put(m_scene_data.planet_center, air->center, air->planet_radius);
+            put(m_scene_data.planet_x, axes.GetAxisX(), air->top_radius);
+            put(m_scene_data.planet_y, axes.GetAxisY(), 1.0);
+            put(m_scene_data.planet_z, axes.GetAxisZ(), air->cloud_height);
+            put(m_scene_data.rayleigh, ChVector3d(air->rayleigh.x(), air->rayleigh.y(), air->rayleigh.z()), air->rayleigh_height);
+            m_scene_data.mie[0] = air->mie_scattering, m_scene_data.mie[1] = air->mie_extinction;
+            m_scene_data.mie[2] = air->mie_height, m_scene_data.mie[3] = air->mie_g;
+            put(m_scene_data.ozone, ChVector3d(air->ozone.x(), air->ozone.y(), air->ozone.z()), air->ozone_center);
+            m_scene_data.ozone_width[0] = air->ozone_width;
+        }
+        m_scene_data.stars[0] = UintBitsAsFloat(CH_VKRT_INVALID_TEXTURE);
+        if (const auto& stars = scene->GetStars()) {
+            m_scene_data.stars[0] = UintBitsAsFloat(RegisterStars(stars));
+            m_scene_data.stars[1] = scene->GetStarScale() / kStarMapGain;
+        }
 
         for (const auto& light : scene->GetLights())
             m_lights.push_back(MakeGpuLight(light));
@@ -3307,6 +3477,9 @@ struct ChVulkanRTGpuRenderer {
     void BuildMeshChunks(const std::vector<MeshChunk*>& chunks) {
         if (chunks.empty())
             return;
+        StageTimes().chunks += chunks.size();
+        for (const MeshChunk* chunk : chunks)
+            StageTimes().chunk_faces += chunk->num_faces;
         VkDevice device = m_device->GetDevice();
         const VkDeviceSize scratch_alignment = ScratchAlignment();
 
@@ -3577,11 +3750,35 @@ struct ChVulkanRTGpuRenderer {
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        // The GI cache, a texel per block of pixels (bound for every launch, used by cameras that ask for it)
+        const VkDeviceSize texels = static_cast<VkDeviceSize>((width + CH_VKRT_GI_CACHE_BLOCK - 1) / CH_VKRT_GI_CACHE_BLOCK) *
+                                    static_cast<VkDeviceSize>((height + CH_VKRT_GI_CACHE_BLOCK - 1) / CH_VKRT_GI_CACHE_BLOCK);
+        EnsureBuffer(m_gi_cache_buffer, texels * 3 * 4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
 
-    // Pack a participating medium into the volume buffer (see CH_VKRT_VOLUME_HEADER_WORDS). With no medium, or an
-    // empty one, the buffer holds only a header and the shader leaves the medium out.
-    void UploadVolume(const ChVulkanRTVolume* volume) {
+    // Pack the participating media into the volume buffer (see CH_VKRT_VOLUME_HEADER_WORDS). With none, or only
+    // empty ones, the buffer holds only its directory and the shader leaves the media out.
+    void UploadVolumes(const std::vector<std::shared_ptr<const ChVulkanRTVolume>>& volumes) {
+        std::vector<uint32_t>& words = m_volume_words;
+        words.assign(CH_VKRT_VOLUME_DIRECTORY_WORDS, 0u);
+        uint32_t media = 0;
+        for (const auto& volume : volumes) {
+            if (media == CH_VKRT_VOLUME_MAX)
+                break;
+            const uint32_t base = static_cast<uint32_t>(words.size());
+            if (PackVolume(volume.get(), words)) {
+                words[1 + media] = base;
+                ++media;
+            }
+        }
+        words[0] = media;
+        m_volume_active = media > 0;
+        UploadVector(m_volume_buffer, words, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    }
+
+    // Append one medium to `words`: its header, its bricks' largest extinctions and its voxels. False, with nothing
+    // appended, for none or an empty one.
+    bool PackVolume(const ChVulkanRTVolume* volume, std::vector<uint32_t>& words) {
         const size_t count = volume ? size_t(volume->nx) * volume->ny * volume->nz : 0;
         const bool valid = volume && volume->nx >= 2 && volume->ny >= 2 && volume->nz >= 2 && volume->voxel > 0 &&
                            volume->extinction.size() == count &&
@@ -3589,46 +3786,47 @@ struct ChVulkanRTGpuRenderer {
                            (volume->sun_visibility.empty() || volume->sun_visibility.size() == count);
         if (volume && !valid)
             std::cerr << "Chrono::Sensor Vulkan RT: participating medium ignored, its fields do not match its grid" << std::endl;
-        m_volume_active = valid && std::any_of(volume->extinction.begin(), volume->extinction.end(), [](float s) { return s > 0.f; });
-
-        std::vector<uint32_t>& words = m_volume_words;
-        if (!m_volume_active) {
-            words.assign(CH_VKRT_VOLUME_HEADER_WORDS, 0u);
-            UploadVector(m_volume_buffer, words, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            return;
-        }
+        if (!valid || !std::any_of(volume->extinction.begin(), volume->extinction.end(), [](float s) { return s > 0.f; }))
+            return false;
 
         const uint32_t nx = volume->nx, ny = volume->ny, nz = volume->nz;
         const uint32_t B = CH_VKRT_VOLUME_BRICK;
         const uint32_t bx = (nx + B - 1) / B, by = (ny + B - 1) / B, bz = (nz + B - 1) / B;
-        const uint32_t brick_offset = CH_VKRT_VOLUME_HEADER_WORDS;
+        const uint32_t base = static_cast<uint32_t>(words.size());
+        const uint32_t brick_offset = base + CH_VKRT_VOLUME_HEADER_WORDS;
         const uint32_t voxel_offset = brick_offset + bx * by * bz;
-        words.assign(size_t(voxel_offset) + 2 * count, 0u);
+        words.resize(size_t(voxel_offset) + 2 * count, 0u);
 
         auto put = [&](uint32_t i, float v) { std::memcpy(&words[i], &v, sizeof(float)); };
-        put(0, volume->origin.x());
-        put(1, volume->origin.y());
-        put(2, volume->origin.z());
-        put(3, volume->voxel);
-        words[4] = nx;
-        words[5] = ny;
-        words[6] = nz;
-        words[7] = B;
-        words[8] = bx;
-        words[9] = by;
-        words[10] = bz;
-        words[11] = brick_offset;
-        words[12] = voxel_offset;
+        auto header = [&](uint32_t i) -> uint32_t& { return words[base + i]; };
+        put(base + 0, volume->origin.x());
+        put(base + 1, volume->origin.y());
+        put(base + 2, volume->origin.z());
+        put(base + 3, volume->voxel);
+        header(4) = nx;
+        header(5) = ny;
+        header(6) = nz;
+        header(7) = B;
+        header(8) = bx;
+        header(9) = by;
+        header(10) = bz;
+        header(11) = brick_offset;
+        header(12) = voxel_offset;
         const ChVector3f sun = volume->sun_dir.GetNormalized();
-        put(16, sun.x());
-        put(17, sun.y());
-        put(18, sun.z());
-        put(19, volume->albedo);
-        put(20, volume->color.x());
-        put(21, volume->color.y());
-        put(22, volume->color.z());
-        put(23, volume->phase_b);
-        put(24, volume->phase_c);
+        put(base + 16, sun.x());
+        put(base + 17, sun.y());
+        put(base + 18, sun.z());
+        put(base + 19, volume->albedo);
+        put(base + 20, volume->color.x());
+        put(base + 21, volume->color.y());
+        put(base + 22, volume->color.z());
+        put(base + 23, volume->phase_b);
+        put(base + 24, volume->phase_c);
+        const ChQuaternionf rot = volume->rotation.GetNormalized();
+        put(base + 25, rot.e0());
+        put(base + 26, rot.e1());
+        put(base + 27, rot.e2());
+        put(base + 28, rot.e3());
 
         // Rounded to nearest, as std::lround would, without its cost: the grid has a million voxels or more
         auto unorm16 = [](float v) { return static_cast<uint32_t>(std::clamp(v, 0.f, 1.f) * 65535.f + 0.5f); };
@@ -3661,7 +3859,7 @@ struct ChVulkanRTGpuRenderer {
             put(static_cast<uint32_t>(brick_offset + b), m);
         }
 
-        UploadVector(m_volume_buffer, words, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        return true;
     }
 
     void WriteDescriptors() {
@@ -3678,8 +3876,9 @@ struct ChVulkanRTGpuRenderer {
         VkDescriptorBufferInfo light_info = {m_light_buffer->GetBuffer(), 0, m_light_buffer->GetSize()};
         VkDescriptorBufferInfo scene_info = {m_scene_buffer->GetBuffer(), 0, m_scene_buffer->GetSize()};
         VkDescriptorBufferInfo volume_info = {m_volume_buffer->GetBuffer(), 0, m_volume_buffer->GetSize()};
+        VkDescriptorBufferInfo gi_cache_info = {m_gi_cache_buffer->GetBuffer(), 0, m_gi_cache_buffer->GetSize()};
 
-        std::array<VkWriteDescriptorSet, 9> writes = {};
+        std::array<VkWriteDescriptorSet, 10> writes = {};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].pNext = &as_info;
         writes[0].dstSet = m_descriptor_set;
@@ -3734,26 +3933,48 @@ struct ChVulkanRTGpuRenderer {
         writes[8].descriptorCount = 1;
         writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[8].pBufferInfo = &volume_info;
+        writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[9].dstSet = m_descriptor_set;
+        writes[9].dstBinding = 10;
+        writes[9].descriptorCount = 1;
+        writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[9].pBufferInfo = &gi_cache_info;
         vkUpdateDescriptorSets(m_device->GetDevice(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
         m_descriptors_dirty = false;
     }
 
-    void RecordAndSubmitRender(const ChVulkanRTGpuPushConstants& pc, unsigned int width, unsigned int height, VulkanPipelineType pipeline) {
+    void RecordAndSubmitRender(const ChVulkanRTGpuPushConstants& pc, unsigned int width, unsigned int height, VulkanPipelineType pipeline, bool gi_cache) {
         BeginCommands();
         vkCmdBindPipeline(m_command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_pipeline);
         vkCmdBindDescriptorSets(m_command_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_pipeline_layout, 0, 1, &m_descriptor_set, 0, nullptr);
-        vkCmdPushConstants(m_command_buffer,
-                           m_pipeline_layout,
-                           VK_SHADER_STAGE_RAYGEN_BIT_KHR,
-                           0,
-                           sizeof(ChVulkanRTGpuPushConstants),
-                           &pc);
 
         const VkDeviceAddress sbt_addr = m_sbt_buffer->GetDeviceAddress();
         VkStridedDeviceAddressRegionKHR raygen = {sbt_addr + m_sbt_raygen_offset, m_sbt_stride, m_sbt_stride};
         VkStridedDeviceAddressRegionKHR miss = {sbt_addr + m_sbt_miss_offset, m_sbt_stride, m_sbt_miss_size};
         VkStridedDeviceAddressRegionKHR hit = {sbt_addr + m_sbt_hit_offset, m_sbt_stride, m_sbt_hit_size};
         VkStridedDeviceAddressRegionKHR callable = {};
+
+        if (gi_cache) {
+            // First the GI cache, a texel per block of pixels, then the camera's launch reading it
+            ChVulkanRTGpuPushConstants cache_pc = pc;
+            cache_pc.pipeline = CH_VKRT_PIPE_GI_CACHE;
+            vkCmdPushConstants(m_command_buffer, m_pipeline_layout, VK_SHADER_STAGE_RAYGEN_BIT_KHR, 0, sizeof(ChVulkanRTGpuPushConstants), &cache_pc);
+            m_device->vkCmdTraceRaysKHR(m_command_buffer, &raygen, &miss, &hit, &callable, (width + CH_VKRT_GI_CACHE_BLOCK - 1) / CH_VKRT_GI_CACHE_BLOCK,
+                                        (height + CH_VKRT_GI_CACHE_BLOCK - 1) / CH_VKRT_GI_CACHE_BLOCK, 1);
+            VkMemoryBarrier cache_to_camera = {};
+            cache_to_camera.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            cache_to_camera.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            cache_to_camera.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(m_command_buffer, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, 1,
+                                 &cache_to_camera, 0, nullptr, 0, nullptr);
+        }
+
+        vkCmdPushConstants(m_command_buffer,
+                           m_pipeline_layout,
+                           VK_SHADER_STAGE_RAYGEN_BIT_KHR,
+                           0,
+                           sizeof(ChVulkanRTGpuPushConstants),
+                           &pc);
         m_device->vkCmdTraceRaysKHR(m_command_buffer, &raygen, &miss, &hit, &callable, width, height, 1);
 
         const VkDeviceSize copy_size = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) *
@@ -3853,6 +4074,8 @@ struct ChVulkanRTGpuRenderer {
     std::unordered_map<std::string, bool> m_texture_has_alpha;
     bool m_scene_has_transparency = false;
     ChVulkanRTGpuSceneData m_scene_data{};
+    std::shared_ptr<const ChVulkanRTStarField> m_star_field;  // the stars whose map is baked
+    uint32_t m_star_texture = CH_VKRT_INVALID_TEXTURE;
 
     std::unique_ptr<ChVulkanRTBuffer> m_material_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_texture_buffer;
@@ -3860,6 +4083,7 @@ struct ChVulkanRTGpuRenderer {
     std::unique_ptr<ChVulkanRTBuffer> m_light_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_scene_buffer;
     std::unique_ptr<ChVulkanRTBuffer> m_volume_buffer;
+    std::unique_ptr<ChVulkanRTBuffer> m_gi_cache_buffer;  // GI cache: 3 vec4 per texel (see the ray generation shader)
     std::vector<uint32_t> m_volume_words;
     uint64_t m_volume_revision = 0;
     bool m_volume_active = false;
@@ -4158,6 +4382,12 @@ void ChFilterVulkanRTRender::Apply() {
         gpu_frame.gamma = CameraGamma(sensor);
         gpu_frame.use_gi = CameraUseGI(sensor);
         gpu_frame.noise_tolerance = CameraNoiseTolerance(sensor);
+        gpu_frame.gi_cache_rays = CameraGICacheRays(sensor);
+        gpu_frame.tone_map = CameraToneMap(sensor);
+        gpu_frame.fisheye = CameraLensModel(sensor) == CameraLensModelType::FISHEYE;
+        gpu_frame.exposure = CameraExposure(sensor);
+        gpu_frame.gi_cache = gpu_frame.use_gi && CameraGICache(sensor) &&
+                             (pipeline == VulkanPipelineType::CAMERA || pipeline == VulkanPipelineType::PHYS_CAMERA);
         gpu_frame.ray_recursions = static_cast<uint32_t>(std::max(1, m_ray_recursions));
         gpu_frame.sample_factor = CameraSampleFactor(sensor);
         // Frame index advances the stream across launches; m_rng_seed selects the

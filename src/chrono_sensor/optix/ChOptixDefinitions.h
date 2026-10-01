@@ -61,7 +61,8 @@ enum class RayType {
 enum class CameraLensModelType {
     PINHOLE,   ///< traditional computer graphics ideal camera model.
     FOV_LENS,  ///< Wide angle lens model based on single spherical lens.
-    RADIAL     ///< Wide angle lens model based on polynomial fit
+    RADIAL,    ///< Wide angle lens model based on polynomial fit
+    FISHEYE    ///< Equidistant fisheye (r = f theta). Vulkan RT only
 };
 
 enum class Integrator { PATH, VOLUMETRIC, TRANSIENT, TIMEGATED, MITRANSIENT, LEGACY };

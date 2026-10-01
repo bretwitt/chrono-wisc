@@ -301,6 +301,40 @@ const ChCraterLayer::Params& ChCraterLayer::GetParams() const {
 }
 
 // Reach is at most kReachCells of a cell, so only adjacent cells can contribute.
+std::vector<ChCraterInstance> ChCraterLayer::Query(double minLon, double minLat, double maxLon, double maxLat,
+                                                   double minDiameter) const {
+    const Model& m = *m_model;
+    std::vector<ChCraterInstance> out;
+    for (int octaveIndex = 0; octaveIndex < m.count(); ++octaveIndex) {
+        const OctaveInfo& info = m.octave(octaveIndex);
+        // Nominal radii span 0.55 to 1.0 of the class radius
+        if (1000.0 * info.diameterKm < minDiameter)
+            continue;
+        const int gx0 = fastFloor(minLon * info.invCellSizeDeg), gx1 = fastFloor(maxLon * info.invCellSizeDeg);
+        const int gy0 = fastFloor(minLat * info.invCellSizeDeg), gy1 = fastFloor(maxLat * info.invCellSizeDeg);
+        for (int gy = gy0; gy <= gy1; ++gy) {
+            for (int gx = gx0; gx <= gx1; ++gx) {
+                const auto crater = CraterInstance::make(gx, gy, octaveIndex, m);
+                if (!crater)
+                    continue;
+                if (crater->centerLonDeg < minLon || crater->centerLonDeg >= maxLon || crater->centerLatDeg < minLat ||
+                    crater->centerLatDeg >= maxLat)
+                    continue;
+                ChCraterInstance c;
+                c.lonDeg = crater->centerLonDeg;
+                c.latDeg = crater->centerLatDeg;
+                c.diameterM = 2000.0 * crater->nominalRadiusKm;
+                c.depthM = 1000.0 * crater->depthKm;
+                c.rimM = 1000.0 * crater->rimKm;
+                c.isComplex = crater->isComplex;
+                if (c.diameterM >= minDiameter)
+                    out.push_back(c);
+            }
+        }
+    }
+    return out;
+}
+
 double ChCraterLayer::GetHeight(double lonDeg, double latDeg, double sampleSpacingDeg) const {
     const Model& m = *m_model;
     const double kKmPerDeg = m.kmPerDeg;

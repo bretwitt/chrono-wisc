@@ -41,6 +41,15 @@ namespace planet {
 ///
 /// The default parameters describe no craters. See planets/moon for a calibrated lunar set, and use
 /// it as a template for other bodies: the transition diameter scales roughly with 1/gravity.
+/// One crater of the procedural field, deterministic from its grid cell.
+struct CH_PLANET_API ChCraterInstance {
+    double lonDeg = 0.0, latDeg = 0.0;  ///< center (degrees)
+    double diameterM = 0.0;             ///< nominal rim-to-rim diameter (m)
+    double depthM = 0.0;                ///< floor depth below the surrounding surface (m)
+    double rimM = 0.0;                  ///< rim height above the surrounding surface (m)
+    bool isComplex = false;             ///< past the simple-to-complex transition
+};
+
 class CH_PLANET_API ChCraterLayer : public ChReliefLayer {
   public:
     struct Params {
@@ -66,6 +75,15 @@ class CH_PLANET_API ChCraterLayer : public ChReliefLayer {
     ~ChCraterLayer();
 
     const Params& GetParams() const;
+
+    /// Craters of diameter >= min_diameter (m) whose centers lie in a longitude/latitude rectangle (degrees),
+    /// half-open on the max edges. Diameters, depths and rims are the full-resolution values; a query spacing
+    /// coarser than a crater fades its relief out of the height, not out of this list.
+    std::vector<ChCraterInstance> Query(double min_lon,
+                                        double min_lat,
+                                        double max_lon,
+                                        double max_lat,
+                                        double min_diameter) const;
 
     virtual double GetHeight(double lon_deg, double lat_deg, double spacing_deg) const override;
     virtual void AddToGrid(const ChGeoGrid& grid, std::vector<double>& heights) const override;

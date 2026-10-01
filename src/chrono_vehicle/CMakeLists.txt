@@ -295,6 +295,10 @@ set(CV_TERRAIN_FILES
     terrain/RandomSurfaceTerrain.cpp
     terrain/SCMTerrain.h
     terrain/SCMTerrain.cpp
+    terrain/SCMSindyResidual.h
+    terrain/SCMSindyResidual.cpp
+    terrain/SCMSindyStiffness.h
+    terrain/SCMSindyStiffness.cpp
     terrain/GranularTerrain.h
     terrain/GranularTerrain.cpp
     terrain/ChDustField.h
@@ -332,6 +336,8 @@ if(CH_ENABLE_MODULE_PLANET AND CH_ENABLE_MODULE_FSI_SPH)
         terrain/PlanetCRMTerrain.cpp
         terrain/PlanetCRMWindow.h
         terrain/PlanetCRMWindow.cpp
+        terrain/PlanetHybridTerrain.h
+        terrain/PlanetHybridTerrain.cpp
     )
 endif()
 source_group("terrain" FILES ${CV_TERRAIN_FILES})

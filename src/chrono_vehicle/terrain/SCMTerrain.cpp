@@ -227,6 +227,14 @@ void SCMTerrain::SetTestHeight(double offset) {
     m_loader->m_test_offset_up = offset;
 }
 
+void SCMTerrain::SetForceScale(double scale) {
+    m_loader->m_force_scale = scale;
+}
+
+double SCMTerrain::GetForceScale() const {
+    return m_loader->m_force_scale;
+}
+
 double SCMTerrain::GetTestHeight() const {
     return m_loader->m_test_offset_up;
 }
@@ -291,6 +299,10 @@ void SCMTerrain::AddActiveDomain(std::shared_ptr<ChBody> body, const ChVector3d&
 // Set user-supplied callback for evaluating location-dependent soil parameters.
 void SCMTerrain::RegisterSoilParametersCallback(std::shared_ptr<SoilParametersCallback> cb) {
     m_loader->m_soil_fun = cb;
+}
+
+void SCMTerrain::RegisterContactForceCorrection(std::shared_ptr<ContactForceCorrection> cb) {
+    m_loader->m_force_correction = cb;
 }
 
 // Initialize the terrain as a flat grid.
@@ -1883,7 +1895,7 @@ void SCMLoader::ComputeInternalForces() {
                     // [](){} Trick: no deletion for this shared ptr
                     std::shared_ptr<ChLoadableUV> ssurf(surf, [](ChLoadableUV*) {});
                     auto loader = chrono_types::make_shared<ChLoaderForceOnSurface>(ssurf);
-                    loader->SetForce(Fn + Ft);
+                    loader->SetForce(m_force_scale * (Fn + Ft));
                     loader->SetApplication(0.5, 0.5);  //// TODO set UV, now just in middle
                     auto load = chrono_types::make_shared<ChLoad>(loader);
                     this->Add(load);
@@ -1906,15 +1918,39 @@ void SCMLoader::ComputeInternalForces() {
     if (!m_cosim_mode) {
         for (const auto& f : m_body_forces) {
             std::shared_ptr<ChBody> sbody(f.first, [](ChBody*) {});
-            auto force_load = chrono_types::make_shared<ChLoadBodyForce>(sbody, f.second.first, false, sbody->GetPos(), false);
-            auto torque_load = chrono_types::make_shared<ChLoadBodyTorque>(sbody, f.second.second, false);
+            ChVector3d force = f.second.first;
+            ChVector3d torque = f.second.second;
+            if (m_force_correction) {
+                ChVector3d dforce(0), dtorque(0);
+                m_force_correction->Correct(*f.first, f.second.first, f.second.second, dforce, dtorque);
+                force += dforce;
+                torque += dtorque;
+            }
+            auto force_load = chrono_types::make_shared<ChLoadBodyForce>(sbody, m_force_scale * force, false, sbody->GetPos(), false);
+            auto torque_load = chrono_types::make_shared<ChLoadBodyTorque>(sbody, m_force_scale * torque, false);
             Add(force_load);
             Add(torque_load);
         }
 
+        // Bodies the correction asks for that the soil does not touch (such as a wheel over a rut SCM made deeper
+        // than the soil it models would)
+        if (m_force_correction) {
+            for (ChBody* body : m_force_correction->GetBodies()) {
+                if (m_body_forces.count(body))
+                    continue;
+                ChVector3d dforce(0), dtorque(0);
+                m_force_correction->Correct(*body, VNULL, VNULL, dforce, dtorque);
+                if (dforce.IsNull() && dtorque.IsNull())
+                    continue;
+                std::shared_ptr<ChBody> sbody(body, [](ChBody*) {});
+                Add(chrono_types::make_shared<ChLoadBodyForce>(sbody, m_force_scale * dforce, false, sbody->GetPos(), false));
+                Add(chrono_types::make_shared<ChLoadBodyTorque>(sbody, m_force_scale * dtorque, false));
+            }
+        }
+
 #ifdef CHRONO_FEA
         for (const auto& f : m_node_forces) {
-            auto force_load = chrono_types::make_shared<ChLoadNodeXYZ>(f.first, f.second);
+            auto force_load = chrono_types::make_shared<ChLoadNodeXYZ>(f.first, m_force_scale * f.second);
             Add(force_load);
         }
 #endif

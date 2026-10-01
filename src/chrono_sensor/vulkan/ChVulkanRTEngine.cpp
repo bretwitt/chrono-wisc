@@ -17,6 +17,8 @@
 #include "chrono_sensor/vulkan/ChVulkanRTEngine.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -100,14 +102,21 @@ void ChVulkanRTEngine::UpdateSensors(std::shared_ptr<ChVulkanRTScene> scene) {
     if (scene)
         m_scene = scene;
 
+    // With CH_VKRT_PROFILE set, the wall time of the scene sync and of the sensors' filters is printed every 20 updates
+    static const bool profile = std::getenv("CH_VKRT_PROFILE") != nullptr;
+    static int updates = 0;
+    static double sync_time = 0, filter_time = 0;
+    auto t0 = std::chrono::steady_clock::now();
     if (m_scene)
         m_scene->SyncFromSystem(m_system);
+    sync_time += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     for (auto& renderer : m_assigned_renderers) {
         if (renderer)
             renderer->SetScene(m_scene);
     }
 
+    t0 = std::chrono::steady_clock::now();
     for (const size_t i : due_sensors) {
         auto& sensor = m_assigned_sensors[i];
         if (!sensor)
@@ -117,6 +126,12 @@ void ChVulkanRTEngine::UpdateSensors(std::shared_ptr<ChVulkanRTScene> scene) {
         m_assigned_renderers[i]->m_time_stamp = time;
         for (auto& filter : sensor->GetFilterList())
             filter->Apply();
+    }
+    filter_time += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (profile && ++updates == 20) {
+        std::cout << "[vkrt] per update over 20: scene sync " << 50 * sync_time << " ms, sensor filters (render, readback, save, ...) "
+                  << 50 * filter_time << " ms" << std::endl;
+        updates = 0, sync_time = 0, filter_time = 0;
     }
 }
 

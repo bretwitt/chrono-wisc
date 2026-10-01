@@ -53,7 +53,8 @@ namespace sensor {
 enum class CameraLensModelType {
     PINHOLE,   ///< Traditional ideal pinhole camera model.
     FOV_LENS,  ///< Wide-angle spherical/FOV lens model.
-    RADIAL     ///< Wide-angle lens model based on radial polynomial fit.
+    RADIAL,    ///< Wide-angle lens model based on radial polynomial fit.
+    FISHEYE    ///< Equidistant fisheye: a pixel's distance from the center is proportional to its ray's angle off the axis.
 };
 
 /// Camera integration mode. Vulkan RT currently maps all modes to its camera path.

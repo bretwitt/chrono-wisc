@@ -140,6 +140,30 @@ class CH_SENSOR_API ChCameraSensor : public ChCameraSensorBase {
     void SetNoiseTolerance(float steps) { m_noise_tolerance = steps; }
     float GetNoiseTolerance() const { return m_noise_tolerance; }
 
+    /// Take the light the scene bounces onto the surfaces (GI) from a cache instead of a GI ray per sample (Vulkan RT
+    /// only, cameras with GI; default: false). The cache is traced each frame at a quarter of the resolution, each texel
+    /// with 128 GI rays by default (see SetGICacheRays), and each sample filters it from the texels around it on its own surface,
+    /// tracing its own GI ray where none is (at silhouettes). The bounced light varies slowly across the image, so with
+    /// the cache far fewer samples per pixel are needed: they are left for anti-aliasing and the direct light.
+    void SetGICache(bool val) { m_gi_cache = val; }
+    bool GetGICache() const { return m_gi_cache; }
+
+    /// GI rays per texel of the GI cache, rounded up to a multiple of 16 (up to 2032; default 0, the renderer's
+    /// default of 128). Fewer rays leave more noise in the shadows, spread over blocks of pixels.
+    void SetGICacheRays(unsigned int rays) { m_gi_cache_rays = rays; }
+    unsigned int GetGICacheRays() const { return m_gi_cache_rays; }
+
+    /// Map the light onto the picture with a filmic curve (ACES, Narkowicz's fit) before the gamma, instead of
+    /// clipping it at white (Vulkan RT only; default: false): bright surfaces roll off to white keeping their color,
+    /// and the shadows are deepened a little
+    void SetToneMap(bool val) { m_tone_map = val; }
+    bool GetToneMap() const { return m_tone_map; }
+
+    /// Scale the light the camera takes before it is put on the picture (Vulkan RT only; default: 1), as a camera's
+    /// exposure time and gain do: each camera its own, whatever the scene's lights
+    void SetExposure(float exposure) { m_exposure = exposure; }
+    float GetExposure() const { return m_exposure; }
+
     /// returns if the camera should use fog as dictated by the scene
     /// @return True if it does request
     bool GetUseFog() { return m_use_fog; }
@@ -160,6 +184,10 @@ class CH_SENSOR_API ChCameraSensor : public ChCameraSensorBase {
     float m_hFOV;                           ///< the horizontal field of view of the sensor
     unsigned int m_supersample_factor;      ///< super sampling factor for antialiasing
     float m_noise_tolerance = 0;            ///< pixel noise (8-bit steps) at which sampling stops, 0 for none
+    bool m_gi_cache = false;                ///< take the GI from a cache traced at a quarter of the resolution
+    unsigned int m_gi_cache_rays = 0;       ///< GI rays per cache texel, 0 for the renderer's default
+    bool m_tone_map = false;                ///< a filmic curve instead of clipping at white
+    float m_exposure = 1.f;                 ///< the light taken, times this
     CameraLensModelType m_lens_model_type;  ///< lens model used by the camera
     bool m_use_gi;                          ///< holds whether the camera considers diffuse reflection
     bool m_use_denoiser;                    ///< holds whether the camera requests OptiX denoiser

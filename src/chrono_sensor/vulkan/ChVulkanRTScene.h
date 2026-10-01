@@ -194,6 +194,12 @@ struct CH_SENSOR_API ChVulkanRTLight {
     ChVector3f width_vec = ChVector3f(0.f, 0.f, 0.f);
     float radius = 0.f;
     float area = 0.f;
+    /// A directional light's disk, as the cameras see it where they look toward the light past everything else: its
+    /// angular radius (rad; 0, the default, for none). The disk is as bright as the light's color over its solid angle
+    /// makes it, darkened toward its limb as the Sun's is, and is seen only along a camera's own rays (not in mirrors,
+    /// whose highlights the light's shading gives already). Its light on the scene is unchanged: a direction still
+    /// casts sharp shadows.
+    float disk_radius = 0.f;
 
     std::string texture;
 };
@@ -223,6 +229,45 @@ struct ChVulkanRTVolume {
     float phase_b = 0.25f;                          ///< Hapke phase function shape b
     float phase_c = 0.3f;                           ///< Hapke phase function back/forward weight c
     ChVector3f color = ChVector3f(1.f, 1.f, 1.f);   ///< tint of the scattered light
+    /// The grid's axes in the scene, so a thin layer such as dust over sloping ground needs no grid as tall as it is
+    /// wide. `origin` is its corner in the scene; voxel (i, j, k) is at origin + rotation (voxel (i + 1/2, ...)).
+    ChQuaternionf rotation = ChQuaternionf(1.f, 0.f, 0.f, 0.f);
+};
+
+/// A planet's atmosphere, drawn by the cameras as light scattered along their rays (Rayleigh, Mie and ozone
+/// absorption, single scattering, lit by the scene's directional lights and shadowed by the planet), and the frame a
+/// PLANET material is shaded in: its center and axes, so that its clouds' shadows and its night side are found where
+/// they are. Coefficients are per meter at the ground, falling off exponentially with height (ozone: a tent about
+/// its center). The defaults are the Earth's (Bruneton & Neyret 2008; Hillaire 2020).
+struct ChVulkanRTAtmosphere {
+    ChVector3d center = ChVector3d(0, 0, 0);          ///< the planet's center, in the scene (m)
+    ChQuaterniond rotation = QUNIT;                   ///< the planet's axes in the scene's
+    double planet_radius = 6371e3;                    ///< the ground (m)
+    double top_radius = 6471e3;                       ///< the top of the air (m)
+    ChVector3f rayleigh = ChVector3f(5.802e-6f, 13.558e-6f, 33.1e-6f);  ///< Rayleigh scattering (1/m), red green blue
+    float rayleigh_height = 8000.f;                   ///< its scale height (m)
+    float mie_scattering = 3.996e-6f;                 ///< Mie (aerosol) scattering (1/m)
+    float mie_extinction = 4.44e-6f;                  ///< Mie extinction (1/m)
+    float mie_height = 1200.f;                        ///< its scale height (m)
+    float mie_g = 0.8f;                               ///< its Henyey-Greenstein asymmetry
+    ChVector3f ozone = ChVector3f(0.650e-6f, 1.881e-6f, 0.085e-6f);  ///< ozone absorption at its peak (1/m)
+    float ozone_center = 25000.f;                     ///< its peak's height (m)
+    float ozone_width = 15000.f;                      ///< its half width (m)
+    float cloud_height = 6000.f;                      ///< the height a PLANET material's clouds cast their shadows from (m)
+};
+
+/// The stars, as the cameras see them past everything else: each a point of light from a direction in the scene's
+/// axes, baked into a map of the sky (equirectangular, `width` × width / 2 texels, each star's light spread over the
+/// four texels about it as its radiance there), which the cameras' rays that meet nothing take their light from. A
+/// star's irradiance is in the units the lights' colors are in, times `scale`: with a directional light for the Sun
+/// of color 1, a star of visual magnitude m gives 10^(-0.4 (m + 26.74)), and `scale` is then the Sun's color, so the
+/// stars are as bright beside the sunlit ground as they are. A camera exposed for sunlit ground sees the brightest few
+/// at most, as a real one does; one exposed for the stars (a star tracker's) sees them all.
+struct ChVulkanRTStarField {
+    std::vector<ChVector3f> directions;  ///< unit, in the scene's axes
+    std::vector<ChVector3f> irradiance;  ///< rgb, before `scale`
+    float scale = 1.f;
+    unsigned int width = 8192;           ///< the map's texels about the sky: 8192, 0.044° each
 };
 
 /// Staging scene for the Vulkan backend.
@@ -250,7 +295,9 @@ class CH_SENSOR_API ChVulkanRTScene {
     unsigned int AddPointLight(ChVector3f pos, ChColor color, float max_range, bool const_color = true);
 
     unsigned int AddDirectionalLight(const ChVector3f& dir, const ChVector3f& color);
-    unsigned int AddDirectionalLight(ChColor color, float elevation, float azimuth);
+    /// A directional light from spherical angles; `disk_radius` the angular radius of its disk as the cameras see it (rad; see
+    /// ChVulkanRTLight::disk_radius)
+    unsigned int AddDirectionalLight(ChColor color, float elevation, float azimuth, float disk_radius = 0.f);
 
     unsigned int AddSpotLight(const ChVector3f& pos, const ChVector3f& dir, const ChVector3f& color, float range, float angle);
     unsigned int AddSpotLight(ChVector3f pos,
@@ -280,7 +327,7 @@ class CH_SENSOR_API ChVulkanRTScene {
     // Modify*Light overloads. Out-of-range IDs are ignored.
     void ModifyPointLight(unsigned int light_ID, ChVector3f pos, ChColor color, float max_range, bool const_color = true);
 
-    void ModifyDirectionalLight(unsigned int light_ID, ChColor color, float elevation, float azimuth);
+    void ModifyDirectionalLight(unsigned int light_ID, ChColor color, float elevation, float azimuth, float disk_radius = 0.f);
 
     void ModifySpotLight(unsigned int light_ID,
                          ChVector3f pos,
@@ -303,11 +350,40 @@ class CH_SENSOR_API ChVulkanRTScene {
     /// Set the participating medium the cameras draw (null for none). The renderers upload it again whenever it
     /// is set, without rebuilding the scene's geometry, so set a new one each time it changes.
     void SetVolume(std::shared_ptr<const ChVulkanRTVolume> volume) {
-        m_volume = std::move(volume);
+        m_volumes.clear();
+        if (volume)
+            m_volumes.push_back(std::move(volume));
         ++m_volume_revision;
     }
-    const std::shared_ptr<const ChVulkanRTVolume>& GetVolume() const { return m_volume; }
+    /// Set several media, each on its own grid with its own scattering, such as a jet's gas and the dust it raises:
+    /// up to four, the rest ignored. Each is marched on its own along a camera ray and they are laid over each other,
+    /// near enough where thin media overlap. Surfaces are shadowed by all of them.
+    void SetVolumes(std::vector<std::shared_ptr<const ChVulkanRTVolume>> volumes) {
+        m_volumes = std::move(volumes);
+        ++m_volume_revision;
+    }
+    const std::vector<std::shared_ptr<const ChVulkanRTVolume>>& GetVolumes() const { return m_volumes; }
     uint64_t GetVolumeRevision() const { return m_volume_revision; }
+    /// Set the planet's atmosphere the cameras draw (null for none)
+    void SetAtmosphere(std::shared_ptr<const ChVulkanRTAtmosphere> atmosphere) {
+        m_atmosphere = std::move(atmosphere);
+        Touch();
+    }
+    const std::shared_ptr<const ChVulkanRTAtmosphere>& GetAtmosphere() const { return m_atmosphere; }
+
+    /// Set the stars the cameras see (null for none). The map is baked once for each star field set: to change only
+    /// their brightness, set the same stars with another scale through SetStarScale
+    void SetStars(std::shared_ptr<const ChVulkanRTStarField> stars) {
+        m_stars = std::move(stars);
+        m_star_scale = m_stars ? m_stars->scale : 1.f;
+        Touch();
+    }
+    void SetStarScale(float scale) {
+        m_star_scale = scale;
+        Touch();
+    }
+    const std::shared_ptr<const ChVulkanRTStarField>& GetStars() const { return m_stars; }
+    float GetStarScale() const { return m_star_scale; }
     void ClearLights() { if (!m_lights.empty()) { m_lights.clear(); Touch(); } }
     const std::vector<ChVulkanRTLight>& GetLights() const { return m_lights; }
 
@@ -354,8 +430,11 @@ class CH_SENSOR_API ChVulkanRTScene {
     Background m_background;
     uint64_t m_revision = 1;
     uint64_t m_system_signature = 0;
-    std::shared_ptr<const ChVulkanRTVolume> m_volume;
+    std::vector<std::shared_ptr<const ChVulkanRTVolume>> m_volumes;
     uint64_t m_volume_revision = 1;
+    std::shared_ptr<const ChVulkanRTAtmosphere> m_atmosphere;
+    std::shared_ptr<const ChVulkanRTStarField> m_stars;
+    float m_star_scale = 1.f;
 };
 
 /// @} sensor_vulkan

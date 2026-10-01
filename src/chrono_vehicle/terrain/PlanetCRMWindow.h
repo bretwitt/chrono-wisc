@@ -103,6 +103,10 @@ class CH_VEHICLE_API PlanetCRMWindow {
     /// berms along the ruts and soil pushed ahead of the wheels (default: false).
     void SetBerms(bool val) { m_berms = val; }
 
+    /// Scale the soil forces applied to the wheels (default: 1; see PlanetCRMTerrain::SetForceScale). Holds for the
+    /// windows seeded later as the window moves.
+    void SetForceScale(double scale);
+
     /// Soil a wheel threw up since the previous call: mass (kg), and the mean and spread (1 sigma per axis) of where
     /// it was and how fast it moved when caught in free flight.
     struct Ejecta {
@@ -188,6 +192,7 @@ class CH_VEHICLE_API PlanetCRMWindow {
     std::unique_ptr<planet::ChSparseSdfGrid> m_loose;
     Surface m_carried;                              // soil surface of the window being replaced
     bool m_berms = false;
+    double m_force_scale = 1;
     std::unordered_set<size_t> m_emitted;           // particles handed to a dust field
     std::vector<ChVector3d> m_prev_velocities;      // particle velocities at the previous EmitDust
     double m_prev_time = 0;
