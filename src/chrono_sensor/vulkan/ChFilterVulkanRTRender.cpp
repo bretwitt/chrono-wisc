@@ -604,7 +604,9 @@ EvaluatedMaterial EvaluateMaterial(const ChVulkanRTRenderCache* cache, const Ray
             if (tex.valid)
                 out.metallic = ClampFloat(tex.r, 0.f, 1.f);
         }
-        if (!hit.material.opacity_texture.empty()) {
+        // An opacity map that is the diffuse map names that map's alpha (a Wavefront map_d beside its map_Kd), which is
+        // applied above. Its red would make a dark surface see-through
+        if (!hit.material.opacity_texture.empty() && hit.material.opacity_texture != hit.material.diffuse_texture) {
             const auto tex = SampleTexture(cache, hit.material.opacity_texture, hit.uv, hit.material.tex_scale_u, hit.material.tex_scale_v);
             if (tex.valid)
                 out.opacity = ClampFloat(tex.r, 0.f, 1.f);
@@ -2917,7 +2919,8 @@ struct ChVulkanRTGpuRenderer {
         out.texture0[3] = RegisterTexture(mat.normal_texture);
         out.texture1[0] = RegisterTexture(mat.roughness_texture);
         out.texture1[1] = RegisterTexture(mat.metallic_texture);
-        out.texture1[2] = RegisterTexture(mat.opacity_texture);
+        // The diffuse map named again as the opacity map means its alpha, which the diffuse map's sampling applies
+        out.texture1[2] = mat.opacity_texture == mat.diffuse_texture ? RegisterTexture(std::string()) : RegisterTexture(mat.opacity_texture);
         out.texture1[3] = RegisterTexture(mat.weight_texture);
 
         // Shadow rays can use the OptiX-style terminate-on-first-hit fast path

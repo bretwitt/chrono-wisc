@@ -431,7 +431,15 @@ vsg::ref_ptr<vsg::StateGroup> createPbrStateGroup(vsg::ref_ptr<const vsg::Option
         void apply(vsg::InputAssemblyState& ias) {
             // if (wireframe) ias.topology = VK_POLYGON_MODE_LINE;
         }
-        void apply(vsg::ColorBlendState& cbs) { cbs.configureAttachments(blending); }
+        void apply(vsg::ColorBlendState& cbs) {
+            cbs.configureAttachments(blending);
+            // Blend the color only and keep the target's alpha as the opaque scene left it. Blended too, the alpha of
+            // a transparent surface lowers the image's: a screenshot, or a compositor, then shows through it.
+            for (auto& attachment : cbs.attachments) {
+                attachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+                attachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            }
+        }
     };
 
     SetPipelineStates sps(wireframe, wire_width, use_blending, double_faced);
