@@ -690,6 +690,11 @@ void ChVisualSystemVSG::Initialize() {
     windowTraits->x = m_windows_x;
     windowTraits->y = m_windows_y;
     windowTraits->debugLayer = false;
+    // Tessellation shaders, for applications that add their own pipelines with them. Anisotropic filtering, which
+    // samplers here ask for.
+    windowTraits->deviceFeatures = vsg::DeviceFeatures::create();
+    windowTraits->deviceFeatures->get().tessellationShader = VK_TRUE;
+    windowTraits->deviceFeatures->get().samplerAnisotropy = VK_TRUE;
     windowTraits->deviceExtensionNames = {VK_KHR_MULTIVIEW_EXTENSION_NAME, VK_KHR_MAINTENANCE2_EXTENSION_NAME, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,
                                           VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME};
     windowTraits->swapchainPreferences.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
