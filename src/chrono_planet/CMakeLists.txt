@@ -123,6 +123,10 @@ set(Chrono_PLANET_PROCEDURAL_FILES
     procedural/ChReliefLayer.cpp
     procedural/ChBaseReliefLayer.h
     procedural/ChBaseReliefLayer.cpp
+    procedural/ChBedformLayer.h
+    procedural/ChBedformLayer.cpp
+    procedural/ChExposureField.h
+    procedural/ChExposureField.cpp
     procedural/ChCraterLayer.h
     procedural/ChCraterLayer.cpp
     procedural/ChRockLayer.h
@@ -158,6 +162,7 @@ source_group("planets" FILES ${Chrono_PLANET_PLANETS_FILES})
 # Neither changes a result and nothing here reads errno.
 set_source_files_properties(
     procedural/ChBaseReliefLayer.cpp
+    procedural/ChBedformLayer.cpp
     procedural/ChCraterLayer.cpp
     procedural/ChRockLayer.cpp
     procedural/ChRoughnessLayer.cpp

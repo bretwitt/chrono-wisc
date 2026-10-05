@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "chrono_planet/ChPlanetBody.h"
+#include "chrono_planet/procedural/ChExposureField.h"
 #include "chrono_planet/procedural/ChReliefLayer.h"
 
 namespace chrono {
@@ -52,6 +53,9 @@ struct CH_PLANET_API ChRockInstance {
 /// contributes the shallow bed of regolith it sits in; the rocks themselves are separate bodies or
 /// meshes that callers place with Query(), GetOrientation() and GetCenterRise().
 ///
+/// Rock abundance can vary from place to place (coverage_spread): k then rises and falls in patches about its
+/// given value, and each patch has the sizes of its own k, so a rocky patch holds the larger rocks too.
+///
 /// The default parameters describe no rocks (k = 0).
 class CH_PLANET_API ChRockLayer : public ChReliefLayer {
   public:
@@ -61,6 +65,13 @@ class CH_PLANET_API ChRockLayer : public ChReliefLayer {
         double qb = 0.152;    ///< Golombek-Rapp q(k) = qa + qb / k, per meter of diameter
         /// Class diameter bin edges (m), strictly increasing; one class per bin.
         std::vector<double> bin_edges_m = {0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0};
+        /// Patchiness. k varies from coverage / coverage_spread to coverage * coverage_spread, in patches about
+        /// patch_size (m) wide. 1, the default, is the same k everywhere. k is held under 0.5.
+        double coverage_spread = 1;
+        double patch_size = 200;
+        /// Where bedrock shows, if given: rocks break out of it, so with patchy cover (coverage_spread over 1) the
+        /// ground it says is bedrock is rockier, up to halfway from its patch's k to the richest.
+        std::shared_ptr<const ChExposureField> bedrock;
         int seed = 0;  ///< varies the realization; 0 reproduces the reference field
     };
 
@@ -76,6 +87,8 @@ class CH_PLANET_API ChRockLayer : public ChReliefLayer {
     double GetClassDiameter(int size_class) const;
     /// Largest radius (m) any rock can have.
     double GetMaxRadius() const;
+    /// The cumulative fractional area k at a point. The same everywhere unless coverage_spread is over 1.
+    double GetCoverage(double lon_deg, double lat_deg) const;
 
     /// Rocks with radius >= min_radius (m) whose centers lie in a longitude/latitude rectangle (degrees),
     /// half-open on the max edges so adjacent queries neither repeat nor drop a rock.

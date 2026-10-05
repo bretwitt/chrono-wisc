@@ -19,6 +19,7 @@
 #include <stdexcept>
 
 #include "chrono_planet/core/Parallel.h"
+#include "chrono_planet/core/Perlin.h"
 #include "chrono_planet/core/SphereMath.h"
 #include "chrono_planet/procedural/ChRockLayer.h"
 #include "chrono_planet/procedural/FieldGrid.h"
@@ -53,10 +54,16 @@ constexpr double kMaxTiltRad = 0.60;
 // Floor on cos(lat) for the per-cell density, looser than the grid walkers' so polar cells still thin out.
 constexpr double kMinCellCosLat = 0.02;
 
+// Patchy cover takes one of kLevels values of k, evenly spaced in log k. One level when the cover is even.
+constexpr int kLevels = 9;
+// Ceiling on a patch's k: past it the model's rocks would overlap.
+constexpr double kMaxCoverage = 0.5;
+
 struct Octave {
     double minDiameterM, maxDiameterM;
     double diameterDeg, cellSizeDeg, invCellSizeDeg;
-    double density;                            // probability this cell holds a rock
+    double density;                            // probability this cell holds a rock, the most of any level
+    std::array<double, kLevels> levelDensity;  // the same, for each level of k
     double invMinDiameterM, invMaxDiameterM;   // 1/D at the bin edges, for the within-bin draw
 };
 
@@ -98,6 +105,29 @@ struct ChRockLayer::Model {
     Params params;
     double kmPerDeg;
     std::vector<Octave> octaves;
+    int levels = 1;           // 1 with even cover, else kLevels
+    float patchScale = 0.f;   // noise lattice cells per unit of the sphere's radius
+
+    // k of a level: coverage / spread at level 0, coverage * spread at the last.
+    double levelCoverage(int level) const {
+        if (levels == 1) {
+            return params.coverage;
+        }
+        const double n = 2.0 * level / (levels - 1) - 1.0;
+        return std::min(kMaxCoverage, params.coverage * std::pow(params.coverage_spread, n));
+    }
+    // The level of k at a point, from smooth noise on the sphere.
+    int levelAt(double lonDeg, double latDeg) const {
+        if (levels == 1) {
+            return 0;
+        }
+        // The mean of three noises seldom passes 0.4 either way; stretched so the extremes are reached.
+        double n = std::clamp(2.5 * Perlin::onSphere(util::dirFromLonLat(lonDeg, latDeg), patchScale), -1.0, 1.0);
+        if (params.bedrock) {
+            n += 0.5 * params.bedrock->GetExposureNear(lonDeg, latDeg) * (1.0 - n);
+        }
+        return std::clamp(static_cast<int>(0.5 * (n + 1.0) * levels), 0, levels - 1);
+    }
 
     int count() const { return static_cast<int>(octaves.size()); }
     float hash(int gx, int gy, int salt) const { return hash01(gx, gy, seeded(salt, params.seed)); }
@@ -114,7 +144,13 @@ struct ChRockLayer::Model {
         // Cells are square in degrees, so the per-square-meter density scales by 1/cos(lat).
         const double latDeg = (gy + 0.5) * octaveInfo.cellSizeDeg;
         const double cosLat = std::max(std::cos(util::deg2rad(latDeg)), kMinCellCosLat);
-        if (hash(gx, gy, octaveIndex * 29 + 101) > octaveInfo.density * cosLat) {
+        const float keep = hash(gx, gy, octaveIndex * 29 + 101);
+        if (keep > octaveInfo.density * cosLat) {
+            return std::nullopt;
+        }
+        // Patchy cover: the cell's own k decides. Looked up only for the cells the richest k would fill.
+        if (levels > 1 &&
+            keep > octaveInfo.levelDensity[levelAt((gx + 0.5) * octaveInfo.cellSizeDeg, latDeg)] * cosLat) {
             return std::nullopt;
         }
         rock.id = (static_cast<std::uint64_t>(octaveIndex) << 60) ^
@@ -149,10 +185,14 @@ ChRockLayer::ChRockLayer(const ChPlanetBody& body, const Params& params) {
     }
     if (params.coverage < 0 || params.coverage >= 1)
         throw std::invalid_argument("ChRockLayer: coverage must lie in [0, 1)");
+    if (!(params.coverage_spread >= 1) || !(params.patch_size > 0))
+        throw std::invalid_argument("ChRockLayer: coverage_spread must be at least 1 and patch_size positive");
 
     auto model = std::make_unique<Model>();
     model->params = params;
     model->kmPerDeg = field::kmPerDeg(body.GetRadius());
+    model->levels = params.coverage_spread > 1 ? kLevels : 1;
+    model->patchScale = static_cast<float>(body.GetRadius() / params.patch_size);
     // With no coverage there are no rocks at all, so no classes to walk.
     if (params.coverage > 0) {
         for (size_t i = 0; i + 1 < edges.size(); ++i) {
@@ -164,7 +204,12 @@ ChRockLayer::ChRockLayer(const ChPlanetBody& body, const Params& params) {
             o.invCellSizeDeg = 1.0 / o.cellSizeDeg;
             // One candidate per cell, so the expected count must fit in it.
             const double cellM = o.maxDiameterM * kCellDiams;
-            o.density = std::min(1.0, binDensityPerM2(params.coverage, params.qa, params.qb, o.minDiameterM, o.maxDiameterM) * cellM * cellM);
+            o.density = 0.0;
+            o.levelDensity.fill(0.0);
+            for (int level = 0; level < model->levels; ++level) {
+                o.levelDensity[level] = std::min(1.0, binDensityPerM2(model->levelCoverage(level), params.qa, params.qb, o.minDiameterM, o.maxDiameterM) * cellM * cellM);
+                o.density = std::max(o.density, o.levelDensity[level]);
+            }
             o.invMinDiameterM = 1.0 / o.minDiameterM;
             o.invMaxDiameterM = 1.0 / o.maxDiameterM;
             model->octaves.push_back(o);
@@ -185,6 +230,10 @@ int ChRockLayer::GetNumClasses() const {
 
 double ChRockLayer::GetClassDiameter(int sizeClass) const {
     return (sizeClass >= 0 && sizeClass < m_model->count()) ? m_model->octaves[sizeClass].maxDiameterM : 0.0;
+}
+
+double ChRockLayer::GetCoverage(double lon_deg, double lat_deg) const {
+    return m_model->levelCoverage(m_model->levelAt(lon_deg, lat_deg));
 }
 
 // Coarsest class, not class 0, since the bins run finest first.

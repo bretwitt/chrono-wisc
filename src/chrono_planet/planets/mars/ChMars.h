@@ -27,16 +27,18 @@
 #include "chrono_planet/ChPlanetSurface.h"
 #include "chrono_planet/dem/ChGeoTiffStack.h"
 #include "chrono_planet/filters/ChSurfaceFilter.h"
+#include "chrono_planet/procedural/ChExposureField.h"
+#include "chrono_planet/procedural/ChBedformLayer.h"
 #include "chrono_planet/procedural/ChCraterLayer.h"
 #include "chrono_planet/procedural/ChRockLayer.h"
+#include "chrono_planet/procedural/ChRoughnessLayer.h"
 
 namespace chrono {
 namespace planet {
 
 /// Mars, as a sphere of its mean radius.
-/// The relief parameters are NOT calibrated: they reuse the lunar crater shapes with the
-/// simple-to-complex transition scaled by 1/gravity, and a moderate rock cover. They are a
-/// starting point to tune against site data, not a validated model.
+/// The relief parameters are each from the literature where it gives one, cited beside it in the source,
+/// and say so where it does not. They are not fitted to any one site.
 namespace mars {
 
 /// @addtogroup planet_module
@@ -50,13 +52,20 @@ constexpr double kGravity = 3.721;     ///< surface gravity (m/s^2)
 /// a few kilometers of this sphere; set ChGeoTiffSource::offset if a site needs a common datum.
 CH_PLANET_API ChPlanetBody Body();
 
-/// Craters, uncalibrated: lunar morphometry with a 6.5 km simple-to-complex transition.
+/// Craters: Martian depths and rims, simple under 7 km. The densities are the Moon's thinned, with no source.
 CH_PLANET_API ChCraterLayer::Params CraterParams();
 
-/// Boulders, uncalibrated: Golombek-Rapp with k = 0.05.
+/// Boulders: Golombek-Rapp, k patchy from 1.25% to 20% about 5%.
 CH_PLANET_API ChRockLayer::Params RockParams();
 
-/// The preset filter chain: the crater and rock layers. Each call returns a new chain.
+/// Wind-blown bedforms, one entry a scale, the larger first.
+CH_PLANET_API ChExposureField::Params ExposureParams();
+CH_PLANET_API std::vector<ChBedformLayer::Params> BedformParams();
+
+/// Roughness under a meter.
+CH_PLANET_API ChRoughnessLayer::Params RoughnessParams();
+
+/// The preset filter chain: the crater, bedform, rock and roughness layers. Each call returns a new chain.
 CH_PLANET_API std::shared_ptr<ChFilterChain> FilterChain();
 
 /// A Martian surface: the Mars body, the given DEMs, and the preset filter chain.

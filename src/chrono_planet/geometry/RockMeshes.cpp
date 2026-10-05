@@ -117,8 +117,22 @@ const Icosphere& icosphere() {
     return sphere;
 }
 
-// Slicing planes per rock, and the normal crease angle that keeps slice faces as hard edges.
+// A rock is one of three kinds, by its seed. Rounded: a lumpy ball with a few fracture faces, as a weathered boulder.
+// Block: many deep cuts and little lumpiness, so it is all faces and edges, as freshly broken rock. Slab: a block a
+// fifth as thick as it is long, cut about its rim and flat above and below, as a plate lifted from layered bedrock.
+// Blocks and slabs are most of the library: a field of rounded ones alone reads as pebbles, not as broken rock.
+enum class RockKind { Rounded, Block, Slab };
+RockKind kindOf(int seed) {
+    static constexpr RockKind kinds[RockMeshes::kCount] = {RockKind::Block, RockKind::Slab,  RockKind::Rounded, RockKind::Block,
+                                                           RockKind::Slab,  RockKind::Rounded, RockKind::Block, RockKind::Slab,
+                                                           RockKind::Rounded, RockKind::Block, RockKind::Slab,  RockKind::Slab};
+    return kinds[((seed % RockMeshes::kCount) + RockMeshes::kCount) % RockMeshes::kCount];
+}
+
+// Slicing planes per rounded rock, and the normal crease angle that keeps slice faces as hard edges.
 constexpr int kCutsMin = 3, kCutsMax = 6;
+constexpr int kBlockCutsMin = 9, kBlockCutsMax = 14;
+constexpr int kSlabCutsMin = 6, kSlabCutsMax = 9;
 constexpr double kCreaseDeg = 32.0;
 
 struct SlicePlane {
@@ -127,17 +141,26 @@ struct SlicePlane {
 };
 
 std::vector<SlicePlane> slicePlanes(int seed) {
+    const RockKind kind = kindOf(seed);
+    const int low = kind == RockKind::Block ? kBlockCutsMin : kind == RockKind::Slab ? kSlabCutsMin : kCutsMin;
+    const int high = kind == RockKind::Block ? kBlockCutsMax : kind == RockKind::Slab ? kSlabCutsMax : kCutsMax;
     // The fraction keeps the top count reachable but never exceeded.
-    const int count = kCutsMin + static_cast<int>(hash01(seed, 3, 7003) * (kCutsMax - kCutsMin + 0.99f));
+    const int count = low + static_cast<int>(hash01(seed, 3, 7003) * (high - low + 0.99f));
     std::vector<SlicePlane> planes;
-    planes.reserve(count);
+    planes.reserve(count + 2);
+    if (kind == RockKind::Slab) {
+        // Its two faces: flat, and not quite parallel
+        planes.push_back({normalizedOrUp({0.10 * (hash01(seed, 40, 7040) - 0.5), 0.10 * (hash01(seed, 41, 7041) - 0.5), 1.0}), 0.70});
+        planes.push_back({normalizedOrUp({0.16 * (hash01(seed, 42, 7042) - 0.5), 0.16 * (hash01(seed, 43, 7043) - 0.5), -1.0}), 0.70});
+    }
     for (int i = 0; i < count; ++i) {
-        const double z = 2.0 * hash01(seed, 10 + i, 7010) - 1.0;
+        // A slab is cut about its rim only: its cuts' normals lie near its plane
+        const double z = (kind == RockKind::Slab ? 0.25 : 1.0) * (2.0 * hash01(seed, 10 + i, 7010) - 1.0);
         const double phi = util::kTwoPi * hash01(seed, 20 + i, 7020);
         const double radius = std::sqrt(std::max(0.0, 1.0 - z * z));
-        // Deep cuts leave visible fracture faces rather than shallow caps.
-        planes.push_back({{radius * std::cos(phi), radius * std::sin(phi), z},
-                          0.52 + 0.32 * hash01(seed, 30 + i, 7030)});
+        // Deep cuts leave visible fracture faces rather than shallow caps. A block's and a slab's are deeper yet
+        const double reach = kind == RockKind::Rounded ? 0.52 + 0.32 * hash01(seed, 30 + i, 7030) : 0.42 + 0.36 * hash01(seed, 30 + i, 7030);
+        planes.push_back({{radius * std::cos(phi), radius * std::sin(phi), z}, reach});
     }
     return planes;
 }
@@ -171,15 +194,18 @@ void scaleToUnitRadius(std::vector<Vec3>& positions) {
 // Shape the finest lattice once. Coarser LODs use prefixes of these positions.
 std::vector<Vec3> displacedPositions(int seed, const std::vector<Vec3>& directions) {
     // Unequal axes give the block a preferred resting orientation.
-    const Vec3 axes{1.0, 0.70 + 0.22 * hash01(seed, 1, 7001),
-                    0.52 + 0.22 * hash01(seed, 2, 7002)};
+    const RockKind kind = kindOf(seed);
+    const Vec3 axes{1.0, (kind == RockKind::Rounded ? 0.70 : 0.58) + (kind == RockKind::Rounded ? 0.22 : 0.34) * hash01(seed, 1, 7001),
+                    kind == RockKind::Slab ? 0.16 + 0.12 * hash01(seed, 2, 7002) : (kind == RockKind::Block ? 0.45 : 0.52) + (kind == RockKind::Block ? 0.30 : 0.22) * hash01(seed, 2, 7002)};
+    // A broken rock's faces are flat: it has a third of a rounded one's lumps
+    const double lumps = kind == RockKind::Rounded ? 1.0 : 0.35;
     std::vector<Vec3> positions;
     positions.reserve(directions.size());
     for (const Vec3& direction : directions) {
         double radius = 1.0;
-        radius += 0.20 * valueNoise3(direction * 1.6, seed * 3 + 11);
-        radius += 0.12 * valueNoise3(direction * 3.4, seed * 3 + 12);
-        radius += 0.07 * valueNoise3(direction * 7.0, seed * 3 + 13);
+        radius += lumps * 0.20 * valueNoise3(direction * 1.6, seed * 3 + 11);
+        radius += lumps * 0.12 * valueNoise3(direction * 3.4, seed * 3 + 12);
+        radius += lumps * 0.07 * valueNoise3(direction * 7.0, seed * 3 + 13);
         radius = std::max(0.55, radius);
         positions.push_back({direction.x * radius * axes.x,
                              direction.y * radius * axes.y,
