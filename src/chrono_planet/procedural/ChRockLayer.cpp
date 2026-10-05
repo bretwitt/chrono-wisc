@@ -123,10 +123,36 @@ struct ChRockLayer::Model {
         }
         // The mean of three noises seldom passes 0.4 either way; stretched so the extremes are reached.
         double n = std::clamp(2.5 * Perlin::onSphere(util::dirFromLonLat(lonDeg, latDeg), patchScale), -1.0, 1.0);
+        if (params.patch_share < 1) {
+            n = -1.0 + params.patch_share * (n + 1.0);
+        }
         if (params.bedrock) {
             n += 0.5 * params.bedrock->GetExposureNear(lonDeg, latDeg) * (1.0 - n);
         }
+        if (params.craters && params.ejecta_diameter > 0) {
+            n += ejectaAt(lonDeg, latDeg) * (1.0 - n);
+        }
         return std::clamp(static_cast<int>(0.5 * (n + 1.0) * levels), 0, levels - 1);
+    }
+    // How far a point is among the blocks a crater threw out, in [0, 1]: the most of the craters round it. 1 from the
+    // center to the rim of a newly made one, falling to 0 at ejecta_reach radii, and with its freshness to 0 at 0.7.
+    double ejectaAt(double lonDeg, double latDeg) const {
+        const double mPerDeg = kmPerDeg * 1000.0, cosLat = util::cosLatClamped(latDeg);
+        const double largestM = 1000.0 * params.craters->GetParams().diameters_km.front();
+        const double reachLatDeg = params.ejecta_reach * 0.5 * largestM / mPerDeg, reachLonDeg = reachLatDeg / cosLat;
+        double most = 0.0;
+        for (const ChCraterInstance& crater : params.craters->Query(lonDeg - reachLonDeg, latDeg - reachLatDeg, lonDeg + reachLonDeg,
+                                                                   latDeg + reachLatDeg, params.ejecta_diameter)) {
+            const double fresh = util::smoothstep01(std::clamp((crater.freshness - 0.7) / 0.2, 0.0, 1.0));
+            if (fresh <= most) {
+                continue;
+            }
+            const double east = (lonDeg - crater.lonDeg) * cosLat * mPerDeg, north = (latDeg - crater.latDeg) * mPerDeg;
+            const double radii = std::sqrt(east * east + north * north) / (0.5 * crater.diameterM);
+            const double near = std::clamp((params.ejecta_reach - radii) / (params.ejecta_reach - 1.0), 0.0, 1.0);
+            most = std::max(most, fresh * near);
+        }
+        return most;
     }
 
     int count() const { return static_cast<int>(octaves.size()); }
@@ -187,6 +213,8 @@ ChRockLayer::ChRockLayer(const ChPlanetBody& body, const Params& params) {
         throw std::invalid_argument("ChRockLayer: coverage must lie in [0, 1)");
     if (!(params.coverage_spread >= 1) || !(params.patch_size > 0))
         throw std::invalid_argument("ChRockLayer: coverage_spread must be at least 1 and patch_size positive");
+    if (!(params.patch_share >= 0 && params.patch_share <= 1) || !(params.ejecta_diameter >= 0) || !(params.ejecta_reach > 1))
+        throw std::invalid_argument("ChRockLayer: patch_share must lie in [0, 1], ejecta_diameter not be negative and ejecta_reach be over 1");
 
     auto model = std::make_unique<Model>();
     model->params = params;

@@ -48,6 +48,7 @@ struct CH_PLANET_API ChCraterInstance {
     double depthM = 0.0;                ///< floor depth below the surrounding surface (m)
     double rimM = 0.0;                  ///< rim height above the surrounding surface (m)
     bool isComplex = false;             ///< past the simple-to-complex transition
+    double freshness = 1.0;             ///< how far it keeps its depth and rim: 1 newly made, 0.15 worn down
 };
 
 class CH_PLANET_API ChCraterLayer : public ChReliefLayer {
@@ -66,6 +67,16 @@ class CH_PLANET_API ChCraterLayer : public ChReliefLayer {
         double complex_rim_coef = 0;     ///< complex crater rim height = coef * D^exp (km)
         double complex_rim_exp = 0;      ///< exponent of the complex rim law
         double floor_flattening_km = 30; ///< diameter range above the transition over which floors flatten fully (km)
+
+        /// Small craters, made in loose regolith, are shallower when fresh than the larger simple ones. Under
+        /// `shallow_below_km` the depth/diameter of a fresh crater falls, linearly in the logarithm of its diameter,
+        /// from simple_depth_ratio to `shallow_depth_ratio` at `shallow_at_km`, and keeps that under it. Its rim's
+        /// height falls in the same proportion. 0, the default: none are shallower.
+        /// On the Moon: 0.196 at 400 m, about 0.15 from 100 to 200 m and 0.12 from 30 to 100 m (Stopar et al.,
+        /// "Relative depths of simple craters and the nature of the lunar regolith", Icarus 298, 2017).
+        double shallow_below_km = 0;
+        double shallow_at_km = 0;
+        double shallow_depth_ratio = 0;
 
         int seed = 0;  ///< varies the realization; 0 reproduces the reference field
     };

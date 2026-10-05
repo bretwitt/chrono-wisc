@@ -26,6 +26,7 @@
 #include "chrono_planet/ChApiPlanet.h"
 #include "chrono_planet/filters/ChSurfaceFilter.h"
 #include "chrono_planet/procedural/ChRockLayer.h"
+#include "chrono_planet/samplers/ChElevationSampler.h"
 
 namespace chrono {
 namespace planet {
@@ -54,17 +55,33 @@ class ChPlanetSurface;
 /// - The wrapped relief must be additive: what it adds to a height must not depend on the height. Relief layers are.
 /// - In the polar frame a grid is asked sample by sample, in parallel, where the relief's own grid pass is faster.
 /// - In the blend band two independent reliefs are mixed, so features are shallower there: keep the band narrow.
-/// - The relief about a pole is the relief the wrapped layers lay about the equator at 90 degrees east or west,
-///   turned. No place in the first frame near there is used, but the same features do stand in two places.
+/// - Given one relief, the relief about a pole is what its layers lay about the equator at 90 degrees east or west,
+///   turned: the same features stand in two places. Give a second, of another seed, for the polar frame.
+/// - A layer that reads the elevation data (through a ChExposureField, say) is asked in the polar frame for a place
+///   that is not where the data has it. Give the polar frame a relief of its own, whose layers read the data through
+///   PolarFrameSampler.
 /// - Rocks are placed in the frame their relief is laid in: ask for them through QueryRocks.
 class CH_PLANET_API ChIsotropicRelief : public ChSurfaceFilter {
   public:
     /// Wrap `relief`, a layer or a chain of layers. Throws std::invalid_argument unless
     /// 0 < blend_from_deg < blend_to_deg < 90.
     explicit ChIsotropicRelief(std::shared_ptr<ChSurfaceFilter> relief, double blend_from_deg = 44.0, double blend_to_deg = 46.0);
+    /// Wrap two reliefs: `relief` for the body's own frame and `polar_relief` for the polar frame. The second is
+    /// asked for places in the polar frame's longitude and latitude: its layers may be of another seed, and must read
+    /// any elevation data through PolarFrameSampler.
+    ChIsotropicRelief(std::shared_ptr<ChSurfaceFilter> relief,
+                      std::shared_ptr<ChSurfaceFilter> polar_relief,
+                      double blend_from_deg = 44.0,
+                      double blend_to_deg = 46.0);
 
-    /// The wrapped relief.
+    /// The wrapped relief, the body's own frame's.
     std::shared_ptr<ChSurfaceFilter> GetRelief() const { return m_relief; }
+    /// The polar frame's: the same, unless a second was given.
+    std::shared_ptr<ChSurfaceFilter> GetPolarRelief() const { return m_polar; }
+
+    /// Elevation data as the polar frame has it: asked for a place in the polar frame's longitude and latitude, it
+    /// gives `data` at that place on the body. For the layers of a polar relief that read the data.
+    static std::shared_ptr<ChElevationSampler> PolarFrameSampler(std::shared_ptr<const ChElevationSampler> data);
 
     /// The share of the relief taken from the polar frame at a latitude: 0 up to blend_from_deg, 1 past blend_to_deg.
     double GetPolarWeight(double lat_deg) const;
@@ -100,7 +117,9 @@ class CH_PLANET_API ChIsotropicRelief : public ChSurfaceFilter {
 
   private:
     std::shared_ptr<ChSurfaceFilter> m_relief;
-    std::shared_ptr<ChRockLayer> m_rocks;  ///< the wrapped relief's, null with none
+    std::shared_ptr<ChSurfaceFilter> m_polar;
+    std::shared_ptr<ChRockLayer> m_rocks;        ///< the wrapped relief's, null with none
+    std::shared_ptr<ChRockLayer> m_polar_rocks;  ///< the polar relief's
     double m_blend_from, m_blend_to;
 };
 

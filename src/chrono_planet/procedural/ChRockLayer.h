@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "chrono_planet/ChPlanetBody.h"
+#include "chrono_planet/procedural/ChCraterLayer.h"
 #include "chrono_planet/procedural/ChExposureField.h"
 #include "chrono_planet/procedural/ChReliefLayer.h"
 
@@ -69,9 +70,25 @@ class CH_PLANET_API ChRockLayer : public ChReliefLayer {
         /// patch_size (m) wide. 1, the default, is the same k everywhere. k is held under 0.5.
         double coverage_spread = 1;
         double patch_size = 200;
+        /// How much of the range from the poorest k to the richest the patches span by themselves, from the poorest
+        /// up: 1, the default, all of it. Less leaves the upper part to where bedrock shows or craters threw rocks
+        /// out, so the ground away from those is poor in rocks throughout.
+        double patch_share = 1;
         /// Where bedrock shows, if given: rocks break out of it, so with patchy cover (coverage_spread over 1) the
         /// ground it says is bedrock is rockier, up to halfway from its patch's k to the richest.
         std::shared_ptr<const ChExposureField> bedrock;
+        /// The craters that throw rocks out, if given. A crater that digs through the soil to rock under it leaves
+        /// blocks on its rim and round it, thickest at the rim and thinning outward, and they are broken down in
+        /// time: few are left round an old one. With patchy cover, the ground within `ejecta_reach` radii of the
+        /// center of a crater `ejecta_diameter` (m) across or more is rockier: up to the richest k at the rim of a
+        /// newly made one, falling to its patch's own at the reach, and to nothing for a crater whose `freshness`
+        /// is 0.7 or less. 0 for the diameter, the default: none.
+        /// After Watkins et al., "Boulder distributions around young, small lunar impact craters and implications
+        /// for regolith production rates and landing site safety", JGR Planets 124, 2019: the densest at the rim,
+        /// the larger within 2 to 4 radii, few left after some hundred million years. The shares are not theirs.
+        std::shared_ptr<const ChCraterLayer> craters;
+        double ejecta_diameter = 0;
+        double ejecta_reach = 3;
         int seed = 0;  ///< varies the realization; 0 reproduces the reference field
     };
 

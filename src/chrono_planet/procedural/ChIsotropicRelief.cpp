@@ -64,18 +64,55 @@ bool inLongitudes(double lon, double minLon, double maxLon) {
 
 }  // namespace
 
+namespace {
+
+// The rock layer of a relief: itself, or the first in its chain. Null with none.
+std::shared_ptr<ChRockLayer> rocksOf(const std::shared_ptr<ChSurfaceFilter>& relief) {
+    if (auto chain = std::dynamic_pointer_cast<ChFilterChain>(relief)) {
+        return chain->Find<ChRockLayer>();
+    }
+    return std::dynamic_pointer_cast<ChRockLayer>(relief);
+}
+
+// Elevation data asked for by the polar frame's longitude and latitude.
+class PolarFrameData : public ChElevationSampler {
+  public:
+    explicit PolarFrameData(std::shared_ptr<const ChElevationSampler> data) : m_data(std::move(data)) {}
+    virtual std::optional<double> GetHeight(double lon_deg, double lat_deg, int zoom) const override {
+        double lon, lat;
+        ChIsotropicRelief::FromPolarFrame(lon_deg, lat_deg, lon, lat);
+        return m_data->GetHeight(lon, lat, zoom);
+    }
+
+  private:
+    std::shared_ptr<const ChElevationSampler> m_data;
+};
+
+}  // namespace
+
 ChIsotropicRelief::ChIsotropicRelief(std::shared_ptr<ChSurfaceFilter> relief, double blend_from_deg, double blend_to_deg)
-    : m_relief(std::move(relief)), m_blend_from(blend_from_deg), m_blend_to(blend_to_deg) {
-    if (!m_relief) {
+    : ChIsotropicRelief(relief, relief, blend_from_deg, blend_to_deg) {}
+
+ChIsotropicRelief::ChIsotropicRelief(std::shared_ptr<ChSurfaceFilter> relief,
+                                     std::shared_ptr<ChSurfaceFilter> polar_relief,
+                                     double blend_from_deg,
+                                     double blend_to_deg)
+    : m_relief(std::move(relief)), m_polar(std::move(polar_relief)), m_blend_from(blend_from_deg), m_blend_to(blend_to_deg) {
+    if (!m_relief || !m_polar) {
         throw std::invalid_argument("ChIsotropicRelief: no relief to wrap");
     }
     if (!(blend_from_deg > 0.0 && blend_from_deg < blend_to_deg && blend_to_deg < 90.0)) {
         throw std::invalid_argument("ChIsotropicRelief: wants 0 < blend_from_deg < blend_to_deg < 90");
     }
-    m_rocks = std::dynamic_pointer_cast<ChRockLayer>(m_relief);
-    if (auto chain = std::dynamic_pointer_cast<ChFilterChain>(m_relief)) {
-        m_rocks = chain->Find<ChRockLayer>();
+    m_rocks = rocksOf(m_relief);
+    m_polar_rocks = rocksOf(m_polar);
+}
+
+std::shared_ptr<ChElevationSampler> ChIsotropicRelief::PolarFrameSampler(std::shared_ptr<const ChElevationSampler> data) {
+    if (!data) {
+        throw std::invalid_argument("ChIsotropicRelief: no elevation data to read in the polar frame");
     }
+    return chrono_types::make_shared<PolarFrameData>(std::move(data));
 }
 
 double ChIsotropicRelief::GetPolarWeight(double lat_deg) const {
@@ -115,7 +152,7 @@ double ChIsotropicRelief::Apply(double lon_deg, double lat_deg, double spacing_d
     // A spacing is an angle on the body, the same distance on the ground wherever it is: it is the same in both frames
     double frame_lon, frame_lat;
     ToPolarFrame(lon_deg, lat_deg, frame_lon, frame_lat);
-    const double polar = m_relief->Apply(frame_lon, frame_lat, spacing_deg, 0.0);
+    const double polar = m_polar->Apply(frame_lon, frame_lat, spacing_deg, 0.0);
     if (weight >= 1.0) {
         return height + polar;
     }
@@ -143,20 +180,20 @@ void ChIsotropicRelief::ApplyGrid(const ChGeoGrid& grid, std::vector<double>& he
 
 std::vector<ChRockInstance> ChIsotropicRelief::QueryRocks(double min_lon, double min_lat, double max_lon, double max_lat, double min_radius) const {
     std::vector<ChRockInstance> rocks;
-    if (!m_rocks || !(max_lon > min_lon) || !(max_lat > min_lat)) {
+    if (!(max_lon > min_lon) || !(max_lat > min_lat)) {
         return rocks;
     }
     const double least = std::min(std::abs(min_lat), std::abs(max_lat)), most = std::max(std::abs(min_lat), std::abs(max_lat));
     const bool spans_equator = min_lat < 0.0 && max_lat > 0.0;
     // Those of the body's own frame, where any of the rectangle is short of the polar caps
-    if (spans_equator || least < m_blend_to) {
+    if (m_rocks && (spans_equator || least < m_blend_to)) {
         for (const ChRockInstance& rock : m_rocks->Query(min_lon, min_lat, max_lon, max_lat, min_radius)) {
             if (unitOf(rock.id) >= GetPolarWeight(rock.latDeg)) {
                 rocks.push_back(rock);
             }
         }
     }
-    if (most <= m_blend_from) {
+    if (!m_polar_rocks || most <= m_blend_from) {
         return rocks;
     }
     // Those of the polar frame: of the rectangle that holds this one there, from its edges and its middle, and a
@@ -181,7 +218,7 @@ std::vector<ChRockInstance> ChIsotropicRelief::QueryRocks(double min_lon, double
         return rocks;
     }
     const double over_lon = 0.05 * (frame_max_lon - frame_min_lon) + 1e-9, over_lat = 0.05 * (frame_max_lat - frame_min_lat) + 1e-9;
-    for (ChRockInstance rock : m_rocks->Query(frame_min_lon - over_lon, frame_min_lat - over_lat, frame_max_lon + over_lon,
+    for (ChRockInstance rock : m_polar_rocks->Query(frame_min_lon - over_lon, frame_min_lat - over_lat, frame_max_lon + over_lon,
                                              frame_max_lat + over_lat, min_radius)) {
         double lon, lat;
         FromPolarFrame(rock.lonDeg, rock.latDeg, lon, lat);

@@ -129,8 +129,14 @@ struct CraterInstance {
         // Depth and rim height from power laws in diameter, after Pike (1977).
         const double diameterKm = 2.0 * crater.nominalRadiusKm;
         crater.isComplex = diameterKm >= p.complex_diameter_km;
-        crater.depthKm = (crater.isComplex ? p.complex_depth_coef * std::pow(diameterKm, p.complex_depth_exp) : p.simple_depth_ratio * diameterKm) * crater.preservationFactor;
-        crater.rimKm = (crater.isComplex ? p.complex_rim_coef * std::pow(diameterKm, p.complex_rim_exp) : p.simple_rim_ratio * diameterKm) * crater.preservationFactor;
+        // A small crater's share of a simple crater's depth and rim: 1 from shallow_below_km up
+        double shallow = 1.0;
+        if (p.shallow_below_km > 0 && diameterKm < p.shallow_below_km) {
+            const double t = std::min(1.0, std::log(p.shallow_below_km / diameterKm) / std::log(p.shallow_below_km / p.shallow_at_km));
+            shallow = 1.0 + t * (p.shallow_depth_ratio / p.simple_depth_ratio - 1.0);
+        }
+        crater.depthKm = (crater.isComplex ? p.complex_depth_coef * std::pow(diameterKm, p.complex_depth_exp) : p.simple_depth_ratio * shallow * diameterKm) * crater.preservationFactor;
+        crater.rimKm = (crater.isComplex ? p.complex_rim_coef * std::pow(diameterKm, p.complex_rim_exp) : p.simple_rim_ratio * shallow * diameterKm) * crater.preservationFactor;
         crater.flatness = crater.isComplex ? std::min(1.0, (diameterKm - p.complex_diameter_km) / p.floor_flattening_km) : 0.0;
         crater.outlineAmplitude = 0.04 + 0.08 * crater.age;                              // lumpy outline, old craters more so
         crater.streakAmplitude = (crater.age < 0.8) ? 0.45 * (1.0 - crater.age) : 0.0;   // ejecta rays, fresh only
@@ -278,6 +284,9 @@ ChCraterLayer::ChCraterLayer(const ChPlanetBody& body, const Params& params) {
     }
     if (!d.empty() && !(params.floor_flattening_km > 0))
         throw std::invalid_argument("ChCraterLayer: floor_flattening_km must be positive");
+    if (params.shallow_below_km > 0 &&
+        !(params.shallow_at_km > 0 && params.shallow_at_km < params.shallow_below_km && params.shallow_depth_ratio > 0 && params.simple_depth_ratio > 0))
+        throw std::invalid_argument("ChCraterLayer: shallow craters want 0 < shallow_at_km < shallow_below_km and positive depth ratios");
 
     auto model = std::make_unique<Model>();
     model->params = params;
@@ -327,6 +336,7 @@ std::vector<ChCraterInstance> ChCraterLayer::Query(double minLon, double minLat,
                 c.depthM = 1000.0 * crater->depthKm;
                 c.rimM = 1000.0 * crater->rimKm;
                 c.isComplex = crater->isComplex;
+                c.freshness = crater->preservationFactor;
                 if (c.diameterM >= minDiameter)
                     out.push_back(c);
             }
