@@ -39,6 +39,9 @@ namespace planet {
 /// in any projection GDAL can invert. Projected rasters are transformed through the body's geographic
 /// coordinate system (see ChPlanetBody::SetGeographicSRS); a raster with no coordinate system is read
 /// as longitude/latitude on the body. Longitudes may run -180..180 or 0..360.
+/// A projected raster whose axes run along longitude and latitude over a sampling grid (an equirectangular one) is
+/// interpolated in two passes. Any other (polar stereographic, say) is transformed and interpolated sample by
+/// sample, to the same heights.
 ///
 /// A stored value v becomes a height h above the body's reference sphere as
 ///   h = (v * band_scale + band_offset) * scale + offset   [- body radius, if values_are_radii]

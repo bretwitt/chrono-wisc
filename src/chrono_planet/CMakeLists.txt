@@ -133,6 +133,8 @@ set(Chrono_PLANET_PROCEDURAL_FILES
     procedural/ChRockLayer.cpp
     procedural/ChRoughnessLayer.h
     procedural/ChRoughnessLayer.cpp
+    procedural/ChIsotropicRelief.h
+    procedural/ChIsotropicRelief.cpp
     procedural/FieldGrid.h
     core/FieldHash.h
     core/Perlin.h

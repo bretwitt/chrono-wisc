@@ -41,7 +41,8 @@ public:
     const T* getType() const { return &data_; }
     T* getType() { return &data_; }
 
-    // Borrowed child nodes in Traits::getChildBounds order, NE, NW, SW, SE. All null unless divided.
+    // Borrowed child nodes in Traits::getChildBounds order, NE, NW, SW, SE. All null unless divided; the last two
+    // null where the node split in two (Traits::childCount).
     std::array<QuadTree*, 4> children() {
         return {children_[0].get(), children_[1].get(), children_[2].get(), children_[3].get()};
     }
@@ -49,7 +50,7 @@ public:
         return {children_[0].get(), children_[1].get(), children_[2].get(), children_[3].get()};
     }
 
-    // Creates the four children (no-op if already divided), then fires onSplit.
+    // Creates the children, four or two (no-op if already divided), then fires onSplit.
     void subdivide();
     // Fires onMerge, then deletes the children (no-op if not divided).
     void merge();

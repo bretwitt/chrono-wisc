@@ -18,16 +18,18 @@ namespace {
 // Children merge only once the camera has retreated this far past the split distance.
 constexpr double kMergeHysteresis = 1.5;
 
-// Tiles reaching this latitude are never refined.
+// Tiles wholly past this latitude are never refined: toward the pole they only grow thinner.
 constexpr double kPolarCapLatDeg = 89.9;
 
-// True for a tile that touches the excluded polar cap.
+// True for a tile that lies wholly inside the excluded polar cap. A tile that only reaches into it still splits, so
+// the ground outside the cap is refined: a root tile that touches the pole would otherwise hold everything within its
+// own height of the pole, 16 degrees, at its coarse level.
 template <typename Boundary>
 bool inPolarCap(const Boundary& boundary) {
     if constexpr (std::is_same_v<Boundary, Cartesian::Boundary>)
         return false;
     else
-        return std::abs(boundary.centerLatDeg) + boundary.halfHeightDeg >= kPolarCapLatDeg;
+        return std::abs(boundary.centerLatDeg) - boundary.halfHeightDeg >= kPolarCapLatDeg;
 }
 
 }   // namespace
@@ -45,7 +47,9 @@ QuadtreeTile<CoordSystem>::QuadtreeTile(Boundary b, std::shared_ptr<const ChPlan
     tree_->onSplit = [this](Node* parent) {
         parent->getType()->morphFromParent = true;
         for (Node* c : parent->children()) {
-            c->getType()->morphFromParent = true;
+            if (c) {
+                c->getType()->morphFromParent = true;
+            }
         }
         meshSetVersion_++;
     };
@@ -93,7 +97,9 @@ void QuadtreeTile<CoordSystem>::updateLODRec(Node* node, const util::Vec3& camer
             bench::bump(bench::ctr().splitsDone);
         }
         for (Node* c : node->children()) {
-            updateLODRec(c, cameraM, lod);
+            if (c) {
+                updateLODRec(c, cameraM, lod);
+            }
         }
     } else if ((distance > mergeDist && !forced) || hidden) {
         if (node->isDivided()) {
@@ -179,7 +185,9 @@ int QuadtreeTile<CoordSystem>::invalidateRec(Node* node, double minLon, double m
     }
     if (node->isDivided()) {
         for (Node* c : node->children()) {
-            rebuilt += invalidateRec(c, minLon, minLat, maxLon, maxLat, maxSpacingDeg);
+            if (c) {
+                rebuilt += invalidateRec(c, minLon, minLat, maxLon, maxLat, maxSpacingDeg);
+            }
         }
     }
     return rebuilt;

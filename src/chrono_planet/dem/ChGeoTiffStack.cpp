@@ -105,11 +105,19 @@ struct GeoTransformInverse {
     double row(double x, double y) const { return (-(x - gt[0]) * gt[4] + (y - gt[3]) * gt[1]) / det; }
 };
 
-// Reports once a source whose raster axes are not aligned with lon/lat. It is treated as not covering.
+// GDAL's errors kept off the console while in scope: a sample outside a projection's domain is expected.
+struct QuietErrors {
+    QuietErrors() { CPLPushErrorHandler(CPLQuietErrorHandler); }
+    ~QuietErrors() { CPLPopErrorHandler(); }
+    QuietErrors(const QuietErrors&) = delete;
+    QuietErrors& operator=(const QuietErrors&) = delete;
+};
+
+// Reports once a geographic source whose raster axes are not aligned with lon/lat. It is treated as not covering.
 void warnNonseparableRaster() {
     static std::once_flag warned;
     std::call_once(warned, [] {
-        std::cerr << "[ChGeoTiffStack] raster is not separable in lon/lat; reproject it to Plate Carree\n";
+        std::cerr << "[ChGeoTiffStack] a geographic raster is rotated against lon/lat; it is not read\n";
     });
 }
 
@@ -172,6 +180,9 @@ struct ChGeoTiffStack::Impl {
     // nullopt means the coordinate transform failed or cannot be sampled as separate axes.
     // A successful result can still have no coverage (all blend weights zero).
     std::optional<RasterSamples> reconstructGrid(const Source& source, const ChGeoGrid& grid) const;
+    // A projected raster whose axes do not run along lon/lat over the grid (polar stereographic, say): every sample
+    // transformed and interpolated on its own. The same spline and blend weights as the two-pass path.
+    RasterSamples reconstructPointwise(const Source& source, const ChGeoGrid& grid) const;
     std::optional<RasterCoordinates> mapToRaster(const Source& source, const ChGeoGrid& grid) const;
     RasterSamples interpolateHeights(const Source& source, const RasterCoordinates& coordinates,
                                   const AxisSamples& columns, const AxisSamples& rows) const;
@@ -550,8 +561,11 @@ ChGeoTiffStack::Impl::SelectedSources ChGeoTiffStack::Impl::selectSources(double
 // Map geographic coordinates, prepare each axis, then interpolate the raster in two passes.
 std::optional<ChGeoTiffStack::Impl::RasterSamples> ChGeoTiffStack::Impl::reconstructGrid(const Source& source, const ChGeoGrid& grid) const {
     const auto coordinates = mapToRaster(source, grid);
-    if (!coordinates)
-        return std::nullopt;
+    if (!coordinates) {
+        if (source.isGeographic)
+            return std::nullopt;
+        return reconstructPointwise(source, grid);
+    }
     const auto columns = prepareAxisSamples(coordinates->columns, source.loader->width());
     const auto rows = prepareAxisSamples(coordinates->rows, source.loader->height());
     return interpolateHeights(source, *coordinates, columns, rows);
@@ -598,7 +612,9 @@ std::optional<RasterCoordinates> ChGeoTiffStack::Impl::mapToRaster(const Source&
         std::vector<double> firstColumnX(side, longitudes[0]), firstColumnY(latitudes);
         double cornerX[2] = {longitudes[side - 1], longitudes[0]}, cornerY[2] = {latitudes[side - 1], latitudes[side - 1]};
         {
+            // A point outside the projection's domain is no error here: the samples are then taken one by one
             std::lock_guard<std::mutex> lock(transformMutex_);
+            const QuietErrors quiet;
             if (!source.toDataset->Transform(side, firstRowX.data(), firstRowY.data())) {
                 return std::nullopt;
             }
@@ -613,8 +629,7 @@ std::optional<RasterCoordinates> ChGeoTiffStack::Impl::mapToRaster(const Source&
         const bool separable = std::abs(cornerX[0] - firstRowX[side - 1]) < tolerance && std::abs(cornerY[0] - firstColumnY[side - 1]) < tolerance &&
                                std::abs(cornerX[1] - firstRowX[0]) < tolerance && std::abs(cornerY[1] - firstColumnY[side - 1]) < tolerance;
         if (!separable) {
-            warnNonseparableRaster();
-            return std::nullopt;
+            return std::nullopt;   // sampled point by point instead
         }
         for (int i = 0; i < side; ++i) {
             pixelColumns[i] = inverse.col(firstRowX[i], firstRowY[0]);
@@ -625,6 +640,64 @@ std::optional<RasterCoordinates> ChGeoTiffStack::Impl::mapToRaster(const Source&
     }
 
     return RasterCoordinates{std::move(pixelColumns), std::move(pixelRows)};
+}
+
+ChGeoTiffStack::Impl::RasterSamples ChGeoTiffStack::Impl::reconstructPointwise(const Source& source, const ChGeoGrid& grid) const {
+    const auto [lon0, lat0, stepLon, stepLat, side, spacing] = grid;
+    const size_t count = static_cast<size_t>(side) * side;
+    RasterSamples result{std::vector<double>(count, 0.0), std::vector<double>(count, 0.0)};
+    const GeoTransformInverse inverse(source.loader->geoTransform());
+    if (!inverse.valid()) {
+        return result;
+    }
+    // Every sample into the raster's projection. One past a pole is in no projection's domain: left without data.
+    std::vector<double> x(count), y(count);
+    std::vector<int> transformed(count, 0);
+    for (int j = 0; j < side; ++j) {
+        for (int i = 0; i < side; ++i) {
+            const size_t k = static_cast<size_t>(j) * side + i;
+            x[k] = lon0 + i * stepLon;
+            y[k] = std::clamp(lat0 + j * stepLat, -90.0, 90.0);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(transformMutex_);
+        const QuietErrors quiet;
+        source.toDataset->Transform(static_cast<int>(count), x.data(), y.data(), nullptr, transformed.data());
+    }
+    const int width = source.loader->width(), height = source.loader->height();
+    const auto& rasterHeights = source.loader->elevation();
+    const bool parallel = util::parallelGrid(count);
+#pragma omp parallel for num_threads(util::parallelThreads()) schedule(static) if (parallel)
+    for (int j = 0; j < side; ++j) {
+        const double latitude = lat0 + j * stepLat;
+        if (latitude < -90.0 || latitude > 90.0)
+            continue;
+        for (int i = 0; i < side; ++i) {
+            const size_t k = static_cast<size_t>(j) * side + i;
+            if (!transformed[k] || !std::isfinite(x[k]) || !std::isfinite(y[k]))
+                continue;
+            const double column = inverse.col(x[k], y[k]), row = inverse.row(x[k], y[k]);
+            if (!(column >= 0.0) || column >= width - 1 || !(row >= 0.0) || row >= height - 1)
+                continue;
+            const double weight = edgeBlendWeight(source, column, row);
+            if (!(weight > 0.0))
+                continue;
+            const int baseColumn = static_cast<int>(std::floor(column)), baseRow = static_cast<int>(std::floor(row));
+            const auto columnWeights = bsplineWeights(column - baseColumn), rowWeights = bsplineWeights(row - baseRow);
+            double sum = 0.0;
+            for (int rowTap = 0; rowTap < kSplineTaps; ++rowTap) {
+                const double* rasterRow = &rasterHeights[static_cast<size_t>(std::clamp(baseRow - 1 + rowTap, 0, height - 1)) * width];
+                double along = 0.0;
+                for (int columnTap = 0; columnTap < kSplineTaps; ++columnTap)
+                    along += columnWeights[columnTap] * rasterRow[std::clamp(baseColumn - 1 + columnTap, 0, width - 1)];
+                sum += rowWeights[rowTap] * along;
+            }
+            result.elevations[k] = sum;
+            result.blendWeights[k] = weight;
+        }
+    }
+    return result;
 }
 
 ChGeoTiffStack::Impl::RasterSamples ChGeoTiffStack::Impl::interpolateHeights(

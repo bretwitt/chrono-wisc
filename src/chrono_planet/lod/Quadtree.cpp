@@ -34,7 +34,8 @@ void QuadTree<T, CoordSystem>::subdivide() {
         return;
     }
     const auto bounds = Traits::getChildBounds(boundary_);
-    for (int k = 0; k < 4; ++k) {
+    const int count = Traits::childCount(boundary_);
+    for (int k = 0; k < count; ++k) {
         children_[k] = std::make_unique<QuadTree>(bounds[k], level_ + 1, this);
     }
     divided_ = true;

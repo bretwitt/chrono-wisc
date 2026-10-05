@@ -17,6 +17,7 @@ class CoordinateTraits<Cartesian> {
   public:
     using Boundary = Cartesian::Boundary;
     using Position = Cartesian::Position;
+    static int childCount(const Boundary&) { return 4; }
     static std::array<Boundary, 4> getChildBounds(const Boundary& bounds);
     static double distanceToBounds(const Boundary& bounds, const util::Vec3& camera, double minHeight, double maxHeight, double);
     static std::vector<double> cartesianGrid(const Boundary& bounds, int divisions, const ChPlanetSurface& surface,

@@ -10,8 +10,25 @@
 namespace chrono {
 namespace planet {
 
+namespace {
+
+// A tile narrower than this share of its height, on the ground at its center, splits in latitude only. At 1/sqrt(2)
+// both kinds of split leave children between 0.71 and 1.41 of square.
+constexpr double kThinAspect = 0.70710678118654752;
+
+}  // namespace
+
+int CoordinateTraits<Spherical>::childCount(const Boundary& b) {
+    const double widthOverHeight = b.halfWidthDeg * std::cos(util::deg2rad(b.centerLatDeg)) / b.halfHeightDeg;
+    return widthOverHeight < kThinAspect ? 2 : 4;
+}
+
 std::array<Spherical::Boundary, 4> CoordinateTraits<Spherical>::getChildBounds(const Boundary& b) {
     const double hw = b.halfWidthDeg * 0.5, hh = b.halfHeightDeg * 0.5;
+    if (childCount(b) == 2) {
+        return {{clampAtPoles({b.centerLonDeg, b.centerLatDeg + hh, b.halfWidthDeg, hh}),
+                 clampAtPoles({b.centerLonDeg, b.centerLatDeg - hh, b.halfWidthDeg, hh}), {}, {}}};
+    }
     return {{clampAtPoles({wrapLongitude(b.centerLonDeg + hw), b.centerLatDeg + hh, hw, hh}),
              clampAtPoles({wrapLongitude(b.centerLonDeg - hw), b.centerLatDeg + hh, hw, hh}),
              clampAtPoles({wrapLongitude(b.centerLonDeg + hw), b.centerLatDeg - hh, hw, hh}),
@@ -39,7 +56,11 @@ std::vector<double> CoordinateTraits<Spherical>::elevationGrid(const Boundary& b
     const double startLat = b.centerLatDeg - b.halfHeightDeg;
 
     // Heights on the surface. The DEM sees the unwrapped origin; the surface wraps it for the relief.
-    const double spacingDeg = reliefSpacingDeg > 0.0 ? reliefSpacingDeg : stepLon;
+    // The relief's spacing is an angle on the body: the grid's coarser step on the ground. A tile as many degrees wide
+    // as tall is coarser in latitude, and that step equals its step in longitude. One split north and south only is
+    // wider in degrees, and its step in longitude is shortened by the cosine of its latitude.
+    const double stepLonOnGround = stepLon * std::cos(util::deg2rad(b.centerLatDeg));
+    const double spacingDeg = reliefSpacingDeg > 0.0 ? reliefSpacingDeg : std::max(stepLat, std::min(stepLon, stepLonOnGround));
     const ChGeoGrid grid{b.centerLonDeg - b.halfWidthDeg, startLat, stepLon, stepLat, n, spacingDeg};
     std::vector<double> heights;
     if (!staticHeights) {

@@ -40,7 +40,13 @@ public:
         size[1] = 2.0 * b.halfHeightDeg / 180.0;
     }
 
-    // NE, NW, SW, SE.
+    // How many tiles a tile splits into. Four, as a quadtree's, where it is about as wide as tall on the ground.
+    // Toward a pole a tile of equal degrees each way grows thin, its width shrinking as the cosine of its latitude:
+    // there it splits in two, north and south, keeping its width, until its children are about square again. So a
+    // tile's cells stay within a factor of 1.4 of square at any latitude, where a plain quadtree's are 12 times taller
+    // than wide at 85 degrees. A tile's level still counts the halvings of its height.
+    static int childCount(const Boundary& b);
+    // NE, NW, SW, SE; or north, south where childCount is two (the last two are then unused).
     static std::array<Boundary, 4> getChildBounds(const Boundary& b);
 
     // Chord distance from a camera position (meters) to the nearest point of the tile's elevation shell
