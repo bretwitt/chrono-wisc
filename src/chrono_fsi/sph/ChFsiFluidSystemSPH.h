@@ -83,6 +83,17 @@ class CH_FSI_API ChFsiFluidSystemSPH : public ChFsiFluidSystem {
                                      ///< (default: 0)
         double mcc_v_lambda;         ///< Specific volume at reference pressure of 1000 Pa
                                      ///< (default: 2.0)
+        double mcc_pc_min;           ///< Cam-Clay: least consolidation pressure a particle is left
+                                     ///< with after it yields [Pa]. The default suits soil under
+                                     ///< its own weight on a planet. A soil under next to none,
+                                     ///< on an asteroid, yields in compression far below it and
+                                     ///< needs it lowered (default: 100)
+        double mcc_modulus_min;      ///< Cam-Clay: least elastic modulus, as a fraction of the
+                                     ///< bulk and shear moduli that Young_modulus and
+                                     ///< Poisson_ratio give. Cam-Clay's own bulk modulus,
+                                     ///< K = v p / kappa, goes to zero with the pressure, and
+                                     ///< is held at this floor. Must be over 0 and at most 1
+                                     ///< (default: 0.1)
 
         SoilProperties();
     };

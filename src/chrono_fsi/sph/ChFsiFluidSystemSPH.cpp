@@ -459,6 +459,15 @@ void ChFsiFluidSystemSPH::CheckSPHParameters() {
                 if (m_paramsH->mcc_M <= 0) {
                     mcc_fatal("MCC parameter mcc_M (critical state line slope) must be positive, but is " + mcc_num(m_paramsH->mcc_M) + ".");
                 }
+                mcc_finite(m_paramsH->mcc_pc_min, "mcc_pc_min");
+                mcc_finite(m_paramsH->mcc_modulus_min, "mcc_modulus_min");
+                if (m_paramsH->mcc_pc_min <= 0) {
+                    mcc_fatal("MCC parameter mcc_pc_min (least consolidation pressure) must be positive, but is " + mcc_num(m_paramsH->mcc_pc_min) + ".");
+                }
+                if (m_paramsH->mcc_modulus_min <= 0 || m_paramsH->mcc_modulus_min > 1) {
+                    mcc_fatal("MCC parameter mcc_modulus_min (least elastic modulus, as a fraction) must be over 0 and at most 1, but is " +
+                              mcc_num(m_paramsH->mcc_modulus_min) + ".");
+                }
                 if (m_paramsH->mcc_v_lambda <= 0) {
                     mcc_fatal("MCC parameter mcc_v_lambda (specific volume at the reference pressure) must be positive, but is " + mcc_num(m_paramsH->mcc_v_lambda) + ".");
                 }
@@ -581,7 +590,9 @@ ChFsiFluidSystemSPH::SoilProperties::SoilProperties()
       mcc_M(0),
       mcc_kappa(0),
       mcc_lambda(0),
-      mcc_v_lambda(2.0) {}
+      mcc_v_lambda(2.0),
+      mcc_pc_min(100.0),
+      mcc_modulus_min(0.1) {}
 
 void ChFsiFluidSystemSPH::SetCrmSPH(const SoilProperties& mat_props) {
     ChAssertAlways(!m_is_initialized);
@@ -605,6 +616,8 @@ void ChFsiFluidSystemSPH::SetCrmSPH(const SoilProperties& mat_props) {
             m_paramsH->mcc_kappa = Real(mat_props.mcc_kappa);
             m_paramsH->mcc_lambda = Real(mat_props.mcc_lambda);
             m_paramsH->mcc_v_lambda = Real(mat_props.mcc_v_lambda);
+            m_paramsH->mcc_pc_min = Real(mat_props.mcc_pc_min);
+            m_paramsH->mcc_modulus_min = Real(mat_props.mcc_modulus_min);
             break;
         case RheologyCRM::MU_OF_I:
             if (mat_props.mu_fric_2 < mat_props.mu_fric_s) {
@@ -1117,6 +1130,8 @@ void PrintParams(const ChFsiParamsSPH& params, const Counters& counters) {
                 cout << "    mcc_kappa: " << params.mcc_kappa << endl;
                 cout << "    mcc_lambda: " << params.mcc_lambda << endl;
                 cout << "    mcc_v_lambda: " << params.mcc_v_lambda << endl;
+                cout << "    mcc_pc_min: " << params.mcc_pc_min << endl;
+                cout << "    mcc_modulus_min: " << params.mcc_modulus_min << endl;
             }
 
             break;

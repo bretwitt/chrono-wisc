@@ -186,6 +186,8 @@ struct ChFsiParamsSPH {
                         ///< v-ln(p). Governs virgin compressibility and the hardening rate, which
                         ///< divides by (mcc_lambda - mcc_kappa). Must exceed mcc_kappa
     Real mcc_v_lambda;  ///< Specific volume at reference pressure of 1000 Pa
+    Real mcc_pc_min;    ///< Least consolidation pressure a particle is left with after it yields [Pa]
+    Real mcc_modulus_min;  ///< Least elastic modulus, as a fraction of the bulk and shear moduli given by E and nu
 
     Real boxDimX;  ///< Dimension of the space domain - X
     Real boxDimY;  ///< Dimension of the space domain - Y
