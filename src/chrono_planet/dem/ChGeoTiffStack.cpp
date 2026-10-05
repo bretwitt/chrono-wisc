@@ -152,9 +152,15 @@ struct ChGeoTiffStack::Impl {
         const Source* base = nullptr;
     };
     SelectedSources selectSources(double minLon, double maxLon, double minLat, double maxLat, int zoom) const;
+    // Does a lon/lat rect meet a source's footprint, at any wrap of longitude.
+    [[nodiscard]] static bool meets(const Source& source, double minLon, double maxLon, double minLat, double maxLat);
+    // Seamless compositing: the base the zoom picks, then every overlay the rect meets, in the order added.
+    void seamlessGrid(const ChGeoGrid& grid, int zoom, std::vector<double>& out) const;
+    bool seamless_ = false;
     // Validity mask of a raster, feathered over a fixed ground distance. edgesInvalid fades the
     // raster's own border too, which overlays need and a global base must not have.
-    [[nodiscard]] static ValidityMask validityMaskOf(const GeoTIFFLoader& raster, double pixelMetres, double minValid, bool edgesInvalid);
+    [[nodiscard]] static ValidityMask validityMaskOf(const GeoTIFFLoader& raster, double pixelMetres, double minValid, bool edgesInvalid,
+                                                     double featherM);
     // Blend weight in [0, 1] from distance to an edge or nodata hole at a fractional pixel.
     [[nodiscard]] static double edgeBlendWeight(const Source& source, double pixelColumn, double pixelRow);
     // A successfully mapped raster. A zero weight means no usable data at that sample;
@@ -189,6 +195,78 @@ int ChGeoTiffStack::GetNumSources() const {
     return static_cast<int>(m_impl->sources_.size());
 }
 
+void ChGeoTiffStack::SetSeamless(bool seamless) {
+    m_impl->seamless_ = seamless;
+}
+
+bool ChGeoTiffStack::IsSeamless() const {
+    return m_impl->seamless_;
+}
+
+bool ChGeoTiffStack::Impl::meets(const Source& source, double minLon, double maxLon, double minLat, double maxLat) {
+    if (maxLat < source.minLat || minLat > source.maxLat) {
+        return false;
+    }
+    for (double shift : {0.0, 360.0, -360.0}) {
+        if (!(maxLon + shift < source.minLon || minLon + shift > source.maxLon)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ChGeoTiffStack::Impl::seamlessGrid(const ChGeoGrid& grid, int zoom, std::vector<double>& out) const {
+    const auto [lon0, lat0, stepLon, stepLat, side, spacing] = grid;
+    const size_t n = static_cast<size_t>(side) * side;
+    const double lon1 = lon0 + (side - 1) * stepLon, lat1 = lat0 + (side - 1) * stepLat;
+    const double minLon = std::min(lon0, lon1), maxLon = std::max(lon0, lon1), minLat = std::min(lat0, lat1), maxLat = std::max(lat0, lat1);
+
+    // The base: of the whole-body rasters, the narrowest whose zooms hold this one, else the finest.
+    const Source* base = nullptr;
+    int smallestZoomRange = std::numeric_limits<int>::max(), finestBaseZoom = std::numeric_limits<int>::min();
+    bool holdsZoom = false;
+    for (const auto& source : sources_) {
+        if (source.minZoom != 0 || !meets(source, minLon, maxLon, minLat, maxLat)) {
+            continue;
+        }
+        if (zoom <= source.maxZoom) {
+            if (!holdsZoom || source.maxZoom - source.minZoom < smallestZoomRange) {
+                smallestZoomRange = source.maxZoom - source.minZoom;
+                base = &source;
+                holdsZoom = true;
+            }
+        } else if (!holdsZoom && source.maxZoom > finestBaseZoom) {
+            finestBaseZoom = source.maxZoom;
+            base = &source;
+        }
+    }
+    if (base) {
+        if (const auto under = reconstructGrid(*base, grid)) {
+            for (size_t i = 0; i < n; ++i) {
+                if (under->blendWeights[i] > 0.0) {
+                    out[i] = under->elevations[i];
+                }
+            }
+        }
+    }
+    // Each overlay over what is under it, by its own weight: 1 well inside it, 0 at its edges and holes.
+    for (const auto& source : sources_) {
+        if (source.minZoom == 0 || !meets(source, minLon, maxLon, minLat, maxLat)) {
+            continue;
+        }
+        const auto over = reconstructGrid(source, grid);
+        if (!over) {
+            continue;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const double weight = over->blendWeights[i];
+            if (weight > 0.0) {
+                out[i] = std::isnan(out[i]) ? over->elevations[i] : out[i] * (1.0 - weight) + over->elevations[i] * weight;
+            }
+        }
+    }
+}
+
 void ChGeoTiffStack::GetHeightGrid(const ChGeoGrid& grid, int zoom, std::vector<double>& out) const {
     const auto [lon0, lat0, stepLon, stepLat, side, spacing] = grid;
     if (side <= 0) {
@@ -196,6 +274,10 @@ void ChGeoTiffStack::GetHeightGrid(const ChGeoGrid& grid, int zoom, std::vector<
     }
     const size_t n = static_cast<size_t>(side) * side;
     out.assign(n, std::numeric_limits<double>::quiet_NaN());
+    if (m_impl->seamless_) {
+        m_impl->seamlessGrid(grid, zoom, out);
+        return;
+    }
 
     // Select the active raster and its coarser base, then reconstruct both on the same grid.
     const double lon1 = lon0 + (side - 1) * stepLon, lat1 = lat0 + (side - 1) * stepLat;
@@ -319,7 +401,7 @@ void ChGeoTiffStack::Impl::addSource(const ChGeoTiffSource& opt) {
     // and gets a mask only if it has holes, so they read as no data instead of the nodata sentinel.
     const double pixelMetres = std::abs(gt[1]) * (dsIsGeo ? util::metresPerDegLat(radiusM_) : 1.0);
     if (opt.min_zoom > 0) {
-        src.mask = validityMaskOf(*ldr, pixelMetres, opt.min_valid, true);
+        src.mask = validityMaskOf(*ldr, pixelMetres, opt.min_valid, true, opt.feather_m > 0 ? opt.feather_m : kFeatherM);
     } else {
         const bool hasNodata = ldr->hasNodata();
         const double nodata = ldr->nodata();
@@ -328,7 +410,7 @@ void ChGeoTiffStack::Impl::addSource(const ChGeoTiffSource& opt) {
             return !std::isfinite(v) || (hasNodata && v == nodata) || v < opt.min_valid;
         });
         if (holes) {
-            src.mask = validityMaskOf(*ldr, pixelMetres, opt.min_valid, false);
+            src.mask = validityMaskOf(*ldr, pixelMetres, opt.min_valid, false, kFeatherM);
         }
     }
     sources_.push_back(std::move(src));
@@ -339,13 +421,13 @@ void ChGeoTiffStack::Impl::addSource(const ChGeoTiffSource& opt) {
 
 // Chamfer distance transform to the nearest invalid pixel or raster edge, in whole pixels.
 ChGeoTiffStack::Impl::ValidityMask ChGeoTiffStack::Impl::validityMaskOf(const GeoTIFFLoader& raster, double pixelMetres,
-                                                                      double minValid, bool edgesInvalid) {
+                                                                      double minValid, bool edgesInvalid, double featherM) {
     const int width = raster.width(), height = raster.height();
     const auto& rasterHeights = raster.elevation();
     const bool hasNodata = raster.hasNodata();
     const double nodata = raster.nodata();
     ValidityMask mask;
-    mask.featherPx = static_cast<float>(std::clamp(kFeatherM / std::max(pixelMetres, 1e-3), kMinFeatherPx, kMaxFeatherPx));
+    mask.featherPx = static_cast<float>(std::clamp(featherM / std::max(pixelMetres, 1e-3), kMinFeatherPx, kMaxFeatherPx));
 
     std::vector<int> distanceThirdPixels(static_cast<size_t>(width) * height);   // thirds of a pixel
     auto distanceAt = [&](int x, int y) -> int& { return distanceThirdPixels[static_cast<size_t>(y) * width + x]; };

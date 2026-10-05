@@ -60,6 +60,8 @@ struct CH_PLANET_API ChGeoTiffSource {
     bool use_band_scale_offset = true;  ///< apply the band's own scale/offset metadata first
     std::optional<double> nodata;       ///< nodata value, overriding the band's own
     double min_valid = -30000;          ///< heights below this (m) are treated as nodata
+    double feather_m = 0;               ///< ground distance (m) over which an overlay fades into what is under it at
+                                        ///< its edges and holes; 0: the stack's default, 500 m. At most 255 pixels
 };
 
 /// Elevation source backed by a stack of rasters, each valid over a range of quadtree zooms.
@@ -83,6 +85,23 @@ class CH_PLANET_API ChGeoTiffStack : public ChElevationSampler {
 
     /// Number of rasters loaded.
     int GetNumSources() const;
+
+    /// Seamless compositing (default: off).
+    ///
+    /// Off, a query's zoom picks the rasters: the one whose zoom range holds it, faded into the finest coarser one
+    /// that covers the query. Two rasters of one place never hold the same heights, so along the line where a tile of
+    /// one zoom meets a tile of the next, where the pick changes, the ground steps by their difference: a wall.
+    ///
+    /// On, the pick depends on where a point is, not on the zoom asked. The base is the whole-body raster
+    /// (min_zoom 0) the zoom picks, as before. Over it every overlay (min_zoom over 0) the query meets is laid, in the
+    /// order the overlays were added, coarser first, each fading into what is under it over its own feather
+    /// (ChGeoTiffSource::feather_m) at its edges and holes. An overlay's zoom range is then not used. A coarse tile
+    /// over a fine overlay reads that overlay at the tile's own spacing, without filtering it first.
+    ///
+    /// With a feather as wide as the rasters differ at an overlay's edge is steep, this gives one ground at every
+    /// level of detail, for any stack of rasters. Not thread-safe with queries.
+    void SetSeamless(bool seamless);
+    bool IsSeamless() const;
 
     const ChPlanetBody& GetBody() const { return m_body; }
 
